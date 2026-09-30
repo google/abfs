@@ -125,6 +125,8 @@ type ABFSClient interface {
 	MapResults(ctx context.Context, id entities.Hash) ([]entities.Hash, error)
 	PutObject(ctx context.Context, key remote.Hash, reader remote.ContentReadCloser) error
 	PutRefs(ctx context.Context, server string, project string, refs []entities.RefHash) error
+	XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error
+	XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error
 	SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error)
 	Mark(ctx context.Context, hash entities.Hash, key, value string) (int64, error)
 	Version(ctx context.Context) (string, error)
@@ -2828,6 +2830,64 @@ func (c *CacheMan) putRefs(server, project string, refHashes []entities.RefHash,
 	case <-time.After(c.config.RefUpdateTimeout):
 		return fmt.Errorf(
 			"failed to update refs %s for %s@%s: timed out after %s", csRefs(),
+			project, server, c.config.RefUpdateTimeout,
+		)
+	}
+}
+
+func (c *CacheMan) xchgRefs(server, project string, refXchgs []entities.RefXchg, blocking bool) error {
+	if c.config.LocalOnly {
+		return errors.New("cannot xchgRefs in localOnly mode")
+	}
+	if c.config.RemoteReadOnly {
+		c.printer.Printf("skipping xchgRefs for %s@%s in remoteReadOnly mode\n", project, server)
+		return nil
+	}
+	sync := c.getSync()
+	if sync == nil {
+		return errors.New("sync client not initialized")
+	}
+	if debug {
+		c.printer.Printf("XchgRefs(server=%q, project=%q, refs=%v)\n", server, project, refXchgs)
+	}
+
+	// Non-blocking mode queues asynchronously and drops any CAS mismatch error.
+	if !blocking {
+		sync.XchgRefs(server, project, refXchgs)
+		return nil
+	}
+
+	done := make(chan error, 1)
+	sync.XchgRefs(server, project, refXchgs, func(err error) {
+		select {
+		case done <- err:
+		default:
+		}
+	})
+
+	csRefs := func() string {
+		refs := new(strings.Builder)
+		for i, r := range refXchgs {
+			if i > 0 {
+				refs.WriteByte(',')
+			}
+			fmt.Fprintf(refs, "%s=%s->%s", r.Ref, r.Current, r.Desired)
+		}
+		return refs.String()
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf(
+				"failed to xchg refs %s for %s@%s: %w", csRefs(),
+				project, server, err,
+			)
+		}
+		return nil
+	case <-time.After(c.config.RefUpdateTimeout):
+		return fmt.Errorf(
+			"failed to xchg refs %s for %s@%s: timed out after %s", csRefs(),
 			project, server, c.config.RefUpdateTimeout,
 		)
 	}

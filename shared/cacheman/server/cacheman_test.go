@@ -37,6 +37,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/google/abfs/shared/cacheman/client"
 	"github.com/google/abfs/shared/cacheman/protocol"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
@@ -2133,4 +2134,58 @@ func TestMaintenanceAndEvictionRace(t *testing.T) {
 	require.False(t, hasKept, "clean must remove blob file from disk when EnableIndex is true")
 	require.NoError(t, c.maintenanceWork())
 	require.Nil(t, c.index.Get(keptHash), "cleaned hash must not be resurrected by subsequent maintenance")
+}
+
+func TestCachemanXchgRefMismatchHTTP(t *testing.T) {
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	logDir := filepath.Join(tempDir, "log")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+	require.NoError(t, os.MkdirAll(logDir, 0755))
+
+	trueVal := true
+	falseVal := false
+	flagsConfig := &instance.ConfigOptional{
+		CacheDir:    &cacheDir,
+		LogDir:      &logDir,
+		LocalOnly:   &trueVal,
+		EnableIndex: &falseVal,
+	}
+
+	inst := instance.NewInstance("default", tempDir, tempDir, "abfs", flagsConfig, instance.DefaultFlavor)
+	defer func() {
+		require.NoError(t, inst.Close())
+	}()
+
+	mockRemote := inmemory.New()
+	c, err := New(inst, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, c.Stop())
+	}()
+
+	c.config.LocalOnly = false
+	c.abfsClient = mockRemote
+	c.setupDAGSync(context.Background(), c.config, true)
+	go func() {
+		_ = c.httpServer.Serve(c.httpSocket)
+	}()
+
+	// Seed the empty dir object on the mock remote so link validation succeeds.
+	require.NoError(t, mockRemote.PutObject(context.Background(), entities.EmptyDirHash, remote.NewReaderFromBytes(entities.EmptyDirContent)))
+
+	httpClient := client.NewHTTPClient(cacheDir)
+
+	// 1. Initial XchgRef from ZeroHash -> EmptyDirHash succeeds.
+	err = httpClient.XchgRef("myserver", "myproject", "refs/heads/main", entities.EmptyDirHash, entities.ZeroHash, true)
+	require.NoError(t, err)
+
+	// 2. XchgRef with stale Current (ZeroHash) fails with typed *entities.ErrRefMismatch over HTTP.
+	err = httpClient.XchgRef("myserver", "myproject", "refs/heads/main", entities.EmptyDirHash, entities.ZeroHash, true)
+	var mismatchErr *entities.ErrRefMismatch
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, "refs/heads/main", mismatchErr.Ref)
+	require.Equal(t, entities.ZeroHash, mismatchErr.Current)
+	require.Equal(t, entities.EmptyDirHash, mismatchErr.Actual)
 }

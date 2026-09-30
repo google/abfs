@@ -303,6 +303,61 @@ func (s *InMemoryServer) PutRefs(ctx context.Context, server string, project str
 	return nil
 }
 
+// XchgRef implements remote.RemoteProvider.
+func (s *InMemoryServer) XchgRef(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error {
+	return s.XchgRefs(ctx, server, project, []remote.RefXchg{
+		{
+			Ref:     ref,
+			Current: current,
+			Desired: desired,
+		},
+	})
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (s *InMemoryServer) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	prj := s.getProjectRefs(server, project, true)
+
+	misses := make([]entities.Hash, 0)
+	for _, ref := range refs {
+		if ref.Desired == entities.ZeroHash {
+			continue
+		}
+		if _, ok := s.objects[ref.Desired]; !ok {
+			misses = append(misses, ref.Desired)
+		}
+	}
+	if len(misses) > 0 {
+		s.brokenLinks++
+		return &remote.ErrObjectLinkValidation{
+			MissingLinks: misses,
+		}
+	}
+
+	// All Current hashes are checked against pre-batch state before applying Desired updates
+	// (duplicate refs in a batch are not rejected; the last Desired value wins).
+	for _, ref := range refs {
+		actual := prj[ref.Ref]
+		if actual != ref.Current {
+			return &remote.ErrRefMismatch{
+				Ref:     ref.Ref,
+				Current: ref.Current,
+				Actual:  actual,
+			}
+		}
+	}
+
+	log.Printf("xchg %d refs for server=%s project=%s", len(refs), server, project)
+	for _, ref := range refs {
+		prj[ref.Ref] = ref.Desired
+	}
+
+	return nil
+}
+
 // SearchRefs implements remote.RemoteProvider.
 func (s *InMemoryServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
 	s.lock.RLock()

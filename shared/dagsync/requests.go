@@ -206,6 +206,73 @@ func (r *PutRefsRequest) String() string {
 	return b.String()
 }
 
+type XchgRefsRequest struct {
+	server  string
+	project string
+	refs    []entities.RefXchg
+}
+
+func (r *XchgRefsRequest) Key() entities.Hash {
+	return entities.Hash{}
+}
+func (r *XchgRefsRequest) Links(accessor ObjectAccessor) ([]entities.Hash, error) {
+	links := make([]entities.Hash, 0, len(r.refs))
+	for _, ref := range r.refs {
+		// zero hash for a ref means it is getting soft deleted
+		if ref.Desired.IsZero() {
+			continue
+		}
+		links = append(links, ref.Desired)
+	}
+	return links, nil
+}
+func (r *XchgRefsRequest) Execute(ctx context.Context, updater ABFSUpdater, accessor ObjectAccessor) error {
+	if len(r.refs) == 1 {
+		rx := r.refs[0]
+		return updater.XchgRef(ctx, r.server, r.project, rx.Ref, rx.Desired, rx.Current)
+	}
+	return updater.XchgRefs(ctx, r.server, r.project, r.refs)
+}
+func (r *XchgRefsRequest) Type() string {
+	return "ref"
+}
+
+// String is used as the DAGSync node key; identical in-flight requests (or >maxRefsString
+// batches sharing the same first maxRefsString entries and length) coalesce into one node.
+func (r *XchgRefsRequest) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "xchg-refs:%s,%s:", r.server, r.project)
+	for i, ref := range r.refs[:min(len(r.refs), maxRefsString)] {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%s:%s->%s", ref.Ref, ref.Current, ref.Desired)
+	}
+	if len(r.refs) > maxRefsString {
+		fmt.Fprintf(&b, ",(%d total refs...)", len(r.refs))
+	}
+	return b.String()
+}
+
+func refKeys(req Request) []string {
+	switch r := req.(type) {
+	case *PutRefsRequest:
+		keys := make([]string, len(r.refs))
+		for i, ref := range r.refs {
+			keys[i] = fmt.Sprintf("%s\x00%s\x00%s", r.server, r.project, ref.Ref)
+		}
+		return keys
+	case *XchgRefsRequest:
+		keys := make([]string, len(r.refs))
+		for i, ref := range r.refs {
+			keys[i] = fmt.Sprintf("%s\x00%s\x00%s", r.server, r.project, ref.Ref)
+		}
+		return keys
+	default:
+		return nil
+	}
+}
+
 type PhonyRequest struct {
 	links []entities.Hash
 }

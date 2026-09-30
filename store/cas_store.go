@@ -307,6 +307,24 @@ func (c *CASStore) PutRefs(server string, project string, refs []entities.RefHas
 	return c.provider.PutRefs(server, project, refs, false)
 }
 
+// XchgRef implements entities.CASStore.
+// Always blocks so CAS mismatch errors are returned to the caller (non-blocking drops errors).
+func (c *CASStore) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	if c.localOnly {
+		return errors.New("cannot xchg ref in localOnly mode")
+	}
+	return c.provider.XchgRef(server, project, ref, desired, current, true)
+}
+
+// XchgRefs implements entities.CASStore.
+// Always blocks so CAS mismatch errors are returned to the caller (non-blocking drops errors).
+func (c *CASStore) XchgRefs(server string, project string, refs []entities.RefXchg) error {
+	if c.localOnly {
+		return errors.New("cannot xchg refs in localOnly mode")
+	}
+	return c.provider.XchgRefs(server, project, refs, true)
+}
+
 // SearchRefs implements entities.CASStore.
 func (c *CASStore) SearchRefs(server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	if c.localOnly {

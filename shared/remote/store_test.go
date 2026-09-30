@@ -64,6 +64,12 @@ func (m *mockRemoteCloser) SearchRefs(ctx context.Context, server string, projec
 func (m *mockRemoteCloser) PutRefs(ctx context.Context, server string, project string, refs []RefHash) error {
 	return nil
 }
+func (m *mockRemoteCloser) XchgRef(ctx context.Context, server string, project string, ref string, desired Hash, current Hash) error {
+	return nil
+}
+func (m *mockRemoteCloser) XchgRefs(ctx context.Context, server string, project string, refs []RefXchg) error {
+	return nil
+}
 func (m *mockRemoteCloser) Mark(ctx context.Context, hash Hash, key, value string) (int64, error) {
 	return 0, nil
 }

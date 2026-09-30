@@ -18,6 +18,7 @@ import (
 	context "context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"sync"
@@ -256,6 +257,63 @@ func (c *PBClient) PutRefs(ctx context.Context, server string, project string, r
 			return UnwrapMissingLinkError(err)
 		}
 		pbRefs = pbRefs[end:]
+	}
+
+	return nil
+}
+
+// XchgRef implements remote.RemoteProvider.
+func (c *PBClient) XchgRef(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error {
+	_, err := c.pb.XchgRef(ctx, &pb.XchgRefRequest{
+		Server:  server,
+		Project: project,
+		Ref:     ref,
+		Current: HashToBytes(current),
+		Desired: HashToBytes(desired),
+	})
+	if err != nil {
+		return UnwrapMissingLinkError(err)
+	}
+	return nil
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (c *PBClient) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	pbRefs := make([]*pb.RefXchg, len(refs))
+	flatRefs := make([]pb.RefXchg, len(refs))
+	flatHashes := make([]byte, len(refs)*40)
+	for i, rx := range refs {
+		curStart := i * 40
+		curEnd := curStart + 20
+		desStart := curEnd
+		desEnd := desStart + 20
+		copy(flatHashes[curStart:curEnd], rx.Current[:])
+		copy(flatHashes[desStart:desEnd], rx.Desired[:])
+
+		flatRefs[i] = pb.RefXchg{
+			Ref:     rx.Ref,
+			Current: flatHashes[curStart:curEnd],
+			Desired: flatHashes[desStart:desEnd],
+		}
+		pbRefs[i] = &flatRefs[i]
+	}
+	req := &pb.XchgRefsRequest{
+		Server:  server,
+		Project: project,
+		Refs:    pbRefs,
+	}
+	if size := proto.Size(req); size > MaxMessageSize {
+		return fmt.Errorf("cannot split atomic XchgRefs across multiple RPCs (%d refs): %w", len(refs), &remote.ErrMessageTooLarge{
+			Size:    size,
+			MaxSize: MaxMessageSize,
+		})
+	}
+	_, err := c.pb.XchgRefs(ctx, req)
+	if err != nil {
+		return UnwrapMissingLinkError(err)
 	}
 
 	return nil

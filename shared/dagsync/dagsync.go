@@ -113,17 +113,19 @@ func (n *node) String() string {
 }
 
 type DAGSync struct {
-	lock                   sync.Mutex
-	stopC                  chan struct{}
-	stopped                atomic.Bool
-	mailbox                *Mailbox
-	mailboxLen             atomic.Int32
-	updater                ABFSUpdater
-	accessor               ObjectAccessor
-	onPush                 func(entities.Hash, string)
-	workersCount           int
-	runningCount           int
-	nodes                  map[string]*node
+	lock         sync.Mutex
+	stopC        chan struct{}
+	stopped      atomic.Bool
+	mailbox      *Mailbox
+	mailboxLen   atomic.Int32
+	updater      ABFSUpdater
+	accessor     ObjectAccessor
+	onPush       func(entities.Hash, string)
+	workersCount int
+	runningCount int
+	nodes        map[string]*node
+	// Tracks the latest in-flight node per ref so chained updates to the same ref execute in order.
+	lastRefNode            map[string]*node
 	stateCounts            []map[string]int64
 	brokenLinks            int64
 	missingObjects         int64
@@ -149,6 +151,8 @@ type ABFSUpdater interface {
 	PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error
 	AddMapResult(ctx context.Context, from, to entities.Hash) error
 	PutRefs(ctx context.Context, server string, project string, refs []entities.RefHash) error
+	XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error
+	XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error
 }
 
 type ReadSizeCloser interface {
@@ -208,6 +212,7 @@ func New(opts *DagSyncOpts) *DAGSync {
 		accessor:               opts.Accessor,
 		onPush:                 opts.OnPush,
 		nodes:                  make(map[string]*node),
+		lastRefNode:            make(map[string]*node),
 		queue:                  NewPriorityQueue(),
 		stateCounts:            counts,
 		workersCount:           opts.WorkersCount,
@@ -550,6 +555,11 @@ func (d *DAGSync) delete(n *node) {
 	if n.state == RunningState {
 		d.runningCount--
 	}
+	for _, rk := range refKeys(n.request) {
+		if d.lastRefNode[rk] == n {
+			delete(d.lastRefNode, rk)
+		}
+	}
 	delete(d.nodes, n.tag)
 }
 
@@ -712,6 +722,13 @@ func (d *DAGSync) handleRequestLinked(r *requestLinked) {
 		m := d.node(NewObjectRequest(link))
 		d.addDependency(n, m)
 	}
+	// Serialize updates to the same ref so a newer update cannot execute before an older one.
+	for _, rk := range refKeys(n.request) {
+		if prev := d.lastRefNode[rk]; prev != nil && prev != n && d.nodes[prev.tag] == prev {
+			d.addDependency(n, prev)
+		}
+		d.lastRefNode[rk] = n
+	}
 	for m, c := range n.revDeps {
 		m.degree += c
 		if m.degree == c && (m.state == QueuedState || m.state == FixingLinkValidationState) {
@@ -719,6 +736,34 @@ func (d *DAGSync) handleRequestLinked(r *requestLinked) {
 		}
 	}
 	d.activate(n)
+}
+
+func (d *DAGSync) cleanupNodeEdges(n *node) {
+	debugLog(d.logger, "execute for %q, going to lower degree of rev deps", n)
+	for m, c := range n.revDeps {
+		if m.deps[n] != c {
+			d.logger.Printf("BUG: execute - %s has a deps link to %s but revs do not match (%d != %d)", m, n, m.deps[n], c)
+		}
+		m.degree -= c
+		debugLog(d.logger, "execute lowering %q degree by %d because %q executed. degree after: %d", m, c, n, m.degree)
+		m.deps[n] -= c
+		if m.deps[n] == 0 {
+			delete(m.deps, n)
+		}
+		if m.degree == 0 && m.state == BlockedState {
+			d.transit(m, QueuedState)
+		}
+	}
+	for m, c := range n.deps {
+		if m.revDeps[n] != c {
+			d.logger.Printf("BUG: execute - %s has a revDeps link to %s but revs do not match (%d != %d)", m, n, m.revDeps[n], c)
+		}
+		m.revDeps[n] -= c
+		debugLog(d.logger, "execute lowering (%s).revDeps[%s] by %d because %q executed. m.revDeps[n] after: %d", m, n, c, n, m.revDeps[n])
+		if m.revDeps[n] == 0 {
+			delete(m.revDeps, n)
+		}
+	}
 }
 
 func (d *DAGSync) handleExecuted(e *executed) {
@@ -749,31 +794,7 @@ func (d *DAGSync) handleExecuted(e *executed) {
 		}
 	}
 
-	debugLog(d.logger, "execute for %q, going to lower degree of rev deps", n)
-	for m, c := range n.revDeps {
-		if m.deps[n] != c {
-			d.logger.Printf("BUG: execute - %s has a deps link to %s but revs do not match (%d != %d)", m, n, m.deps[n], c)
-		}
-		m.degree -= c
-		debugLog(d.logger, "execute lowering %q degree by %d because %q executed. degree after: %d", m, c, n, m.degree)
-		m.deps[n] -= c
-		if m.deps[n] == 0 {
-			delete(m.deps, n)
-		}
-		if m.degree == 0 && m.state == BlockedState {
-			d.transit(m, QueuedState)
-		}
-	}
-	for m, c := range n.deps {
-		if m.revDeps[n] != c {
-			d.logger.Printf("BUG: execute - %s has a revDeps link to %s but revs do not match (%d != %d)", m, n, m.revDeps[n], c)
-		}
-		m.revDeps[n] -= c
-		debugLog(d.logger, "execute lowering (%s).revDeps[%s] by %d because %q executed. m.revDeps[n] after: %d", m, n, c, n, m.revDeps[n])
-		if m.revDeps[n] == 0 {
-			delete(m.revDeps, n)
-		}
-	}
+	d.cleanupNodeEdges(n)
 	d.delete(n)
 	d.executedCallback(n, nil)
 }
@@ -781,8 +802,13 @@ func (d *DAGSync) handleExecuted(e *executed) {
 func (d *DAGSync) handleFailedExec(n *node, err error) {
 	n.retries++
 	var linkErr *remote.ErrObjectLinkValidation
+	var mismatchErr *remote.ErrRefMismatch
+	var tooLargeErr *remote.ErrMessageTooLarge
 	if errors.As(err, &linkErr) && len(linkErr.MissingLinks) > 0 {
 		d.handleMissingLinks(n, linkErr)
+	} else if errors.As(err, &mismatchErr) || errors.As(err, &tooLargeErr) {
+		d.cleanupNodeEdges(n)
+		d.delete(n)
 	} else {
 		d.transit(n, FailedState)
 		d.schedule(d.failedNodeCooldown(n), n, func() { d.Send(&retryFailedNode{n}) })
@@ -910,6 +936,22 @@ func (d *DAGSync) AddMapResult(from, to entities.Hash) fmt.Stringer {
 
 func (d *DAGSync) PutRefs(server string, project string, refs []entities.RefHash, callbacks ...Callback) fmt.Stringer {
 	r := &PutRefsRequest{server: server, project: project, refs: refs}
+	d.Send(&newRequest{request: r, callbacks: callbacks})
+	return r
+}
+
+func (d *DAGSync) XchgRef(server string, project string, ref string, desired, current entities.Hash, callbacks ...Callback) fmt.Stringer {
+	return d.XchgRefs(server, project, []entities.RefXchg{
+		{
+			Ref:     ref,
+			Current: current,
+			Desired: desired,
+		},
+	}, callbacks...)
+}
+
+func (d *DAGSync) XchgRefs(server string, project string, refs []entities.RefXchg, callbacks ...Callback) fmt.Stringer {
+	r := &XchgRefsRequest{server: server, project: project, refs: refs}
 	d.Send(&newRequest{request: r, callbacks: callbacks})
 	return r
 }

@@ -31,10 +31,32 @@ type RefHash struct {
 	Hash string
 }
 
+type RefXchg struct {
+	Ref     string
+	Current string
+	Desired string
+}
+
 type PutRefsReq struct {
 	Server   string
 	Project  string
 	Refs     []RefHash
+	Blocking bool
+}
+
+type XchgRefReq struct {
+	Server   string
+	Project  string
+	Ref      string
+	Current  string
+	Desired  string
+	Blocking bool
+}
+
+type XchgRefsReq struct {
+	Server   string
+	Project  string
+	Refs     []RefXchg
 	Blocking bool
 }
 
@@ -115,6 +137,8 @@ type PushBuildMetricsReq struct {
 type HTTP interface {
 	GetRefs(server string, project string, refs []string) ([]entities.Hash, error)
 	PutRefs(server string, project string, refs []entities.RefHash, blocking bool) error
+	XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash, blocking bool) error
+	XchgRefs(server string, project string, refs []entities.RefXchg, blocking bool) error
 	SearchRefs(server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error)
 	UseMany(hashes []entities.Hash) error
 	WaitIdle(timeout time.Duration) error

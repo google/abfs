@@ -645,3 +645,59 @@ func TestStateCountsOnTypeResolution(t *testing.T) {
 		}
 	}
 }
+
+func TestDAGSyncXchgRef(t *testing.T) {
+	updater := inmemory.New()
+	accessor := newTestAccessor()
+	d := dagsync.New(&dagsync.DagSyncOpts{Updater: updater, Accessor: accessor, WorkersCount: 1})
+	d.FailCooldown = time.Microsecond
+
+	accessor.blobs[hash1] = content1
+	accessor.blobs[hash2] = content2
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+
+	go func() {
+		d.Start(ctx)
+		close(stopped)
+	}()
+
+	// Chained XchgRef: ZeroHash -> hash1, then hash1 -> hash2
+	d.PutBlob(hash1)
+	d.PutBlob(hash2)
+	var err1, err2 error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	d.XchgRef("srv", "prj", "refs/heads/main", hash1, entities.ZeroHash, func(err error) {
+		err1 = err
+		wg.Done()
+	})
+	d.XchgRef("srv", "prj", "refs/heads/main", hash2, hash1, func(err error) {
+		err2 = err
+		wg.Done()
+	})
+	wg.Wait()
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	require.NoError(t, d.Wait(5*time.Second))
+
+	refs, err := updater.GetRefs(ctx, "srv", "prj", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash2}, refs)
+
+	// Mismatched XchgRef should fail permanently and not leave failed nodes in dagsync
+	done := make(chan error, 1)
+	d.XchgRef("srv", "prj", "refs/heads/main", hash1, entities.ZeroHash, func(err error) {
+		done <- err
+	})
+	mismatchErr := <-done
+	var refMismatch *entities.ErrRefMismatch
+	require.ErrorAs(t, mismatchErr, &refMismatch)
+	require.NoError(t, d.Wait(5*time.Second))
+	assertSyncIsGood(t, d)
+}

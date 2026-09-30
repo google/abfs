@@ -100,6 +100,14 @@ func (p *Provider) PutRefs(server string, project string, refs []entities.RefHas
 	return p.client.PutRefs(server, project, refs, blocking)
 }
 
+func (p *Provider) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash, blocking bool) error {
+	return p.client.XchgRef(server, project, ref, desired, current, blocking)
+}
+
+func (p *Provider) XchgRefs(server string, project string, refs []entities.RefXchg, blocking bool) error {
+	return p.client.XchgRefs(server, project, refs, blocking)
+}
+
 func (p *Provider) SearchRefs(server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	return p.client.SearchRefs(server, project, refPrefix, limit)
 }

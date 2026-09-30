@@ -455,6 +455,44 @@ func (s *fileBasedServer) PutRefs(ctx context.Context, server string, project st
 	return s.refStore.Put(server, project, refs)
 }
 
+// XchgRef implements remote.RemoteProvider.
+func (s *fileBasedServer) XchgRef(ctx context.Context, server string, project string, ref string, desired Hash, current Hash) error {
+	return s.XchgRefs(ctx, server, project, []entities.RefXchg{
+		{
+			Ref:     ref,
+			Current: current,
+			Desired: desired,
+		},
+	})
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (s *fileBasedServer) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	var missing []Hash
+	if s.validateLinks {
+		for _, ref := range refs {
+			if ref.Desired == entities.ZeroHash {
+				continue
+			}
+			ok, err := s.objExists(ref.Desired)
+			if err != nil {
+				return fmt.Errorf("error finding hash %q when validating ref %s/%s/%s links, err: %v", ref.Desired, server, project, ref.Ref, err)
+			}
+			if !ok {
+				missing = append(missing, ref.Desired)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return &remote.ErrObjectLinkValidation{MissingLinks: missing}
+	}
+
+	s.acquireIOSem()
+	defer s.releaseIOSem()
+
+	return s.refStore.Xchg(server, project, refs)
+}
+
 // SearchRefs implements remote.RemoteProvider.
 func (s *fileBasedServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	s.acquireIOSem()

@@ -189,6 +189,28 @@ func (r *LimitedRemoteProvider) PutRefs(ctx context.Context, server string, proj
 	})
 }
 
+// XchgRef implements RemoteProvider.
+func (r *LimitedRemoteProvider) XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	r.blockedCnt.Add(1)
+
+	return withConcurrencyLimit(ctx, r.getSem(), func(ctx context.Context) error {
+		r.blockedCnt.Add(-1)
+
+		return r.c.XchgRef(ctx, server, project, ref, desired, current)
+	})
+}
+
+// XchgRefs implements RemoteProvider.
+func (r *LimitedRemoteProvider) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	r.blockedCnt.Add(1)
+
+	return withConcurrencyLimit(ctx, r.getSem(), func(ctx context.Context) error {
+		r.blockedCnt.Add(-1)
+
+		return r.c.XchgRefs(ctx, server, project, refs)
+	})
+}
+
 // SearchRefs implements RemoteProvider.
 func (r *LimitedRemoteProvider) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	r.blockedCnt.Add(1)

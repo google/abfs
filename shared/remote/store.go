@@ -187,6 +187,16 @@ func (s *RemoteStore) PutRefs(server string, project string, refs []entities.Ref
 	return s.remote.PutRefs(context.TODO(), server, project, refs)
 }
 
+// XchgRef implements entities.CASStore.
+func (s *RemoteStore) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	return s.remote.XchgRef(context.TODO(), server, project, ref, desired, current)
+}
+
+// XchgRefs implements entities.CASStore.
+func (s *RemoteStore) XchgRefs(server string, project string, refs []entities.RefXchg) error {
+	return s.remote.XchgRefs(context.TODO(), server, project, refs)
+}
+
 // Close implements entities.CASStore.
 func (s *RemoteStore) Close() error {
 	return s.remote.Close()

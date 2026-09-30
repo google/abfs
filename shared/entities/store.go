@@ -50,6 +50,8 @@ type RefStore interface {
 	GetRefs(server string, project string, refs []string) ([]Hash, error)
 	SearchRefs(server string, project string, refPrefix string, limit int) ([]ProjectRefHash, error)
 	PutRefs(server string, project string, refs []RefHash) error
+	XchgRef(server string, project string, ref string, desired Hash, current Hash) error
+	XchgRefs(server string, project string, refs []RefXchg) error
 }
 
 type CASStore interface {

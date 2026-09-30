@@ -61,6 +61,14 @@ func (l *localOnlyClient) PutRefs(ctx context.Context, server string, project st
 	return errors.New("PutRefs unsupported with local only client")
 }
 
+func (l *localOnlyClient) XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	return errors.New("XchgRef unsupported with local only client")
+}
+
+func (l *localOnlyClient) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	return errors.New("XchgRefs unsupported with local only client")
+}
+
 func (l *localOnlyClient) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	return nil, errors.New("SearchRefs unsupported with local only client")
 }

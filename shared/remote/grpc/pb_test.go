@@ -84,6 +84,8 @@ type ServerImpl struct {
 	GetRefsImpl      func(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error)
 	SearchRefsImpl   func(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error)
 	PutRefsImpl      func(ctx context.Context, server string, project string, refs []remote.RefHash) error
+	XchgRefImpl      func(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error
+	XchgRefsImpl     func(ctx context.Context, server string, project string, refs []remote.RefXchg) error
 	MarkImpl         func(ctx context.Context, hash remote.Hash, key string, value string) (int64, error)
 	VersionImpl      func(ctx context.Context) (string, error)
 	WhoAmIImpl       func(ctx context.Context) (string, error)
@@ -127,6 +129,16 @@ func (s *ServerImpl) PutObject(ctx context.Context, key remote.Hash, reader remo
 // PutRefs implements remote.RemoteProvider.
 func (s *ServerImpl) PutRefs(ctx context.Context, server string, project string, refs []remote.RefHash) error {
 	return s.PutRefsImpl(ctx, server, project, refs)
+}
+
+// XchgRef implements remote.RemoteProvider.
+func (s *ServerImpl) XchgRef(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error {
+	return s.XchgRefImpl(ctx, server, project, ref, desired, current)
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (s *ServerImpl) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	return s.XchgRefsImpl(ctx, server, project, refs)
 }
 
 // SearchRefs implements remote.RemoteProvider.
@@ -585,4 +597,83 @@ func TestSHA256Simple(t *testing.T) {
 	got, err := client.SHA256(context.Background(), myKeys)
 	require.NoError(t, err)
 	require.Equal(t, shas, got)
+}
+
+func TestXchgRef(t *testing.T) {
+	cur := entities.NewHash("a0423896973644771497bdc03eb99d5281615b50")
+	des := entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
+	act := entities.NewHash("a0423896973644771497bdc03eb99d5281615b52")
+
+	var failMismatch bool
+	server := &ServerImpl{
+		XchgRefImpl: func(ctx context.Context, srv string, prj string, ref string, desired remote.Hash, current remote.Hash) error {
+			assert.Equal(t, "myserver", srv)
+			assert.Equal(t, "myproject", prj)
+			assert.Equal(t, "refs/heads/main", ref)
+			assert.Equal(t, des, desired)
+			assert.Equal(t, cur, current)
+			if failMismatch {
+				return &remote.ErrRefMismatch{
+					Ref:     ref,
+					Current: current,
+					Actual:  act,
+				}
+			}
+			return nil
+		},
+	}
+
+	client, stop := grpcPipe(t, server)
+	defer stop()
+
+	require.NoError(t, client.XchgRef(context.Background(), "myserver", "myproject", "refs/heads/main", des, cur))
+
+	failMismatch = true
+	err := client.XchgRef(context.Background(), "myserver", "myproject", "refs/heads/main", des, cur)
+	require.Error(t, err)
+	var mismatchErr *remote.ErrRefMismatch
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, "refs/heads/main", mismatchErr.Ref)
+	require.Equal(t, cur, mismatchErr.Current)
+	require.Equal(t, act, mismatchErr.Actual)
+}
+
+func TestXchgRefs(t *testing.T) {
+	cur := entities.NewHash("a0423896973644771497bdc03eb99d5281615b50")
+	des := entities.NewHash("a0423896973644771497bdc03eb99d5281615b51")
+	cur2 := entities.NewHash("a0423896973644771497bdc03eb99d5281615b52")
+	des2 := entities.NewHash("a0423896973644771497bdc03eb99d5281615b53")
+
+	expected := []remote.RefXchg{
+		{Ref: "refs/heads/main", Current: cur, Desired: des},
+		{Ref: "refs/heads/dev", Current: cur2, Desired: des2},
+	}
+
+	var calls int
+	server := &ServerImpl{
+		XchgRefsImpl: func(ctx context.Context, srv string, prj string, refs []remote.RefXchg) error {
+			calls++
+			assert.Equal(t, "myserver", srv)
+			assert.Equal(t, "myproject", prj)
+			assert.Equal(t, expected, refs)
+			return nil
+		},
+	}
+
+	client, stop := grpcPipe(t, server)
+	defer stop()
+
+	require.NoError(t, client.XchgRefs(context.Background(), "myserver", "myproject", expected))
+	require.Equal(t, 1, calls)
+
+	// Exceeding MaxMessageSize should be rejected on the client without invoking the RPC
+	hugeRef := string(bytes.Repeat([]byte("a"), MaxMessageSize))
+	err := client.XchgRefs(context.Background(), "myserver", "myproject", []remote.RefXchg{
+		{Ref: hugeRef, Current: cur, Desired: des},
+	})
+	var tooLargeErr *remote.ErrMessageTooLarge
+	require.ErrorAs(t, err, &tooLargeErr)
+	require.Equal(t, MaxMessageSize, tooLargeErr.MaxSize)
+	require.Greater(t, tooLargeErr.Size, MaxMessageSize)
+	require.Equal(t, 1, calls)
 }

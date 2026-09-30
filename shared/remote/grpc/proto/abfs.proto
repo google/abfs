@@ -31,6 +31,8 @@ service ABFS {
   rpc GetRefs(GetRefsRequest) returns (GetRefsReply) {}
   rpc SearchRefs(SearchRefsRequest) returns (SearchRefsReply) {}
   rpc PutRefs(PutRefsRequest) returns (PutRefsReply) {}
+  rpc XchgRef(XchgRefRequest) returns (XchgRefReply) {}
+  rpc XchgRefs(XchgRefsRequest) returns (XchgRefsReply) {}
 
   rpc GetVersion(GetVersionRequest) returns (GetVersionReply) {}
 
@@ -117,6 +119,12 @@ message RefHash {
   bytes hash = 2;
 }
 
+message RefXchg {
+  string ref = 1;
+  bytes current = 2;
+  bytes desired = 3;
+}
+
 message ProjectRefHash {
   string project = 1;
   string ref = 2;
@@ -151,6 +159,32 @@ message PutRefsRequest {
 }
 
 message PutRefsReply {
+}
+
+message XchgRefRequest {
+  string server = 1;
+  string project = 2;
+  string ref = 3;
+  bytes current = 4;
+  bytes desired = 5;
+}
+
+message XchgRefReply {
+}
+
+message XchgRefsRequest {
+  string server = 1;
+  string project = 2;
+  repeated RefXchg refs = 3;
+}
+
+message XchgRefsReply {
+}
+
+message RefMismatch {
+  string ref = 1;
+  bytes current = 2;
+  bytes actual = 3;
 }
 
 message ObjectLink {

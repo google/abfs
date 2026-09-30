@@ -151,12 +151,30 @@ func (s *LogRefStore) Put(server string, project string, refs []entities.RefHash
 	if err != nil {
 		return err
 	}
+	sRefs.mu.Lock()
+	defer sRefs.mu.Unlock()
 	for _, rh := range refs {
 		if err := sRefs.put(project, rh.Ref, rh.Hash); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *LogRefStore) Xchg(server string, project string, refs []entities.RefXchg) error {
+	if err := s.ensureSetup(); err != nil {
+		return err
+	}
+	if err := checkScheme(server); err != nil {
+		return err
+	}
+	cleaned := cleanServerPath(server)
+	project = strings.ReplaceAll(project, "/", "@")
+	sRefs, err := s.getOrCreateServer(cleaned)
+	if err != nil {
+		return err
+	}
+	return sRefs.xchg(project, refs)
 }
 
 func (s *LogRefStore) Get(server string, project string, refs []string) ([]entities.Hash, error) {
@@ -245,6 +263,7 @@ func (s *LogRefStore) getOrCreateServer(cleanedServer string) (*serverRefs, erro
 }
 
 type serverRefs struct {
+	mu       sync.Mutex
 	file     *os.File
 	projects *Folder
 	refs     *Folder
@@ -307,4 +326,27 @@ func (s *serverRefs) put(project, ref string, hash entities.Hash) error {
 	}
 	_, err := fmt.Fprintf(s.file, "%s %s %s\n", project, hash, ref)
 	return err
+}
+
+func (s *serverRefs) xchg(project string, refs []entities.RefXchg) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// All Current hashes are checked against pre-batch state before applying Desired updates
+	// (duplicate refs in a batch are not rejected; the last Desired value wins).
+	for _, rx := range refs {
+		actual := s.refs.Get(path.Join(rx.Ref, project))
+		if actual != rx.Current {
+			return &entities.ErrRefMismatch{
+				Ref:     rx.Ref,
+				Current: rx.Current,
+				Actual:  actual,
+			}
+		}
+	}
+	for _, rx := range refs {
+		if err := s.put(project, rx.Ref, rx.Desired); err != nil {
+			return err
+		}
+	}
+	return nil
 }

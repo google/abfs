@@ -243,6 +243,16 @@ func (c *RBEClient) PutRefs(ctx context.Context, server string, project string, 
 	return nil
 }
 
+// XchgRef delegates to fallback.
+func (c *RBEClient) XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	return nil
+}
+
+// XchgRefs delegates to fallback.
+func (c *RBEClient) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	return nil
+}
+
 // Mark delegates to fallback.
 func (c *RBEClient) Mark(ctx context.Context, hash entities.Hash, key, value string) (int64, error) {
 	return 0, nil

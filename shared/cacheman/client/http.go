@@ -111,6 +111,12 @@ func (c *HttpClient) doRequest(method, path string, req any, result any) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusConflict {
+			var mismatchErr entities.ErrRefMismatch
+			if err := json.Unmarshal(body, &mismatchErr); err == nil && mismatchErr.Ref != "" {
+				return fmt.Errorf("failed %s %s: %w", method, path, &mismatchErr)
+			}
+		}
 		var errString string
 		if err := json.Unmarshal(body, &errString); err == nil && errString != "" {
 			return fmt.Errorf("failed %s %s: %d %s %s", method, path, resp.StatusCode, resp.Status, errString)
@@ -183,6 +189,49 @@ func (c *HttpClient) PutRefs(server string, project string, refs []entities.RefH
 	}
 	if !resp {
 		return fmt.Errorf("expected true for put-refs request %+v", reqRefs)
+	}
+	return nil
+}
+
+func (c *HttpClient) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash, blocking bool) error {
+	req := protocol.XchgRefReq{
+		Server:   server,
+		Project:  project,
+		Ref:      ref,
+		Current:  current.String(),
+		Desired:  desired.String(),
+		Blocking: blocking,
+	}
+	var resp bool
+	if err := c.postJSON("/xchg-ref", req, &resp); err != nil {
+		return err
+	}
+	if !resp {
+		return fmt.Errorf("expected true for xchg-ref request %+v", req)
+	}
+	return nil
+}
+
+func (c *HttpClient) XchgRefs(server string, project string, refs []entities.RefXchg, blocking bool) error {
+	reqRefs := make([]protocol.RefXchg, len(refs))
+	for i, ref := range refs {
+		reqRefs[i].Ref = ref.Ref
+		reqRefs[i].Current = ref.Current.String()
+		reqRefs[i].Desired = ref.Desired.String()
+	}
+
+	req := protocol.XchgRefsReq{
+		Server:   server,
+		Project:  project,
+		Refs:     reqRefs,
+		Blocking: blocking,
+	}
+	var resp bool
+	if err := c.postJSON("/xchg-refs", req, &resp); err != nil {
+		return err
+	}
+	if !resp {
+		return fmt.Errorf("expected true for xchg-refs request %+v", reqRefs)
 	}
 	return nil
 }

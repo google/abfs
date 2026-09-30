@@ -178,6 +178,63 @@ func (s *ACLServer) PutRefs(ctx context.Context, server string, project string, 
 	return nil
 }
 
+func (s *ACLServer) XchgRef(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error {
+	user, err := s.requireUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	hasAccess, err := s.hasAccess(server, project, ref, user.Email, remote.AuthWrite)
+	if err != nil {
+		return err
+	}
+	if !hasAccess {
+		return &remote.ErrPermissionDenied{Action: fmt.Sprintf("%q", ref)}
+	}
+
+	if err := s.RemoteCloser.XchgRef(ctx, server, project, ref, desired, current); err != nil {
+		return err
+	}
+
+	if s.evaluator != nil && ref == remote.ACLRef {
+		s.evaluator.DropCaches()
+	}
+
+	return nil
+}
+
+func (s *ACLServer) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	user, err := s.requireUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, rx := range refs {
+		hasAccess, err := s.hasAccess(server, project, rx.Ref, user.Email, remote.AuthWrite)
+		if err != nil {
+			return err
+		}
+		if !hasAccess {
+			return &remote.ErrPermissionDenied{Action: fmt.Sprintf("%q", rx.Ref)}
+		}
+	}
+
+	if err := s.RemoteCloser.XchgRefs(ctx, server, project, refs); err != nil {
+		return err
+	}
+
+	if s.evaluator != nil {
+		for _, rx := range refs {
+			if rx.Ref == remote.ACLRef {
+				s.evaluator.DropCaches()
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
 func (s *ACLServer) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
 	if s.evaluator == nil {
 		return s.RemoteCloser.AddMapResult(ctx, from, to)

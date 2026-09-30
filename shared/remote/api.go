@@ -26,6 +26,8 @@ import (
 type (
 	Hash           = entities.Hash
 	RefHash        = entities.RefHash
+	RefXchg        = entities.RefXchg
+	ErrRefMismatch = entities.ErrRefMismatch
 	ProjectRefHash = entities.ProjectRefHash
 )
 
@@ -46,6 +48,8 @@ type RemoteProvider interface {
 	GetRefs(ctx context.Context, server string, project string, refs []string) ([]Hash, error)
 	SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]ProjectRefHash, error)
 	PutRefs(ctx context.Context, server string, project string, refs []RefHash) error
+	XchgRef(ctx context.Context, server string, project string, ref string, desired Hash, current Hash) error
+	XchgRefs(ctx context.Context, server string, project string, refs []RefXchg) error
 
 	Mark(ctx context.Context, hash Hash, key, value string) (int64, error)
 
@@ -111,3 +115,14 @@ func (e *ErrPermissionDenied) Error() string {
 }
 
 var _ error = (*ErrPermissionDenied)(nil)
+
+type ErrMessageTooLarge struct {
+	Size    int
+	MaxSize int
+}
+
+func (e *ErrMessageTooLarge) Error() string {
+	return fmt.Sprintf("request size %d exceeds maximum message size %d", e.Size, e.MaxSize)
+}
+
+var _ error = (*ErrMessageTooLarge)(nil)

@@ -213,6 +213,16 @@ func (t *testStore) PutRefs(server string, project string, refs []entities.RefHa
 	panic("unimplemented")
 }
 
+// XchgRef implements entities.CASStore.
+func (t *testStore) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	panic("unimplemented")
+}
+
+// XchgRefs implements entities.CASStore.
+func (t *testStore) XchgRefs(server string, project string, refs []entities.RefXchg) error {
+	panic("unimplemented")
+}
+
 // PutTree implements entities.CASStore.
 func (t *testStore) PutTree(ctx context.Context, key entities.Hash, content []byte, meta entities.TreeMeta) error {
 	panic("unimplemented")

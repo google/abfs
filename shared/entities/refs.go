@@ -14,6 +14,8 @@
 
 package entities
 
+import "fmt"
+
 const (
 	ABFSMetaServer  = "default-server"
 	ABFSMetaProject = "abfs-meta"
@@ -22,6 +24,22 @@ const (
 type RefHash struct {
 	Ref  string
 	Hash Hash
+}
+
+type RefXchg struct {
+	Ref     string
+	Current Hash
+	Desired Hash
+}
+
+type ErrRefMismatch struct {
+	Ref     string
+	Current Hash
+	Actual  Hash
+}
+
+func (e *ErrRefMismatch) Error() string {
+	return fmt.Sprintf("ref %q mismatch: expected current %s, actual %s", e.Ref, e.Current, e.Actual)
 }
 
 type ProjectRefHash struct {

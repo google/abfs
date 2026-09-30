@@ -129,6 +129,14 @@ func (c *Client) PutRefs(server string, project string, refs []entities.RefHash,
 	return c.httpClient.PutRefs(server, project, refs, blocking)
 }
 
+func (c *Client) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash, blocking bool) error {
+	return c.httpClient.XchgRef(server, project, ref, desired, current, blocking)
+}
+
+func (c *Client) XchgRefs(server string, project string, refs []entities.RefXchg, blocking bool) error {
+	return c.httpClient.XchgRefs(server, project, refs, blocking)
+}
+
 func (c *Client) UseMany(hashes []entities.Hash) error {
 	return c.httpClient.UseMany(hashes)
 }

@@ -215,6 +215,28 @@ func (s *LoggingServer) PutRefs(ctx context.Context, server string, project stri
 	return err
 }
 
+// XchgRef implements remote.RemoteProvider.
+func (s *LoggingServer) XchgRef(ctx context.Context, server string, project string, ref string, desired remote.Hash, current remote.Hash) error {
+	start := time.Now()
+
+	err := s.server.XchgRef(ctx, server, project, ref, desired, current)
+
+	s.logFunc(ctx, start, "XchgRef(%s,%s,%s,%s->%s)", err, server, project, ref, current, desired)
+
+	return err
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (s *LoggingServer) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	start := time.Now()
+
+	err := s.server.XchgRefs(ctx, server, project, refs)
+
+	s.logFunc(ctx, start, "XchgRefs(%s,%s,[%d])", err, server, project, len(refs))
+
+	return err
+}
+
 // Mark implements remote.RemoteProvider.
 func (s *LoggingServer) Mark(ctx context.Context, hash remote.Hash, key string, value string) (int64, error) {
 	start := time.Now()

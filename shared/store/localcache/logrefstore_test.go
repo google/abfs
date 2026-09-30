@@ -140,3 +140,47 @@ func TestPutRefSeparator(t *testing.T) {
 
 	require.NoError(t, err)
 }
+
+func TestRefStoreXchg(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewLogRefStore(tmpDir)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	// Initial Xchg from ZeroHash -> hash1 succeeds
+	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
+		{Ref: "heads/main", Current: entities.ZeroHash, Desired: hash1},
+	})
+	require.NoError(t, err)
+
+	refs, err := store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash1}, refs)
+
+	// Xchg with wrong Current fails with ErrRefMismatch
+	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
+		{Ref: "heads/main", Current: hash2, Desired: hash3},
+	})
+	var mismatchErr *entities.ErrRefMismatch
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, "heads/main", mismatchErr.Ref)
+	require.Equal(t, hash2, mismatchErr.Current)
+	require.Equal(t, hash1, mismatchErr.Actual)
+
+	// Ref remains hash1
+	refs, err = store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash1}, refs)
+
+	// Xchg from hash1 -> hash2 succeeds
+	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
+		{Ref: "heads/main", Current: hash1, Desired: hash2},
+	})
+	require.NoError(t, err)
+
+	refs, err = store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash2}, refs)
+}

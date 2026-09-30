@@ -46,6 +46,8 @@ func (c *CacheMan) httpHandler() http.Handler {
 	r.HandleFunc("/log", c.handlePutLog).Methods("PUT")
 	r.HandleFunc("/get-refs", c.handleGetRefs).Methods("POST")
 	r.HandleFunc("/put-refs", c.handlePutRefs).Methods("POST")
+	r.HandleFunc("/xchg-ref", c.handleXchgRef).Methods("POST")
+	r.HandleFunc("/xchg-refs", c.handleXchgRefs).Methods("POST")
 	r.HandleFunc("/search-refs", c.handleSearchRefs).Methods("POST")
 	r.HandleFunc("/sync/dump", c.handleSyncDump).Methods("GET")
 	r.HandleFunc("/sync/validate", c.handleSyncValidate).Methods("GET")
@@ -168,6 +170,12 @@ func (c *CacheMan) ReadJSON(w http.ResponseWriter, r *http.Request, value any) b
 }
 
 func (c *CacheMan) ErrorJSON(w http.ResponseWriter, r *http.Request, err error, status int) {
+	var mismatchErr *entities.ErrRefMismatch
+	if errors.As(err, &mismatchErr) {
+		w.WriteHeader(http.StatusConflict)
+		c.WriteJSON(w, r, mismatchErr)
+		return
+	}
 	w.WriteHeader(status)
 	c.WriteJSON(w, r, err.Error())
 }
@@ -269,6 +277,53 @@ func (c *CacheMan) handlePutRefs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := c.putRefs(req.Server, req.Project, refHashes, req.Blocking)
+	if err != nil {
+		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
+		return
+	}
+
+	c.WriteJSON(w, r, true)
+}
+
+func (c *CacheMan) handleXchgRef(w http.ResponseWriter, r *http.Request) {
+	var req protocol.XchgRefReq
+	if !c.ReadJSON(w, r, &req) {
+		return
+	}
+
+	c.pushRefsStat.Request.Add(1)
+	refXchgs := []entities.RefXchg{
+		{
+			Ref:     req.Ref,
+			Current: entities.NewHash(req.Current),
+			Desired: entities.NewHash(req.Desired),
+		},
+	}
+
+	err := c.xchgRefs(req.Server, req.Project, refXchgs, req.Blocking)
+	if err != nil {
+		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
+		return
+	}
+
+	c.WriteJSON(w, r, true)
+}
+
+func (c *CacheMan) handleXchgRefs(w http.ResponseWriter, r *http.Request) {
+	var req protocol.XchgRefsReq
+	if !c.ReadJSON(w, r, &req) {
+		return
+	}
+
+	c.pushRefsStat.Request.Add(1)
+	refXchgs := make([]entities.RefXchg, len(req.Refs))
+	for i, ref := range req.Refs {
+		refXchgs[i].Ref = ref.Ref
+		refXchgs[i].Current = entities.NewHash(ref.Current)
+		refXchgs[i].Desired = entities.NewHash(ref.Desired)
+	}
+
+	err := c.xchgRefs(req.Server, req.Project, refXchgs, req.Blocking)
 	if err != nil {
 		c.ErrorJSON(w, r, err, http.StatusInternalServerError)
 		return

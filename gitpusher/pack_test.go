@@ -194,6 +194,16 @@ func (m *MockRemoteProvider) PutRefs(ctx context.Context, server string, project
 	return args.Error(0)
 }
 
+func (m *MockRemoteProvider) XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	args := m.Called(ctx, server, project, ref, desired, current)
+	return args.Error(0)
+}
+
+func (m *MockRemoteProvider) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	args := m.Called(ctx, server, project, refs)
+	return args.Error(0)
+}
+
 func (m *MockRemoteProvider) Mark(ctx context.Context, hash entities.Hash, key, value string) (int64, error) {
 	args := m.Called(ctx, hash, key, value)
 	return args.Get(0).(int64), args.Error(1)

@@ -40,6 +40,20 @@ func WrapErrorInStatus(err error) error {
 		return status.Error(codes.PermissionDenied, permErr.Error())
 	}
 
+	var mismatchErr *remote.ErrRefMismatch
+	if errors.As(err, &mismatchErr) {
+		st := status.New(codes.Aborted, mismatchErr.Error())
+		stWithDetails, detailErr := st.WithDetails(&pb.RefMismatch{
+			Ref:     mismatchErr.Ref,
+			Current: HashToBytes(mismatchErr.Current),
+			Actual:  HashToBytes(mismatchErr.Actual),
+		})
+		if detailErr != nil {
+			return detailErr
+		}
+		return stWithDetails.Err()
+	}
+
 	return err
 }
 
@@ -56,7 +70,7 @@ func LinkValidationToStatus(e *remote.ErrObjectLinkValidation) (*status.Status, 
 	return st, nil
 }
 
-// UnwrapMissingLinkError looks for a grpc status error that has any ObjectLink details and unwraps it
+// UnwrapMissingLinkError looks for a grpc status error that has any ObjectLink or RefMismatch details and unwraps it
 // into a native Go error if found.
 func UnwrapMissingLinkError(err error) error {
 	if s, ok := status.FromError(err); ok {
@@ -66,6 +80,12 @@ func UnwrapMissingLinkError(err error) error {
 			case *pb.ObjectLink:
 				h := HashFromInputBytes(t.Key)
 				objs = append(objs, h)
+			case *pb.RefMismatch:
+				return &remote.ErrRefMismatch{
+					Ref:     t.Ref,
+					Current: HashFromInputBytes(t.Current),
+					Actual:  HashFromInputBytes(t.Actual),
+				}
 			}
 		}
 		if len(objs) > 0 {

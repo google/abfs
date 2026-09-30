@@ -44,6 +44,7 @@ var ErrIncompatibleExisting = errors.New("existing cache is not compatible with 
 
 type RefStore interface {
 	Put(server string, project string, refs []entities.RefHash) error
+	Xchg(server string, project string, refs []entities.RefXchg) error
 	Get(server string, project string, refs []string) ([]entities.Hash, error)
 	Search(server string, project string, refPrefix string) ([]entities.ProjectRefHash, error)
 	Close() error
@@ -604,6 +605,25 @@ func (c *LocalCache) PutRefs(server string, project string, refs []entities.RefH
 		return errors.New("no ref-store is set")
 	}
 	return c.refStore.Put(server, project, refs)
+}
+
+// XchgRef implements entities.CASStore.
+func (c *LocalCache) XchgRef(server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	return c.XchgRefs(server, project, []entities.RefXchg{
+		{
+			Ref:     ref,
+			Current: current,
+			Desired: desired,
+		},
+	})
+}
+
+// XchgRefs implements entities.CASStore.
+func (c *LocalCache) XchgRefs(server string, project string, refs []entities.RefXchg) error {
+	if c.refStore == nil {
+		return errors.New("no ref-store is set")
+	}
+	return c.refStore.Xchg(server, project, refs)
 }
 
 // SearchRefs implements entities.CASStore.

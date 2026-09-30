@@ -193,6 +193,33 @@ func (s *PBServer) PutRefs(ctx context.Context, req *pb.PutRefsRequest) (*pb.Put
 	return &pb.PutRefsReply{}, nil
 }
 
+// XchgRef implements ABFSServer.
+func (s *PBServer) XchgRef(ctx context.Context, req *pb.XchgRefRequest) (*pb.XchgRefReply, error) {
+	desired := HashFromInputBytes(req.Desired)
+	current := HashFromInputBytes(req.Current)
+	if err := s.server.XchgRef(ctx, req.Server, req.Project, req.Ref, desired, current); err != nil {
+		return nil, WrapErrorInStatus(err)
+	}
+	return &pb.XchgRefReply{}, nil
+}
+
+// XchgRefs implements ABFSServer.
+func (s *PBServer) XchgRefs(ctx context.Context, req *pb.XchgRefsRequest) (*pb.XchgRefsReply, error) {
+	refs := make([]entities.RefXchg, len(req.Refs))
+	for i, rx := range req.Refs {
+		refs[i] = entities.RefXchg{
+			Ref:     rx.Ref,
+			Current: HashFromInputBytes(rx.Current),
+			Desired: HashFromInputBytes(rx.Desired),
+		}
+	}
+
+	if err := s.server.XchgRefs(ctx, req.Server, req.Project, refs); err != nil {
+		return nil, WrapErrorInStatus(err)
+	}
+	return &pb.XchgRefsReply{}, nil
+}
+
 // GetVersion implements ABFSServer.
 func (s *PBServer) GetVersion(ctx context.Context, req *pb.GetVersionRequest) (*pb.GetVersionReply, error) {
 	version, err := s.server.Version(ctx)

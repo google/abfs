@@ -153,6 +153,22 @@ func (c *ABFSClient) PutRefs(ctx context.Context, server string, project string,
 	return c.cm.getRefs().PutRefs(ctx, instance.MaybeRemoveScheme(server), project, refs)
 }
 
+// XchgRef implements remote.RemoteProvider.
+func (c *ABFSClient) XchgRef(ctx context.Context, server string, project string, ref string, desired entities.Hash, current entities.Hash) error {
+	ctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+	defer cancel()
+
+	return c.cm.getRefs().XchgRef(ctx, instance.MaybeRemoveScheme(server), project, ref, desired, current)
+}
+
+// XchgRefs implements remote.RemoteProvider.
+func (c *ABFSClient) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	ctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
+	defer cancel()
+
+	return c.cm.getRefs().XchgRefs(ctx, instance.MaybeRemoveScheme(server), project, refs)
+}
+
 // SearchRefs implements remote.RemoteProvider.
 func (c *ABFSClient) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	ctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
