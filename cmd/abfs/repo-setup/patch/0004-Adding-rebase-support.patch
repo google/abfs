@@ -1,0 +1,39 @@
+From de3e034abd2aa8793abb7d65946ea6be44d0abed Mon Sep 17 00:00:00 2001
+From: ABFS Authors <abfs@example.com>
+Date: Wed, 24 Jun 2026 02:29:59 +0000
+Subject: [PATCH 4/4] Adding rebase support
+
+---
+ abfs.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/abfs.py b/abfs.py
+index 08e4eda..09480f5 100644
+--- a/abfs.py
++++ b/abfs.py
+@@ -160,11 +160,11 @@ class Abfs:
+                     cwd=cwd,
+                 )
+         except FileNotFoundError:
+-            logger.Error("Failed command: %s", " ".join(cmd))
++            logger.error("Failed command: %s", " ".join(cmd))
+             logger.error("Binary '%s' not found in PATH.", self.binary)
+             raise AbfsError(cmd, -1, "", f"Binary '{self.binary}' not found.")
+         except Exception as e:
+-            logger.Error("Failed command: %s", " ".join(cmd))
++            logger.error("Failed command: %s", " ".join(cmd))
+             logger.error("Unexpected error running abfs: %s", e)
+             raise AbfsError(cmd, -1, "", str(e))
+ 
+@@ -236,6 +236,8 @@ class Abfs:
+         flags = AbfsFlags()
+         if getattr(opt, 'jobs', None):
+             flags.add("--jobs", opt.jobs)
++        if getattr(opt, 'rebase', False):
++            flags.add("--rebase")
+ 
+         self.run(
+             ["repo", "sync"] + args,
+-- 
+2.55.0.rc0.799.gd6f94ed593-goog
+

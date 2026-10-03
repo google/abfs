@@ -1,0 +1,52 @@
+// Copyright 2016 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package manifest
+
+import (
+	"encoding/xml"
+	"os"
+	"strings"
+)
+
+func (p *Project) parse() {
+	for _, s := range strings.Split(p.GroupsString, ",") {
+		if s == "" {
+			continue
+		}
+		p.Groups = append(p.Groups, s)
+	}
+}
+
+// Parse parses the given XML data.
+func Parse(contents []byte) (*Manifest, error) {
+	var m Manifest
+	if err := xml.Unmarshal(contents, &m); err != nil {
+		return nil, err
+	}
+
+	for i := range m.Project {
+		m.Project[i].parse()
+	}
+	return &m, nil
+}
+
+// ParseFile reads and parses an XML file
+func ParseFile(name string) (*Manifest, error) {
+	content, err := os.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(content)
+}

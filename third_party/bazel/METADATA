@@ -1,0 +1,23 @@
+name: "bazel"
+description:
+    "Bazel Remote Output Service protocol definitions "
+    "(src/main/protobuf/bazel_output_service.proto and "
+    "bazel_output_service_rev2.proto) and the Go code generated from them, "
+    "used by the ABFS Bazel daemon."
+
+third_party {
+  identifier {
+    type: "Git"
+    value: "https://github.com/bazelbuild/bazel"
+    primary_source: true
+    version: "37dbdcf14d3691b956b16e02bda8e79e42a16f2e"
+  }
+  version: "37dbdcf14d3691b956b16e02bda8e79e42a16f2e"
+  last_upgrade_date { year: 2026 month: 10 day: 3 }
+  license_type: NOTICE
+  local_modifications:
+      "Only the two .proto files are copied, unmodified. The *.pb.go files "
+      "are generated from them into Go package outputservice "
+      "(github.com/google/abfs/third_party/bazel/src/main/protobuf) using "
+      "protoc M options; see README.abfs.md for the command."
+}

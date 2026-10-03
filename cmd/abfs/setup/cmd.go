@@ -1,0 +1,613 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package setup
+
+import (
+	"bytes"
+	"context"
+	_ "embed"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/spf13/pflag"
+
+	"github.com/google/abfs"
+	"github.com/google/abfs/binding"
+	"github.com/google/abfs/ninjago"
+	"github.com/google/abfs/shared/bindcas"
+	"github.com/google/abfs/shared/cmd"
+	"github.com/google/abfs/shared/cmd/args"
+	"github.com/google/abfs/shared/cmd/clierr"
+	"github.com/google/abfs/shared/cmd/optflags"
+	"github.com/google/abfs/shared/cmd/root"
+	"github.com/google/abfs/shared/entities"
+)
+
+var (
+	//go:embed blueprint.diff
+	blueprintDiff []byte
+)
+
+const buildToolsRelativeDir = "prebuilts/build-tools"
+
+func binDir() (string, error) {
+	switch runtime.GOOS {
+	case "linux":
+		return filepath.Join(buildToolsRelativeDir, "linux-x86", "bin"), nil
+	case "darwin":
+		return filepath.Join(buildToolsRelativeDir, "darwin-x86", "bin"), nil
+	default:
+		return "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+}
+
+type setupCmd struct {
+	*root.RootCmd
+	*cmd.ConfigProvider
+	abfsSourceDir    string
+	mountPoint       string
+	Chroot           string
+	quiet            bool
+	verbose          bool
+	listOverlays     bool
+	DisableCGO       bool
+	OverrideCacheDir string
+	CompiledDir      string
+	abfs             *binding.Client
+	buildToolsDir    string
+	abfsDir          string
+	BuildFromSource  bool
+	DoBlueprintPatch bool
+	AndroidTarget    string
+
+	// Config Overrides
+	EvalSalt              *string
+	EvalNoCache           *bool
+	NoARES                *bool
+	StrictTappingOff      *bool
+	SkipTapSoongBuild     *bool
+	LogMismatches         *bool
+	PrefetchInputs        *bool
+	ConcurrencyMultiplier *float64
+}
+
+func NewCmd(rootCmd *root.RootCmd) *setupCmd {
+	return &setupCmd{RootCmd: rootCmd}
+}
+
+func (c *setupCmd) Spec() cmd.CmdSpec {
+	return cmd.CmdSpec{
+		Name:    "setup",
+		Usage:   "[-l] [-q] [-s <source-dir>] [-c <chroot>] [-o <overlays>] [--salt <salt>] <casfs root or descendant>",
+		Aliases: []string{},
+		Desc: `Setup an already mounted abfs environment for an abfs build.
+
+If $ABFS_NSJAIL_CONFIG is set, it names the NSJail build config XML (relative
+to the mount point) that selects the overlays and views for --target.`,
+	}
+}
+
+func (c *setupCmd) RegisterFlags(fl *pflag.FlagSet) {
+	fl.StringVarP(&c.abfsSourceDir, "source-dir", "s", ".", "The ABFS source directory to compile the patches from")
+	fl.StringVarP(&c.Chroot, "chroot", "c", "", "The root to apply applicable overlays on top, relative to mount point")
+	fl.BoolVarP(&c.quiet, "quiet", "q", false, "Do not print any logs")
+	fl.BoolVarP(&c.verbose, "verbose", "v", false, "Print the logs of steps")
+	fl.BoolVarP(&c.listOverlays, "overlays-list", "l", false, "List the available overlay combinations")
+	fl.BoolVar(&c.DisableCGO, "disable-cgo", true, "Build with CGO_ENABLED=0")
+	fl.StringSliceVarP(&[]string{}, "overlays", "o", nil, "Deprecated and ignored - overlays are read from the NSJail build config ($ABFS_NSJAIL_CONFIG)")
+	fl.StringVarP(&c.AndroidTarget, "target", "t", "", "The android target to determine proper overlays and views.")
+	fl.StringVar(&c.OverrideCacheDir, "override-cache", "", "To override the cache dir written in the ninjago config file")
+	fl.StringVar(&c.CompiledDir, "compiled", "", "Use compiled binaries in this directory instead of building them")
+	fl.BoolVar(&c.BuildFromSource, "source", false, "Force rebuilding from source instead of using prebuilt binaries in the path")
+	fl.BoolVar(&c.DoBlueprintPatch, "blueprint-patch", false, "Apply Blueprint patch")
+
+	optflags.OptString(fl, &c.EvalSalt, "salt", "", "Evaluation salt to use")
+	optflags.OptBool(fl, &c.EvalNoCache, "no-cache", "", "Do not use cache during the evaluation")
+	optflags.OptBool(fl, &c.NoARES, "no-ares", "", "Do not use ARES (remote execution service)")
+	optflags.OptBool(fl, &c.StrictTappingOff, "no-strict-tap", "", "Disable strict filesystem tapping")
+	optflags.OptBool(fl, &c.SkipTapSoongBuild, "skip-tap-soong-build", "", "Skip tapping soong build commands")
+	optflags.OptBool(fl, &c.LogMismatches, "log-mismatches", "", fmt.Sprintf("Enable logging tap mismatches. Logs to $OUT_DIR/%s and the logfile's hash is stored in the final Build object", entities.MismatchesLogFile))
+	optflags.OptBool(fl, &c.PrefetchInputs, "prefetch-inputs", "", "Prefetch inputs for ninja jobs in case of cache-miss")
+	optflags.OptFloat64(fl, &c.ConcurrencyMultiplier, "concurrency-multiplier", "", 0.75, "Multiplier (0.0 to 1.0) applied to CPU count to define concurrency limits")
+}
+
+func (c *setupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
+	var err error
+	c.mountPoint, err = cmd.MountPoint(args.EnsureSingleArg(fl))
+	if err != nil {
+		log.Fatalf("Could not find mount point: %v", err)
+	}
+
+	// Ensure that Chroot isn't written into ninjago.conf
+	// with trailing /
+	if c.Chroot != "" {
+		c.Chroot = filepath.Clean(c.Chroot)
+	}
+
+	nsjailCfg, err := entities.LoadNSJailConfig(c.mountPoint)
+	if err != nil && !entities.IsNotExist(err) {
+		fmt.Printf("Warning: failed to load nsjail config file: %v\n", err)
+	}
+
+	if c.AndroidTarget != "" {
+		overlays := nsjailCfg.OverlaysForBuildTarget(c.AndroidTarget)
+		views := nsjailCfg.ViewsForBuildTarget(c.AndroidTarget)
+
+		fmt.Printf("Overlays for Android target %s: %s\n", c.AndroidTarget, overlays)
+		fmt.Printf("Views for Android target %s: %s\n", c.AndroidTarget, views)
+
+		if (len(overlays) + len(views)) > 0 {
+			if c.Chroot == "" {
+				return clierr.CLIErr("Chroot is necessary to apply overlays. Please use --chroot/-c option.")
+			}
+		}
+	}
+
+	if c.listOverlays {
+		return c.printOverlays()
+	}
+
+	if c.BuildFromSource && c.CompiledDir != "" {
+		return clierr.CLIErr("--source and --compiled cannot be used together")
+	}
+
+	if c.ConfigProvider == nil {
+		return clierr.CLIErr("ConfigProvider of setup cmd not set")
+	}
+
+	if c.Config == nil {
+		return clierr.CLIErr("Config of setup cmd not set")
+	}
+
+	c.abfs, err = binding.NewClient(c.mountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := c.abfs.Close(); err != nil {
+			fmt.Printf("Error closing abfs client: %v\n", err)
+		}
+	}()
+
+	return c.run()
+}
+
+func (c *setupCmd) goBuild(args ...string) error {
+	args = append([]string{"build"}, args...)
+	cmd := exec.Command("go", args...)
+	cmd.Dir = c.abfsSourceDir
+	cmd.Env = os.Environ()
+	if c.DisableCGO {
+		cmd.Env = append(cmd.Env, "CGO_ENABLED=0")
+	}
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+// TODO: Remove this after prebuilts are checked in
+func (c *setupCmd) createPrebuilts() error {
+	c.log("Copying ABFS binaries...")
+
+	if err := c.writeGitExclude(); err != nil {
+		c.log("Failed to write git exclude file, so abfs binaries will appear in repo status. err: %v", err)
+	}
+
+	if err := c.installABFSWrap(); err != nil {
+		return err
+	}
+
+	if err := c.installABFSBox(); err != nil {
+		return err
+	}
+
+	if err := c.patchCKati(); err != nil {
+		return err
+	}
+
+	if err := c.installNinja(); err != nil {
+		return err
+	}
+
+	if err := c.installABFSMap(); err != nil {
+		return err
+	}
+
+	if err := c.installABFSBazelDaemon(); err != nil {
+		return err
+	}
+
+	if err := c.installRbetap(); err != nil {
+		return err
+	}
+
+	return c.installTap()
+}
+
+func (c *setupCmd) run() error {
+	if c.BuildFromSource {
+		if _, err := os.Stat("./cmd/abfs/abfs.go"); entities.IsNotExist(err) {
+			return clierr.CLIErr("'setup' must be ran from abfs module root with --source")
+		}
+	}
+
+	if c.Chroot != "" {
+		chrootPath := filepath.Join(c.mountPoint, c.Chroot)
+		socketPath := filepath.Join(chrootPath, entities.ABFSSocketFileName)
+		if stat, err := os.Stat(socketPath); err == nil && stat.IsDir() { // NO errors means exists
+			log.Println("Chroot already setup, ignoring the rest of setup")
+			return nil
+		}
+		if err := c.setupChroot(chrootPath); err != nil {
+			return err
+		}
+	}
+
+	c.buildToolsDir = filepath.Join(c.mountPoint, c.Chroot, buildToolsRelativeDir)
+	binDirPath, err := binDir()
+	if err != nil {
+		return err
+	}
+	c.abfsDir = filepath.Join(c.mountPoint, c.Chroot, binDirPath)
+	if err := os.MkdirAll(c.abfsDir, 0700); err != nil {
+		return err
+	}
+
+	if err := c.createPrebuilts(); err != nil {
+		return err
+	}
+
+	if err := c.writeNinjaConfig(); err != nil {
+		return err
+	}
+
+	if c.DoBlueprintPatch {
+		if err := c.patchBlueprint(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *setupCmd) log(format string, a ...any) {
+	if !c.quiet {
+		fmt.Printf(format+"\n", a...)
+	}
+}
+
+func (c *setupCmd) getEffectiveOverlays() []string {
+	nsjailCfg, err := entities.LoadNSJailConfig(c.mountPoint)
+
+	if err != nil {
+		if !entities.IsNotExist(err) {
+			fmt.Printf("Warning: failed to load nsjail config file: %v\n", err)
+		}
+		return nil
+	}
+	return nsjailCfg.OverlaysForBuildTarget(c.AndroidTarget)
+}
+
+func (c *setupCmd) getEffectiveViews() []string {
+	nsjailCfg, err := entities.LoadNSJailConfig(c.mountPoint)
+	if err != nil {
+		return nil
+	}
+	return nsjailCfg.ViewsForBuildTarget(c.AndroidTarget)
+}
+
+func (c *setupCmd) printOverlays() error {
+	fmt.Println("Available overlays from the source tree:")
+	entries, err := os.ReadDir(filepath.Join(c.mountPoint, "overlays"))
+	if err != nil {
+		return err
+	}
+
+	for _, ent := range entries {
+		if ent.IsDir() && !strings.HasPrefix(ent.Name(), ".") {
+			fmt.Printf("  %s\n", ent.Name())
+		}
+	}
+	return nil
+}
+
+func (c *setupCmd) setupChroot(p string) error {
+	c.log("Create chroot for %s, mount %s overlays on top, and exclude from parent hash. Including projects that that contain these views: %s",
+		c.Chroot,
+		strings.Join(c.getEffectiveOverlays(), ","),
+		strings.Join(c.getEffectiveViews(), "\n"),
+	)
+	if err := c.abfs.Chroot(c.Chroot, c.getEffectiveOverlays(), c.getEffectiveViews()); err != nil {
+		return err
+	}
+
+	// Exclude chroot from parent hash
+	if err := bindcas.SetExcluded(p, true); err != nil {
+		return err
+	}
+
+	// the mount-details object is needed inside the chroot for abfsbox build-started and build-finished
+	sourceMountDetails := filepath.Join(c.mountPoint, abfs.MountDetailsFileName)
+	destMountDetails := filepath.Join(c.mountPoint, c.Chroot, abfs.MountDetailsFileName)
+	if err := os.MkdirAll(filepath.Dir(destMountDetails), 0755); err != nil {
+		return fmt.Errorf("error while creating directory for mount details %s: %w", filepath.Dir(destMountDetails), err)
+	}
+	if err := os.WriteFile(destMountDetails, nil, 0644); err != nil {
+		return fmt.Errorf("error while creating mount details file %s: %w", destMountDetails, err)
+	}
+	if err := bindcas.CopyHashSize(sourceMountDetails, destMountDetails); err != nil {
+		return fmt.Errorf("error while reading copying mount details file hash/size from %s to %s: %w", sourceMountDetails, destMountDetails, err)
+	}
+	if err := bindcas.SetExcluded(destMountDetails, true); err != nil {
+		return fmt.Errorf("error while setting mount details file %s as excluded: %w", destMountDetails, err)
+	}
+
+	// Soong expects the mount-details file to be at .repo/mount-details inside the chroot
+	chrootRepoDir := filepath.Join(c.mountPoint, c.Chroot, ".repo")
+	if err := os.MkdirAll(chrootRepoDir, 0755); err != nil {
+		return fmt.Errorf("error creating .repo directory in chroot: %w", err)
+	}
+	chrootMountDetailsSym := filepath.Join(chrootRepoDir, "mount-details")
+	if _, err := os.Lstat(chrootMountDetailsSym); errors.Is(err, os.ErrNotExist) {
+		// Create relative symlink: .repo/mount-details -> ../.abfs.mount-details
+		if err := os.Symlink(filepath.Join("..", abfs.MountDetailsFileName), chrootMountDetailsSym); err != nil {
+			return fmt.Errorf("error creating mount-details symlink in chroot: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *setupCmd) installBinary(binary string, buildOpts []string) error {
+	noCGoBinary := binary + "-no-cgo"
+
+	destPath := filepath.Join(c.abfsDir, binary)
+	if c.CompiledDir != "" {
+		if c.DisableCGO {
+			binaryPath := filepath.Join(c.CompiledDir, noCGoBinary)
+			if c.verbose {
+				c.log("Copy compiled %s command-line from %q to %q", noCGoBinary, binaryPath, destPath)
+			}
+			if err := copyFile(destPath, 0755, binaryPath); err == nil || !entities.IsNotExist(err) {
+				return err
+			}
+			// if it wasn't found (err == isNotExist), fall though to check for regular binary
+		}
+		binaryPath := filepath.Join(c.CompiledDir, binary)
+		if c.verbose {
+			c.log("Copy compiled %s from %q to %q", binary, binaryPath, destPath)
+		}
+		return copyFile(destPath, 0755, binaryPath)
+	} else if !c.BuildFromSource && c.DisableCGO {
+		if path := getExecutablePath(noCGoBinary); path != "" {
+			if c.verbose {
+				c.log("Copy compiled %s command-line from %q to %q", noCGoBinary, path, destPath)
+			}
+			return copyFile(destPath, 0755, path)
+		}
+	}
+	// fall back to building even though we might not be in the right directory
+	if c.verbose {
+		c.log("Compile %s and write it to %s", binary, destPath)
+	}
+	opts := append([]string{"-o", destPath}, buildOpts...)
+	return c.goBuild(opts...)
+}
+
+// writeGitExclude is so that our binaries don't show up in `repo status` or `git status`
+// in the prebuilts/build-tools project.
+func (c *setupCmd) writeGitExclude() (returnErr error) {
+	content := []byte(
+		`# AUTO-GENERATED BY ABFS
+# These are the binaries that abfs added here and we are hiding them from your repo status command
+/*-x86/bin/abfs*
+/*-x86/bin/ckati-wrap
+/*-x86/bin/ninjago
+/*-x86/bin/tap
+/*-x86/bin/rbetap
+# END AUTO-GENERATED BY ABFS
+`)
+	excludePath := filepath.Join(c.buildToolsDir, ".git", "info", "exclude")
+	// skip writing if it already has our header in it
+	if _, err := os.Stat(excludePath); err == nil {
+		if existing, err := os.ReadFile(excludePath); err == nil {
+			if strings.Contains(string(existing), "AUTO-GENERATED BY ABFS") {
+				return nil
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
+		return fmt.Errorf("failed to create git excludes directory %q: %w", filepath.Dir(excludePath), err)
+	}
+	// append in case file already exists with some content
+	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open git excludes file %q: %w", excludePath, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil && returnErr == nil {
+			returnErr = fmt.Errorf("failed to close git excludes file %q: %w", excludePath, err)
+		}
+	}()
+	if _, err := f.Write(content); err != nil {
+		return fmt.Errorf("failed to append to git excludes file %q: %w", excludePath, err)
+	}
+	return nil
+}
+
+func (c *setupCmd) installABFSWrap() error {
+	return c.installBinary("abfs-wrap", []string{"./cmd/abfs-wrap/abfs-wrap.go"})
+}
+
+func (c *setupCmd) installABFSMap() error {
+	return c.installBinary("abfs-cmd-map", []string{"./cmd/abfs-cmd-map/abfs-cmd-map.go"})
+}
+
+func (c *setupCmd) installABFSBox() error {
+	// Don't raise error as it can be used as a fall-back
+	files, _ := filepath.Glob("./cmd/abfsbox/*.go")
+	return c.installBinary("abfsbox", files)
+}
+
+func (c *setupCmd) installNinja() error {
+	return c.installBinary("ninjago", []string{"./cmd/ninjago/ninjago.go"})
+}
+
+func (c *setupCmd) installTap() error {
+	return c.installBinary("tap", []string{"./cmd/tap/tap.go"})
+}
+
+func (c *setupCmd) installRbetap() error {
+	return c.installBinary("rbetap", []string{"./cmd/rbetap/main.go"})
+}
+
+func (c *setupCmd) installABFSBazelDaemon() error {
+	return c.installBinary("abfs-bazel-daemon", []string{"./cmd/abfs-bazel-daemon/abfs-bazel-daemon.go"})
+}
+
+func (c *setupCmd) patchCKati() error {
+	binDirPath, err := binDir()
+	if err != nil {
+		return err
+	}
+	ckatiPath := filepath.Join(c.abfsDir, "ckati-wrap")
+
+	ckati := `#!/bin/bash
+
+		exec ` + binDirPath + `/abfs-wrap --input-list ${OUT_DIR}/.module_paths/Android.mk.list --input-list ${OUT_DIR}/.module_paths/AndroidProducts.mk.list --input-list ${OUT_DIR}/.module_paths/CleanSpec.mk.list --input-list ${OUT_DIR}/.module_paths/configuration.list --input-list ${OUT_DIR}/.module_paths/release_config_map.list --input-path ${OUT_DIR}/file_name_tag.txt  --input-path ${OUT_DIR}/soong/soong_phony_targets.mk -- ` + binDirPath + `/ckati "$@"
+	`
+	if err := os.WriteFile(ckatiPath, []byte(ckati), 0755); err != nil {
+		return fmt.Errorf("cannot write the new ckati: %w", err)
+	}
+	return nil
+}
+
+func (c *setupCmd) writeNinjaConfig() error {
+	confPath := filepath.Join(c.mountPoint, c.Chroot, ninjago.ConfigFile)
+	c.log("Write ninjago config to %s", confPath)
+
+	cacheDir := c.Config.CacheDir
+	if c.OverrideCacheDir != "" {
+		cacheDir = c.OverrideCacheDir
+	}
+	evalSalt := c.Config.SetupEvalSalt
+	if c.EvalSalt != nil {
+		evalSalt = *c.EvalSalt
+	}
+
+	evalNoCache := c.Config.SetupEvalNoCache
+	if c.EvalNoCache != nil {
+		evalNoCache = *c.EvalNoCache
+	}
+
+	noARES := c.Config.SetupNoARES
+	if c.NoARES != nil {
+		noARES = *c.NoARES
+	}
+
+	logMismatches := c.Config.SetupLogMismatches
+	if c.LogMismatches != nil {
+		logMismatches = *c.LogMismatches
+	}
+
+	strictTappingOff := !c.Config.SetupStrictTapping
+	if c.StrictTappingOff != nil {
+		strictTappingOff = *c.StrictTappingOff
+	}
+
+	skipTapSoongBuild := c.Config.SetupSkipTapSoongBuild
+	if c.SkipTapSoongBuild != nil {
+		skipTapSoongBuild = *c.SkipTapSoongBuild
+	}
+
+	prefetchInputs := c.Config.SetupPrefetchInputs
+	if c.PrefetchInputs != nil {
+		prefetchInputs = *c.PrefetchInputs
+	}
+
+	concurrencyMultiplier := 0.75
+	if c.ConcurrencyMultiplier != nil {
+		concurrencyMultiplier = *c.ConcurrencyMultiplier
+	}
+
+	conf := ninjago.Configuration{
+		Chroot:                  c.Chroot,
+		CacheDir:                cacheDir,
+		LocalOnly:               c.Config.LocalOnly,
+		LogMismatches:           logMismatches,
+		FetchTimeout:            c.Config.FetchTimeout,
+		EvalSalt:                evalSalt,
+		EvalNoCache:             evalNoCache,
+		OrderOnlyAsRegularInput: c.Config.SetupOrderOnlyAsRegular,
+		NoARES:                  noARES,
+		PSICPU:                  c.Config.SetupPSICPU,
+		PSIIO:                   c.Config.SetupPSIIO,
+		PSIMem:                  c.Config.SetupPSIMem,
+		RemoteCC:                c.Config.SetupRemoteCC,
+		RemoteJava:              c.Config.SetupRemoteJava,
+		RemoteKotlin:            c.Config.SetupRemoteKotlin,
+		RemoteMetalava:          c.Config.SetupRemoteMetalava,
+		RemoteBootstrap:         c.Config.SetupRemoteBootstrap,
+		RemoteRust:              c.Config.SetupRemoteRust,
+		IgnoreEvalCacheRegexStr: c.Config.SetupIgnoreEvalCacheRegex,
+		NoFallbackIfRemoteFails: c.Config.SetupNoLocalFallback,
+		StrictTappingOff:        strictTappingOff,
+		IgnoreSoongEnvAvail:     c.Config.IgnoreSoongEnvAvail,
+		SkipTapSoongBuild:       skipTapSoongBuild,
+		PrefetchInputs:          prefetchInputs,
+		ConcurrencyMultiplier:   concurrencyMultiplier,
+	}
+	return conf.Write(confPath)
+}
+
+func (c *setupCmd) patchBlueprint() error {
+	return c.gitApply(filepath.Join(c.mountPoint, c.Chroot, "build/blueprint"), blueprintDiff)
+}
+
+func (c *setupCmd) gitApply(gitRepo string, patch []byte) error {
+	c.log("applying patch to gitRepo at %q", gitRepo)
+	cmd := exec.Command("git", "-C", gitRepo, "reset", "--hard")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run git reset: %s", err)
+	}
+	cmd = exec.Command("git", "-C", gitRepo, "apply")
+	cmd.Stdin = bytes.NewReader(patch)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func copyFile(dst string, dstPerm os.FileMode, src string) error {
+	content, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, content, dstPerm)
+}
+
+func getExecutablePath(command string) string {
+	p, err := exec.LookPath(command)
+	if err != nil {
+		return ""
+	}
+	return p
+}

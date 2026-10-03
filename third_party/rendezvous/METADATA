@@ -1,0 +1,24 @@
+name: "rendezvous"
+description:
+    "Rendezvous (highest random weight) hashing, used by ABFS to shard work "
+    "such as Git pushers and remote server connections."
+
+third_party {
+  identifier {
+    type: "Git"
+    value: "https://github.com/tysonmote/rendezvous"
+    primary_source: true
+    version: "84eb962597662d26b663fba59135c9b69f17109d"
+  }
+  version: "84eb962597662d26b663fba59135c9b69f17109d"
+  last_upgrade_date { year: 2023 month: 6 day: 5 }
+  license_type: NOTICE
+  local_modifications:
+      "Only rendezvous.go (with the package comment from doc.go) is kept, "
+      "and it is reworked: scores are the SHA-1 of node and key compared as "
+      "byte strings instead of CRC-32C, the type is Hasher with Node, Key "
+      "and Score byte-slice types and no internal locking, and GetN sorts an "
+      "index slice instead of reordering the nodes. LICENSE.md is renamed to "
+      "LICENSE, a short copyright/SPDX header is added, and README.abfs.md "
+      "documents the changes."
+}

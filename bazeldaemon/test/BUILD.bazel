@@ -1,0 +1,66 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load(":symlink.bzl", "ln_symlink_rule")
+load(":directory.bzl", "directory_rule", "create_directory_rule")
+
+directory_rule(
+    name = "dir1"
+)
+
+ln_symlink_rule(
+    name = "ln_symlink",
+    target_file = "hello.txt",
+)
+
+genrule(
+    name = "use_symlink",
+    srcs = ["ln_symlink"],
+    # srcs = ["link_created_by_ln.txt"],
+    outs = ["hello.out"],
+    cmd = "readlink -v $(location :ln_symlink)> $@",
+)
+
+create_directory_rule(
+    name = "dir4"
+)
+
+genrule(
+    name = "use_create_directory_rule",
+    srcs = [":dir4"],
+    # outs = ["dir4/bar.txt"],
+    # cmd = "touch {}/bar.txt".format("$(location :dir4)"),
+    outs = ["bar.txt"],
+    cmd = "stat {}/.config >$@".format("$(location :dir4)"),
+)
+
+# cc_binary(
+#     name = "hello",
+#     srcs = ["hello.c"],
+# )
+
+# genrule(
+#     name = "call_hello",
+#     outs = ["hello.txt"],
+#     tools = ["hello"],
+#     cmd = "$(execpath :hello) > $@",
+# )
+    
+# genrule(
+#     name = "foo",
+#     outs = ["foo.txt"],
+#     cmd = ": > $@",
+# )
+
+

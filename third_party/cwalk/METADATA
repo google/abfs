@@ -1,0 +1,23 @@
+name: "cwalk"
+description:
+    "Concurrent version of Go's filepath.Walk."
+
+third_party {
+  identifier {
+    type: "Git"
+    value: "https://github.com/iafan/cwalk"
+    primary_source: true
+    version: "586a8832a711021ca304ee0129a70b7daaeb5363"
+  }
+  version: "586a8832a711021ca304ee0129a70b7daaeb5363"
+  last_upgrade_date { year: 2025 month: 12 day: 3 }
+  license_type: NOTICE
+  local_modifications:
+      "cwalk.go is patched so that filepath.SkipDir returned for a regular "
+      "file skips only that file, each path is processed as its own job with "
+      "errors (including broken symlinks) reported per path, and the walk "
+      "root is handled like any other path. cwalk_test.go is new and tests "
+      "the SkipDir behavior. MIT-LICENSE.txt is renamed to LICENSE, short "
+      "copyright/SPDX headers are added to the modified and new Go files, "
+      "and README.abfs.md documents the changes in more detail."
+}

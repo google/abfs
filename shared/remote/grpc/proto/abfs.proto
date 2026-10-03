@@ -1,0 +1,165 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+option go_package = "github.com/google/abfs/shared/remote/grpc/proto";
+
+package abfs;
+
+service ABFS {
+  rpc Headers (HeadersRequest) returns (HeadersReply) {}
+  rpc SHA256 (SHA256Request) returns (SHA256Reply) {}
+
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectReply) {}
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectReply) {}
+
+  rpc MapResults(MapResultsRequest) returns (MapResultsReply) {}
+  rpc AddMapResult(AddMapResultRequest) returns (AddMapResultReply) {}
+
+  rpc GetRefs(GetRefsRequest) returns (GetRefsReply) {}
+  rpc SearchRefs(SearchRefsRequest) returns (SearchRefsReply) {}
+  rpc PutRefs(PutRefsRequest) returns (PutRefsReply) {}
+
+  rpc GetVersion(GetVersionRequest) returns (GetVersionReply) {}
+
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIReply) {}
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIReply {
+  string sub = 1;
+  string email = 2;
+  bool email_verified = 3;
+}
+
+// Proto doesn't have constants, so this is a hack that GCS client uses for constant integers.
+enum ServiceConstants {
+  // Unused. Proto3 requires first enum to be 0.
+  UNSPECIFIED=0;
+  // Same max size as GCS client.
+  // 4 MB - 100.
+  MAX_CHUNK_BYTES = 4194204;
+}
+
+message ObjectHeader {
+  string type = 1;
+  int64 size = 2;
+}
+
+message HeadersRequest {
+  repeated bytes keys = 1;
+}
+
+message HeadersReply {
+  repeated ObjectHeader headers = 1;
+}
+
+message SHA256Request {
+  repeated bytes keys = 1;
+}
+
+message SHA256Reply {
+  repeated bytes sha256 = 1;
+}
+
+message Chunk {
+  bytes key = 1;
+  string encoding = 2;
+  bool is_last = 3;
+  bytes data = 4;
+}
+
+message GetObjectRequest {
+  bytes key = 1;
+}
+
+message GetObjectReply {
+  Chunk chunk = 1;
+}
+
+message PutObjectRequest {
+  Chunk chunk = 1;
+}
+
+message PutObjectReply {}
+
+message MapResultsRequest {
+  bytes id = 1;
+}
+
+message MapResultsReply {
+  repeated bytes results = 1;
+}
+
+message AddMapResultRequest {
+  bytes from = 1;
+  bytes to = 2;
+}
+
+message AddMapResultReply {
+}
+
+message RefHash {
+  string ref = 1;
+  bytes hash = 2;
+}
+
+message ProjectRefHash {
+  string project = 1;
+  string ref = 2;
+  bytes hash = 3;
+}
+
+message GetRefsRequest {
+  string server = 1;
+  string project = 2;
+  repeated string refs = 3;
+}
+
+message GetRefsReply {
+  repeated bytes hashes = 1;
+}
+
+message SearchRefsRequest {
+  string server = 1;
+  string project = 2;
+  string refPrefix = 3;
+  int32 limit = 4;
+}
+
+message SearchRefsReply {
+  repeated ProjectRefHash result = 1;
+}
+
+message PutRefsRequest {
+  string server = 1;
+  string project = 2;
+  repeated RefHash refs = 3;
+}
+
+message PutRefsReply {
+}
+
+message ObjectLink {
+  bytes key = 1;
+}
+
+message GetVersionRequest {
+}
+
+message GetVersionReply {
+  string version = 1;
+}

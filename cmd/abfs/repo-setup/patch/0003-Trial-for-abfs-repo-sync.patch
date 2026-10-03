@@ -1,0 +1,127 @@
+From 315365b1a0a8b71805174c538ecb0e6219313035 Mon Sep 17 00:00:00 2001
+From: ABFS Authors <abfs@example.com>
+Date: Mon, 11 May 2026 08:16:12 +0000
+Subject: [PATCH 3/4] Trial for abfs repo sync
+
+---
+ abfs.py         | 73 +++++++++++++++++++++++++++++++++++++++++++------
+ subcmds/sync.py |  8 ++++++
+ 2 files changed, 72 insertions(+), 9 deletions(-)
+
+diff --git a/abfs.py b/abfs.py
+index 62d4ae2..08e4eda 100644
+--- a/abfs.py
++++ b/abfs.py
+@@ -101,6 +101,7 @@ class Abfs:
+         input_data: Optional[str] = None,
+         env: Optional[Dict[str, str]] = None,
+         cwd: Optional[str] = None,
++        stream_output: bool = False,
+     ) -> subprocess.CompletedProcess:
+         """
+         Run the abfs binary with the given arguments and flags.
+@@ -136,15 +137,28 @@ class Abfs:
+             if env:
+                 full_env.update(env)
+ 
+-            result = subprocess.run(
+-                cmd,
+-                input=input_data,
+-                capture_output=True,
+-                text=True,
+-                check=False,  # We handle checking manually to wrap the error
+-                env=full_env,
+-                cwd=cwd,
+-            )
++            if stream_output:
++                result = subprocess.run(
++                    cmd,
++                    input=input_data,
++                    capture_output=False,
++                    check=False,
++                    env=full_env,
++                    cwd=cwd,
++                )
++                if check and result.returncode != 0:
++                    raise AbfsError(cmd, result.returncode, "", "")
++                return result
++            else:
++                result = subprocess.run(
++                    cmd,
++                    input=input_data,
++                    capture_output=True,
++                    text=True,
++                    check=False,  # We handle checking manually to wrap the error
++                    env=full_env,
++                    cwd=cwd,
++                )
+         except FileNotFoundError:
+             logger.Error("Failed command: %s", " ".join(cmd))
+             logger.error("Binary '%s' not found in PATH.", self.binary)
+@@ -189,3 +203,44 @@ class Abfs:
+             flags=flags,
+         )
+         return result.stdout.strip()
++
++    def _get_version(self) -> str:
++        try:
++            result = self.run(["--version"], check=False, stream_output=False)
++            return result.stdout.strip()
++        except Exception:
++            return ""
++
++    def repo_sync(self, args: List[str], opt: Any):
++        version_str = self._get_version()
++        prefix = version_str.split('-')[0]
++        try:
++            version_tuple = tuple(int(x) for x in prefix.split('.'))
++        except ValueError:
++            version_tuple = (0, 0, 0)
++
++        if version_tuple > (0, 1, 14):
++            import sys
++            try:
++                sync_idx = sys.argv.index('sync')
++                args_to_pass = sys.argv[sync_idx + 1:]
++            except ValueError:
++                args_to_pass = sys.argv[2:]
++
++            self.run(
++                ["repo", "sync"] + args_to_pass,
++                stream_output=True,
++            )
++            return ""
++
++        flags = AbfsFlags()
++        if getattr(opt, 'jobs', None):
++            flags.add("--jobs", opt.jobs)
++
++        self.run(
++            ["repo", "sync"] + args,
++            flags=flags,
++            stream_output=True,
++        )
++        return ""
++
+diff --git a/subcmds/sync.py b/subcmds/sync.py
+index 2b9cafe..d2f1992 100644
+--- a/subcmds/sync.py
++++ b/subcmds/sync.py
+@@ -2165,6 +2165,14 @@ later is required to fix a server side protocol bug.
+                 warned = True
+ 
+     def Execute(self, opt, args):
++        try:
++            import abfs
++            if not os.environ.get(abfs.NO_ABFS_ENV):
++                abfs.Abfs(topdir=self.manifest.topdir).repo_sync(args, opt)
++                return
++        except Exception as e:
++            logger.error("abfs repo sync failed or not applicable: %s", e)
++
+         errors = []
+         start_time = time.time()
+         try:
+-- 
+2.55.0.rc0.799.gd6f94ed593-goog
+
