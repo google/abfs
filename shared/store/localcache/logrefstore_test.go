@@ -149,6 +149,11 @@ func TestRefStoreXchg(t *testing.T) {
 		require.NoError(t, store.Close())
 	}()
 
+	// Empty Xchg is a no-op and does not create the server entry.
+	require.NoError(t, store.Xchg("example-server", manifestProject, nil))
+	_, err = store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.Error(t, err)
+
 	// Initial Xchg from ZeroHash -> hash1 succeeds
 	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
 		{Ref: "heads/main", Current: entities.ZeroHash, Desired: hash1},
@@ -183,4 +188,29 @@ func TestRefStoreXchg(t *testing.T) {
 	refs, err = store.Get("example-server", manifestProject, []string{"heads/main"})
 	require.NoError(t, err)
 	require.Equal(t, []entities.Hash{hash2}, refs)
+
+	// Duplicate ref in batch with unchained Current fails and leaves ref unchanged.
+	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
+		{Ref: "heads/main", Current: hash2, Desired: hash1},
+		{Ref: "heads/main", Current: hash2, Desired: hash3},
+	})
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, "heads/main", mismatchErr.Ref)
+	require.Equal(t, hash2, mismatchErr.Current)
+	require.Equal(t, hash1, mismatchErr.Actual)
+
+	refs, err = store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash2}, refs)
+
+	// Chained duplicate ref in batch (hash2 -> hash1 -> hash3) succeeds.
+	err = store.Xchg("example-server", manifestProject, []entities.RefXchg{
+		{Ref: "heads/main", Current: hash2, Desired: hash1},
+		{Ref: "heads/main", Current: hash1, Desired: hash3},
+	})
+	require.NoError(t, err)
+
+	refs, err = store.Get("example-server", manifestProject, []string{"heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{hash3}, refs)
 }

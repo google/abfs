@@ -107,3 +107,37 @@ func TestInMemoryServer_SearchRefs(t *testing.T) {
 		}
 	})
 }
+
+func TestInMemoryServer_XchgRefs(t *testing.T) {
+	ctx := context.Background()
+	server := New()
+
+	// Empty XchgRefs is a no-op.
+	require.NoError(t, server.XchgRefs(ctx, "srv", "prj", nil))
+
+	// Chained updates on the same ref in a single batch succeed (ZeroHash -> EmptyFileHash -> EmptyDirHash).
+	err := server.XchgRefs(ctx, "srv", "prj", []remote.RefXchg{
+		{Ref: "refs/heads/main", Current: entities.ZeroHash, Desired: entities.EmptyFileHash},
+		{Ref: "refs/heads/main", Current: entities.EmptyFileHash, Desired: entities.EmptyDirHash},
+	})
+	require.NoError(t, err)
+
+	got, err := server.GetRefs(ctx, "srv", "prj", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []remote.Hash{entities.EmptyDirHash}, got)
+
+	// Unchained duplicate ref in a batch fails and does not mutate existing refs.
+	err = server.XchgRefs(ctx, "srv", "prj", []remote.RefXchg{
+		{Ref: "refs/heads/main", Current: entities.EmptyDirHash, Desired: entities.EmptyFileHash},
+		{Ref: "refs/heads/main", Current: entities.EmptyDirHash, Desired: entities.ZeroHash},
+	})
+	var mismatchErr *remote.ErrRefMismatch
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, "refs/heads/main", mismatchErr.Ref)
+	require.Equal(t, entities.EmptyDirHash, mismatchErr.Current)
+	require.Equal(t, entities.EmptyFileHash, mismatchErr.Actual)
+
+	got, err = server.GetRefs(ctx, "srv", "prj", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, []remote.Hash{entities.EmptyDirHash}, got)
+}

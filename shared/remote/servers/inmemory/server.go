@@ -316,6 +316,10 @@ func (s *InMemoryServer) XchgRef(ctx context.Context, server string, project str
 
 // XchgRefs implements remote.RemoteProvider.
 func (s *InMemoryServer) XchgRefs(ctx context.Context, server string, project string, refs []remote.RefXchg) error {
+	if len(refs) == 0 {
+		return nil
+	}
+
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -337,10 +341,12 @@ func (s *InMemoryServer) XchgRefs(ctx context.Context, server string, project st
 		}
 	}
 
-	// All Current hashes are checked against pre-batch state before applying Desired updates
-	// (duplicate refs in a batch are not rejected; the last Desired value wins).
+	staged := make(map[string]remote.Hash, len(refs))
 	for _, ref := range refs {
-		actual := prj[ref.Ref]
+		actual, ok := staged[ref.Ref]
+		if !ok {
+			actual = prj[ref.Ref]
+		}
 		if actual != ref.Current {
 			return &remote.ErrRefMismatch{
 				Ref:     ref.Ref,
@@ -348,11 +354,12 @@ func (s *InMemoryServer) XchgRefs(ctx context.Context, server string, project st
 				Actual:  actual,
 			}
 		}
+		staged[ref.Ref] = ref.Desired
 	}
 
 	log.Printf("xchg %d refs for server=%s project=%s", len(refs), server, project)
-	for _, ref := range refs {
-		prj[ref.Ref] = ref.Desired
+	for ref, desired := range staged {
+		prj[ref] = desired
 	}
 
 	return nil

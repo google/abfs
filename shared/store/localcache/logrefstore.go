@@ -168,6 +168,9 @@ func (s *LogRefStore) Xchg(server string, project string, refs []entities.RefXch
 	if err := checkScheme(server); err != nil {
 		return err
 	}
+	if len(refs) == 0 {
+		return nil
+	}
 	cleaned := cleanServerPath(server)
 	project = strings.ReplaceAll(project, "/", "@")
 	sRefs, err := s.getOrCreateServer(cleaned)
@@ -329,12 +332,17 @@ func (s *serverRefs) put(project, ref string, hash entities.Hash) error {
 }
 
 func (s *serverRefs) xchg(project string, refs []entities.RefXchg) error {
+	if len(refs) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// All Current hashes are checked against pre-batch state before applying Desired updates
-	// (duplicate refs in a batch are not rejected; the last Desired value wins).
+	staged := make(map[string]entities.Hash, len(refs))
 	for _, rx := range refs {
-		actual := s.refs.Get(path.Join(rx.Ref, project))
+		actual, ok := staged[rx.Ref]
+		if !ok {
+			actual = s.refs.Get(path.Join(rx.Ref, project))
+		}
 		if actual != rx.Current {
 			return &entities.ErrRefMismatch{
 				Ref:     rx.Ref,
@@ -342,9 +350,10 @@ func (s *serverRefs) xchg(project string, refs []entities.RefXchg) error {
 				Actual:  actual,
 			}
 		}
+		staged[rx.Ref] = rx.Desired
 	}
-	for _, rx := range refs {
-		if err := s.put(project, rx.Ref, rx.Desired); err != nil {
+	for ref, desired := range staged {
+		if err := s.put(project, ref, desired); err != nil {
 			return err
 		}
 	}

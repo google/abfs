@@ -157,3 +157,47 @@ func TestPutObject_DuplicateBig(t *testing.T) {
 	require.NoError(err, "error reading content")
 	require.Equal(got, content)
 }
+
+func TestXchgRefs(t *testing.T) {
+	require := require.New(t)
+
+	s, close := Setup(t)
+	defer close()
+
+	ctx := context.Background()
+	c1 := []byte("blob 4\x00one\n")
+	h1 := objects.HashBytes(c1)
+	require.NoError(s.PutObject(ctx, h1, remote.NewZStdContentReader(c1)))
+
+	c2 := []byte("blob 4\x00two\n")
+	h2 := objects.HashBytes(c2)
+	require.NoError(s.PutObject(ctx, h2, remote.NewZStdContentReader(c2)))
+
+	// Empty XchgRefs is a no-op.
+	require.NoError(s.XchgRefs(ctx, "srv", "prj", nil))
+
+	// Chained updates on the same ref in a single batch succeed (ZeroHash -> h1 -> h2).
+	require.NoError(s.XchgRefs(ctx, "srv", "prj", []entities.RefXchg{
+		{Ref: "refs/heads/main", Current: entities.ZeroHash, Desired: h1},
+		{Ref: "refs/heads/main", Current: h1, Desired: h2},
+	}))
+
+	got, err := s.GetRefs(ctx, "srv", "prj", []string{"refs/heads/main"})
+	require.NoError(err)
+	require.Equal([]Hash{h2}, got)
+
+	// Unchained duplicate ref in a batch fails and leaves ref at h2.
+	err = s.XchgRefs(ctx, "srv", "prj", []entities.RefXchg{
+		{Ref: "refs/heads/main", Current: h2, Desired: h1},
+		{Ref: "refs/heads/main", Current: h2, Desired: entities.ZeroHash},
+	})
+	var mismatchErr *entities.ErrRefMismatch
+	require.ErrorAs(err, &mismatchErr)
+	require.Equal("refs/heads/main", mismatchErr.Ref)
+	require.Equal(h2, mismatchErr.Current)
+	require.Equal(h1, mismatchErr.Actual)
+
+	got, err = s.GetRefs(ctx, "srv", "prj", []string{"refs/heads/main"})
+	require.NoError(err)
+	require.Equal([]Hash{h2}, got)
+}

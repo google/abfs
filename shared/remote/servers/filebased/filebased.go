@@ -468,6 +468,10 @@ func (s *fileBasedServer) XchgRef(ctx context.Context, server string, project st
 
 // XchgRefs implements remote.RemoteProvider.
 func (s *fileBasedServer) XchgRefs(ctx context.Context, server string, project string, refs []entities.RefXchg) error {
+	if len(refs) == 0 {
+		return nil
+	}
+
 	var missing []Hash
 	if s.validateLinks {
 		for _, ref := range refs {
