@@ -176,14 +176,18 @@ func killABFSProcesses() {
 	}
 }
 
-func execCmd(command string, args []string, errorMsg string) {
+// execCmd runs a command, logging a warning if it fails, and returns whether it
+// succeeded.
+func execCmd(command string, args []string, errorMsg string) bool {
 	cmd := exec.Command(command, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		log.Printf("Warning: %s: %v", errorMsg, err)
+		return false
 	}
+	return true
 }
 
 func removeSystemdServices() {
@@ -264,8 +268,36 @@ func removeBashCompletions() {
 	}
 }
 
+// casfsLoaded reports whether the casfs filesystem is registered with the
+// kernel, i.e. whether the casfs kernel module is loaded. If
+// /proc/filesystems can't be read, it assumes casfs is loaded.
+func casfsLoaded() bool {
+	data, err := os.ReadFile("/proc/filesystems")
+	if err != nil {
+		log.Printf("Warning: failed to read /proc/filesystems: %v", err)
+		return true
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// Each line is an optional "nodev" flag followed by the filesystem name.
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[len(fields)-1] == "casfs" {
+			return true
+		}
+	}
+	return false
+}
+
 func removeCASFS() {
-	execCmd("sudo", []string{"modprobe", "-r", "casfs"}, "failed to remove casfs kernel module")
+	if !casfsLoaded() {
+		log.Println("CASFS kernel module is not loaded")
+		return
+	}
+	if execCmd("sudo", []string{"modprobe", "-r", "casfs"}, "modprobe -r casfs failed, trying rmmod") {
+		return
+	}
+	// casfs built from source and loaded with insmod isn't installed under
+	// /lib/modules, so modprobe can't find it.
+	execCmd("sudo", []string{"rmmod", "casfs"}, "failed to remove casfs kernel module")
 }
 
 func removeBaseDirConcurrently(ctx context.Context) error {
