@@ -18,18 +18,19 @@ import (
 	"log"
 	"os"
 
-	"github.com/google/ninja-go"
+	ninjago "github.com/google/ninja-go"
 
 	abfsninjago "github.com/google/abfs/ninjago"
 )
 
 func main() {
 	backend := abfsninjago.NewABFSBackend()
-	defer func() {
-		if err := backend.Close(); err != nil {
-			log.Printf("Error closing backend: %v", err)
-			os.Exit(1)
+	code := ninjago.Main(backend)
+	if err := backend.Close(); err != nil {
+		log.Printf("Error closing backend: %v", err)
+		if code == 0 {
+			code = 1
 		}
-	}()
-	ninjago.Main(backend)
+	}
+	os.Exit(code)
 }
