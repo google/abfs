@@ -47,12 +47,9 @@ func (c *initCmd) Spec() cmd.CmdSpec {
 func (c *initCmd) RegisterFlags(fl *pflag.FlagSet) {
 }
 
+// We need to health-check ARES so cacheman knows if it is supported or not
 func NewARESClient(address string, authInfo instance.AuthInfo) (remote.ARESService, error) {
-	return aresclient.NewARESClientWithOptions(&aresclient.ARESClientOpts{
-		Address:         address,
-		AuthInfo:        authInfo,
-		SkipHealthCheck: true,
-	})
+	return aresclient.NewARESClient(address, authInfo)
 }
 
 func (c *initCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {

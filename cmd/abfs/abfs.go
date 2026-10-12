@@ -100,13 +100,9 @@ func expired() bool {
 	return exp.Compare(time.Now()) == -1
 }
 
-// We skip health-check with cacheman so that it can start with an unhealthy connection.
+// We need to health-check ARES so cacheman knows if it is supported or not
 func NewARESClient(address string, authInfo instance.AuthInfo) (remote.ARESService, error) {
-	return aresclient.NewARESClientWithOptions(&aresclient.ARESClientOpts{
-		Address:         address,
-		AuthInfo:        authInfo,
-		SkipHealthCheck: true,
-	})
+	return aresclient.NewARESClient(address, authInfo)
 }
 
 func populateRootABFSCommands() *root.RootCmd {
