@@ -136,41 +136,49 @@ abfs-bazel-daemon-no-cgo:
 	CGO_ENABLED=0 go build -ldflags="$(VERSION_LDFLAGS) -X github.com/google/abfs/shared/instance.forceFlavor=abfs.bazel-daemon" \
 	  -o $(DESTDIR)/abfs-bazel-daemon-no-cgo cmd/abfs-bazel-daemon/abfs-bazel-daemon.go
 
-# Set SKIP_SETCAP=1 to skip granting file capabilities (e.g. when building as part of a package).
+# Set SKIP_SETCAP=1 to skip granting permissions for binaries (e.g. when building as part of a
+# package).
+# getcap and setcap are usually installed in /usr/sbin or /sbin, which aren't on
+# a normal user's PATH on some distributions (e.g. Debian), so look there too.
+GETCAP ?= $(shell PATH="$$PATH:/usr/sbin:/sbin" command -v getcap)
+SETCAP ?= $(shell PATH="$$PATH:/usr/sbin:/sbin" command -v setcap)
+
+# Fail if getcap or setcap is missing
+define check-setcap
+@if [[ -z "$(GETCAP)" || -z "$(SETCAP)" ]]; then \
+	echo "ERROR: getcap/setcap not found in PATH, /usr/sbin or /sbin." >&2; \
+	echo "They are needed to grant file capabilities to $@." >&2; \
+	echo "Install them ('sudo apt install libcap2-bin' on Debian/Ubuntu) and run make again," >&2; \
+	echo "or set SKIP_SETCAP=1 to skip granting capabilities." >&2; \
+	exit 1; \
+fi
+endef
+
 casfs-mounter:
 	go install -ldflags="$(VERSION_LDFLAGS)" cmd/casfs-mounter/casfs-mounter.go
 ifeq ($(SKIP_SETCAP), )
-	@if command -v getcap > /dev/null && command -v setcap > /dev/null; then \
-		{ \
-		getcap $(DESTDIR)/casfs-mounter | grep --quiet --ignore-case "cap_sys_admin=ep" || \
+	$(check-setcap)
+	@"$(GETCAP)" $(DESTDIR)/casfs-mounter | grep --quiet --ignore-case "cap_sys_admin=ep" || \
 		(echo "casfs-mounter needs CAP_SYS_ADMIN permissions, so you might be asked for a sudo password here." && \
-		sudo setcap CAP_SYS_ADMIN,CAP_SYS_MODULE+ep $(DESTDIR)/casfs-mounter) ;\
-		} \
-	fi
+		sudo "$(SETCAP)" CAP_SYS_ADMIN,CAP_SYS_MODULE+ep $(DESTDIR)/casfs-mounter)
 endif
 
 casfuse-mounter:
 	go install -ldflags="$(VERSION_LDFLAGS)" cmd/casfuse-mounter/casfuse-mounter.go
 ifeq ($(SKIP_SETCAP), )
-	@if command -v getcap > /dev/null && command -v setcap > /dev/null; then \
-		{ \
-		getcap $(DESTDIR)/casfuse-mounter | grep --quiet --ignore-case "cap_sys_resource=ep" || \
+	$(check-setcap)
+	@"$(GETCAP)" $(DESTDIR)/casfuse-mounter | grep --quiet --ignore-case "cap_sys_resource=ep" || \
 		(echo "casfuse-mounter needs CAP_SYS_RESOURCE permissions, so you might be asked for a sudo password here." && \
-		sudo setcap CAP_SYS_RESOURCE+ep $(DESTDIR)/casfuse-mounter) ;\
-		} \
-	fi
+		sudo "$(SETCAP)" CAP_SYS_RESOURCE+ep $(DESTDIR)/casfuse-mounter)
 endif
 
 abfs-resources:
 	go install cmd/abfs-resources/abfs-resources.go
 ifeq ($(SKIP_SETCAP), )
-	@if command -v getcap > /dev/null && command -v setcap > /dev/null; then \
-		{ \
-		getcap $(DESTDIR)/abfs-resources | grep --quiet --ignore-case "cap_dac_override,cap_syslog=ep" || \
+	$(check-setcap)
+	@"$(GETCAP)" $(DESTDIR)/abfs-resources | grep --quiet --ignore-case "cap_dac_override,cap_syslog=ep" || \
 		(echo "abfs-resources needs CAP_DAC_OVERRIDE and CAP_SYSLOG permissions, so you might be asked for a sudo password here." && \
-		sudo setcap cap_dac_override,cap_syslog+ep $(DESTDIR)/abfs-resources) ;\
-		} \
-	fi
+		sudo "$(SETCAP)" cap_dac_override,cap_syslog+ep $(DESTDIR)/abfs-resources)
 endif
 
 install: all
