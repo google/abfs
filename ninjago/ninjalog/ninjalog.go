@@ -19,16 +19,38 @@ import (
 	"log"
 	"os"
 	"sync"
+
+	"github.com/google/abfs/shared/entities"
 )
 
 const (
 	DefaultLogFileName = ".ninja_log"
 	ninjaLogHeader     = "# ninjago log v1"
+	// lining up columns
+	timestampWidth = 13 // Unix milliseconds.
+	durationWidth  = 8  // Seconds with millisecond precision.
+	hashWidth      = entities.HashHexSize
+	mismatchWidth  = len("Mismatch")
 )
 
 var (
-	columnsHeader = fmt.Sprintf("#%-12s %-8s %-6s %-40s %-40s %s\n",
-		"Timestamp", "Duration", "Cached", "Request-Hash", "Response-Hash", "Target",
+	// runTypeWidth fits the "Cached" heading and the longest RunType.
+	runTypeWidth = func() int {
+		w := len("Cached")
+		for _, rt := range allRunTypes {
+			w = max(w, len(rt))
+		}
+		return w
+	}()
+
+	columnsHeader = fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s %*s %s\n",
+		timestampWidth, "#Timestamp",
+		durationWidth, "Duration",
+		runTypeWidth, "Cached",
+		hashWidth, "Request-Hash",
+		hashWidth, "Response-Hash",
+		mismatchWidth, "Mismatch",
+		"Target",
 	)
 	abfsSignature = ninjaLogHeader + "\n" + columnsHeader
 )
@@ -79,13 +101,13 @@ func (n *NinjaLog) WriteEntry(entry *LogEntry) error {
 		return fmt.Errorf("ninja log (%q) not open for write", n.fileName)
 	}
 
-	_, err := fmt.Fprintf(n.writeFile, "%-13d %8.3f %-14s %-40s %-40s %3d %s\n",
-		entry.Time.UnixMilli(),
-		entry.Duration.Seconds(),
-		entry.RunType,
-		entry.ReqHash,
-		entry.RespHash,
-		entry.Mismatches,
+	_, err := fmt.Fprintf(n.writeFile, "%-*d %*.3f %-*s %-*s %-*s %*d %s\n",
+		timestampWidth, entry.Time.UnixMilli(),
+		durationWidth, entry.Duration.Seconds(),
+		runTypeWidth, entry.RunType,
+		hashWidth, entry.ReqHash,
+		hashWidth, entry.RespHash,
+		mismatchWidth, entry.Mismatches,
 		entry.Target,
 	)
 	return err

@@ -46,6 +46,17 @@ const (
 	RunTypeDelayedCached RunType = "delayed-cached"
 )
 
+// allRunTypes lists every RunType for formatting, so keep in sync with above
+var allRunTypes = []RunType{
+	RunTypeLocal,
+	RunTypeLocalNoTap,
+	RunTypeFallbackBusy,
+	RunTypeFallbackErr,
+	RunTypeRemote,
+	RunTypeCached,
+	RunTypeDelayedCached,
+}
+
 type LogEntry struct {
 	Time       time.Time
 	Duration   time.Duration
