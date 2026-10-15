@@ -59,8 +59,13 @@ func (s *Service) RunAction(ctx context.Context, action string) error {
 	return cmd.Run()
 }
 
+// UnitFile returns the path of the service's systemd user unit file.
+func (s *Service) UnitFile() string {
+	return fmt.Sprintf("%s/.config/systemd/user/%s.service", os.ExpandEnv("$HOME"), s.Name)
+}
+
 func (s *Service) writeServiceFile() (retErr error) {
-	serviceFile := fmt.Sprintf("%s/.config/systemd/user/%s.service", os.ExpandEnv("$HOME"), s.Name)
+	serviceFile := s.UnitFile()
 	if err := os.MkdirAll(path.Dir(serviceFile), 0700); err != nil {
 		return err
 	}
