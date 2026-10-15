@@ -74,6 +74,8 @@ func (hp *HashPath) String() string {
 //	<ref>:<relative-path> # with inferred project and server
 //	<ref@project>:<relative-path> # with inferred server
 //	<ref@project@server>:<relative-path>
+//
+// update README.md if a new form is added
 func Parse(a string) (*HashPath, error) {
 	parts := strings.SplitN(a, ":", 2)
 

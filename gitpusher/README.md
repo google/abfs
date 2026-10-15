@@ -1,20 +1,20 @@
-# Background
+# Git-Pusher
 
 Git-Pusher is an ABFS component which is responsible for pushing the source code from git repositories to the ABFS remote server.
 
-It is a replacement for upload-daemon which was based on a static configuration. Git-Pusher reads the configuration from the ABFS remote server and updates the internal states based on the config.
+Git-Pusher reads its configuration from the ABFS remote server and updates its internal states based on the config so that changes can be made without restarting the processes.
 
 It supports multiple manifest-based repositories and multiple independent git projects.
 
-# Git-Pusher Architecture
+## Git-Pusher Architecture
 
-Git-Pusher provides flexibility and scalability by supporting the concept of a pool of pushers. Each pusher is an independent process that can push a subset of projects defined in that pool. The subset is calculated using a consistent hashing algorithm ([`Rendezvous Hashing`](https://en.wikipedia.org/wiki/Rendezvous_hashing)) based on the hash of the project name and the number of pushers in the pool.
+Git-Pusher provides flexibility and scalability by supporting the concept of a pool of pusher servers. Each server is an independent process that can push a subset of projects defined in that pool. The subset is calculated using a consistent hashing algorithm ([`Rendezvous Hashing`](https://en.wikipedia.org/wiki/Rendezvous_hashing)) based on the hash of the project name and the number of servers in the pool.
 
-# Git-Pusher Configuration
+## Git-Pusher Configuration
 
-The Git-Pushers is configured via a YAML format on the remote server for the entire pool. It contains the information about the pool size, the list of pushers inside the pool, list of manifests for repos, and the configuration for each project.
+The Git-Pushers is configured via a YAML format on the remote server for the entire pool. It contains information about the pool size, the list of pushers inside the pool, list of manifests for repos, and the configuration for each project.
 
-The config can be accessed or edited using a hash-path. By default, the pool is `default` and the project is `config`, therefore the config can be edited using:
+The config can be accessed or edited using a hashpath ([see hashpath docs](../shared/hashpath/README.md)). By default, the pool is `default` so the config can be edited using:
 
 ```shell
 abfs edit config:git-pusher/default # Use --add/-a for the first time
@@ -64,9 +64,9 @@ projects:
 
 Defines default configuration for pushers. These can be overriden per pusher.
 
-| Field | Type | Description |
-|---|---|---|
-| `port` | int | Listening port of the Git pusher. |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `port` | int | - | Listening port of the Git pusher. If unset, it won't open an http server. |
 | `max-remote-pushes` | int | 100 | Maximum concurrent pushes to the remote. |
 | `max-projects-syncs` | int | 10 | Maximum concurrent project syncs. |
 | `max-memory-usage` | float64 | 0 | Maximum memory usage percentage (0-100) to self throttle. |

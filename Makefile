@@ -23,10 +23,6 @@ VERSION_LDFLAGS := -X github.com/google/abfs/shared/version.version=$(VERSION)
 # Optional: set EXPIRATION_EPOCH_SEC to build abfs binaries that expire at that
 # time (see `abfs expiration`). Empty means no expiration.
 
-# Where `make doc` installs the documentation.
-ifeq ($(DOCDIR), )
-	DOCDIR := /usr/share/doc/abfs
-endif
 .PHONY: all all-non-abfs abfs build-abfs ninjago abfsbox abfs-wrap-no-cgo tap-no-cgo ninjago-no-cgo abfsbox-no-cgo casfs-mounter casfuse-mounter install install-client install-pusher install-server maybe-copy-license doc abfs-bazel-daemon abfs-bazel-daemon-no-cgo install-hooks abfs-resources rbetap rbetap-no-cgo abfs-rbe
 
 all: install-hooks abfs all-non-abfs
@@ -73,12 +69,6 @@ abfs-pusher: maybe-copy-license
 	  -X github.com/google/abfs/shared/version.expiration=$(EXPIRATION_EPOCH_SEC) \
 	  -X github.com/google/abfs/shared/instance.forceFlavor=abfs.pusher" \
 	  cmd/abfs/abfs.go
-
-
-
-doc:
-	mkdir -p $(DOCDIR)
-	cp doc/* LICENSE $(DOCDIR)
 
 build-abfs: maybe-copy-license
 	go build -ldflags="$(VERSION_LDFLAGS)" cmd/abfs/abfs.go

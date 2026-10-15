@@ -49,7 +49,7 @@ type Digest struct {
 	Size   int64  `json:"size"`
 }
 
-// Node holds the RBE-specific metadata for a content-addressed object.
+// Node holds the RBE-specific metadata for a content-addressable object.
 // This is used in the identity side-channel to map ABFS SHA-1 hashes to RBE digests.
 type Node struct {
 	Digest Digest
