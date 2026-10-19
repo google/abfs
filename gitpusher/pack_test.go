@@ -282,6 +282,20 @@ func TestPackPusher_Push_FreshStart(t *testing.T) {
 	mockRemote.AssertExpectations(t)
 }
 
+func TestPackPusher_Init_NewServer(t *testing.T) {
+	// not actually using context here, just for mocking purposes where t.Context() doesn't work
+	ctx := context.Background()
+	mockRemote := new(MockRemoteProvider)
+
+	// A new CAS server has no refs for the server yet, so GetRefs fails with NotFound.
+	mockRemote.On("GetRefs", ctx, "server", "project", []string{binding.PacksRefs}).Return([]entities.Hash(nil), entities.NotExistErrf("the server %q not found", "server")).Once()
+	mockRemote.On("GetObject", ctx, entities.ZeroHash).Return(nil, entities.ErrNotExist).Once()
+
+	_, err := NewPackPusher(mockRemote, "server", "project", t.TempDir(), new(MockGit), binding.PackingStrategyCommits)
+	assert.NoError(t, err)
+	mockRemote.AssertExpectations(t)
+}
+
 func TestPackPusher_Push_Incremental(t *testing.T) {
 	ctx := context.Background()
 	gitRoot := t.TempDir()

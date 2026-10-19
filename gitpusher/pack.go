@@ -248,6 +248,11 @@ func (p *PackPusher) init(ctx context.Context) error {
 	}
 
 	refs, err := p.client.GetRefs(ctx, p.server, p.project, []string{binding.PacksRefs})
+	if entities.IsNotExist(err) {
+		// A new CAS server has no refs for this server yet, so there are no packs
+		// to restore. Same handling as binding.FetchPacksFromStore.
+		refs, err = []entities.Hash{entities.ZeroHash}, nil
+	}
 	if err != nil {
 		return err
 	}
