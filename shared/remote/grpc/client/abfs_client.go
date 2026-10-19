@@ -17,6 +17,7 @@ package client
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/google/abfs/shared/cacheman/protocol"
@@ -39,6 +40,8 @@ const (
 // ABFSClient serves the purpose of converting from gRPC conventions to golang conventions
 type ABFSClient struct {
 	cm *connectionManager
+
+	closeOnce sync.Once
 }
 
 var _ remote.RemoteProvider = (*ABFSClient)(nil)
@@ -69,8 +72,11 @@ func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
 	return c, nil
 }
 
+// Close closes the server connections. It is safe to call more than once.
 func (c *ABFSClient) Close() error {
-	return c.cm.close()
+	var err error
+	c.closeOnce.Do(func() { err = c.cm.close() })
+	return err
 }
 
 func (c *ABFSClient) HealthCheck(ctx context.Context, service string) error {

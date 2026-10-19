@@ -81,6 +81,16 @@ func TestSetup(t *testing.T) {
 	close()
 }
 
+func TestDoubleClose(t *testing.T) {
+	require := require.New(t)
+	c, err := NewABFSClient(&ABFSClientOpts{Servers: []string{"localhost:0"}, AuthInfo: instance.CreateAuthInfo(instance.AuthTypeNone, "", "", true), SkipHealthCheck: true})
+	require.NoError(err)
+	err = c.Close()
+	require.NoError(err)
+	err = c.Close()
+	require.NoError(err)
+}
+
 func TestEmptyFile(t *testing.T) {
 	require := require.New(t)
 	c, close := Setup(t)
