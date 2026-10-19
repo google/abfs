@@ -70,7 +70,9 @@ func (c *RepoSetupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Cloning git-repo to %s...\n", repoDir)
-	cloneCmd := exec.Command("git", "clone", "https://gerrit.googlesource.com/git-repo", repoDir)
+	// `abfs push` can't open reftable repos, so force the files ref format in
+	// case git defaults to reftable (init.defaultRefFormat).
+	cloneCmd := exec.Command("git", "-c", "init.defaultRefFormat=files", "clone", "https://gerrit.googlesource.com/git-repo", repoDir)
 	cloneCmd.Stdout = os.Stdout
 	cloneCmd.Stderr = os.Stderr
 	if err := cloneCmd.Run(); err != nil {
@@ -86,6 +88,13 @@ func (c *RepoSetupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return getOrder(entries[i].Name()) < getOrder(entries[j].Name())
 	})
 
+	// git am and git rebase create commits, which fails without a committer
+	// identity (common on a fresh server). Fall back to a generic one.
+	if err := exec.Command("git", "-C", repoDir, "var", "GIT_COMMITTER_IDENT").Run(); err != nil {
+		_ = os.Setenv("GIT_COMMITTER_NAME", "ABFS repo-setup")
+		_ = os.Setenv("GIT_COMMITTER_EMAIL", "abfs-repo-setup@localhost")
+	}
+
 	if err := c.applyAndRebase(repoDir, entries); err != nil {
 		return err
 	}
@@ -99,7 +108,9 @@ func (c *RepoSetupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 
 	fmt.Printf("\nRepository patched successfully in %s\n", repoDir)
 	fmt.Printf("To push these changes to the stable-abfs branch, run:\n\n")
-	fmt.Printf("  abfs push -r %s\n", repoDir)
+	// Push straight to the server: put-ref also goes straight to the server and
+	// fails with "missing: <hash>" if the objects are only in the local cache.
+	fmt.Printf("  abfs --no-local-cache push -r %s\n", repoDir)
 	fmt.Printf("  echo \"%s refs/heads/stable-abfs\" | abfs test-client put-ref -s gerrit.googlesource.com -p git-repo\n\n", headHash)
 
 	return nil
