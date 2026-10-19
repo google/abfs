@@ -8,13 +8,68 @@ Ensure you have ABFS and CASFS installed from the main [README doc](../../README
 
 ### One-Time Setup
 
-Your ABFS System Admin will provide you with the `SERVER` value that you need to use below and potentially other flags. This `init` step will start a background ABFS cache manager (cacheman) as a systemd process on your machine.
+Your ABFS System Admin will provide you with the `SERVER` value that you need to use below and potentially other flags. The important part is knowing whether your client should use TLS (or not).
 
+This `init` step will start a background ABFS cache manager (cacheman) as a systemd process on your machine.
+
+<details>
+<summary>With TLS and Certificate File</summary>
+
+If your ABFS System Admin provided you with a certificate file, you can either add it to your system trust store or only configure it to be used by ABFS. Choose one of these options:
+
+**Add .crt to system trust store**
+
+```sh
+sudo cp ca.crt /usr/local/share/ca-certificates/abfs-ca.crt
+sudo update-ca-certificates
+```
+
+Then run the normal init command after providing the proper `SERVER` value.
+
+```sh
+SERVER=
+abfs --remote-servers $SERVER:50051 init
+```
+
+**Use .crt only for abfs**
+
+```sh
+CRT_INSTALL_PATH=/etc/abfs/ca.crt
+sudo install -D -m 644 ca.crt $CRT_INSTALL_PATH
+```
+
+Then run the init command providing both the `SERVER` and the `CRT_INSTALL_PATH`:
+
+```sh
+SERVER=
+abfs --remote-servers $SERVER:50051 --root-ca-file $CRT_INSTALL_PATH init
+```
+
+</details>
+
+<details>
+<summary>With TLS but no Certificate File</summary>
+
+If your ABFS System Admin instructs you to use TLS but you don't need to install a certificate, just provide the `SERVER` below and use this command:
+
+```sh
+SERVER=
+abfs --remote-servers $SERVER:50051 init
+```
+
+</details>
+
+<details>
+<summary>Without TLS</summary>
+
+If your ABFS System Admin instructs you to not use TLS, just provide the `SERVER` below and use this command:
 
 ```sh
 SERVER=
 abfs --remote-servers $SERVER:50051 --disable-tls init
 ```
+
+</details>
 
 If there are issues, you need to check `abfs cacheman tail` to debug and then can run `abfs cacheman restart` after attempting any fixes.
 

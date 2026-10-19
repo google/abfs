@@ -23,14 +23,77 @@ We suggest 5 machines total:
 Start the main CAS gRPC server with an existing backing directory.
 
 > [!WARNING]
-> By default this server has no TLS/authentication/authorization enabled
+> This release is missing authentication and authorization. Anyone who has network access to the CAS server can read and write any data. Please ensure it is firewalled appropriately.
+
+#### Choose a transport mode
+
+You should choose a transport mode that satisfies your company's security requirements. You might choose to go without TLS if you are running everything inside the same isolated network. 
+
+| | **With TLS** | **Without TLS** |
+| --- | --- | --- |
+| Traffic between clients, git-pushers, and CAS server | Encrypted and clients verify the server's identity | Plaintext |
+| Setup | A server certificate (ideally from a CA your clients already trust) | No certificates |
+| Client authentication/authorization | **None** (TLS doesn't identify clients) | **None** |
+
+Based on your selection, you will need to provide different initialization instructions to your developers or anyone else using an ABFS client. So you should decide before onboarding clients because existing clients would all need to modify their configuration.
+
+If you run a reverse proxy or other similar service that terminates TLS, you would still need to instruct clients to use the "With TLS" setup regardless of if you run TLS on the CAS server itself or not.
+
+<details>
+<summary>With TLS</summary>
+
+**Get a server certificate**
+
+ABFS clients will trust the operating system's CA store by default. If you use a server certificate that your client machines already trust, you won't need to distribute a certificate to all of the clients. Common sources:
+
+* Your company's internal CA (if your clients already trust it)
+* A public CA such as Let's Encrypt
+
+If none of these are available, you can use a private CA and distribute a certificate to all of your clients.
+
+Whichever option you use, the certificate must:
+
+* Include the hostname that clients will use in their `--remote-servers` client configuration to connect to the CAS server. It's easiest to use a fully qualified name that all clients can use instead of a short name that only works within a specific network segment.
+* Be a PEM file containing the server certificate followed by any intermediate certificates, plus a PEM private key.
+
+**Start the CAS Server with TLS**
+
+Fill in empty env vars and start the server:
+
+```sh
+TLS_CERT_FILE=
+TLS_KEY_FILE=
+SERVER_DIR=
+mkdir -p "$SERVER_DIR"
+# sample rate of 1 will log every request
+LOG_SAMPLE_RATE=.01
+# Can use any available port, 50051 is just an example
+abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE --tls-cert-file "$TLS_CERT_FILE" --tls-key-file "$TLS_KEY_FILE" file-based --local-dir "$SERVER_DIR"
+```
+
+The output should include "TLS enabled." If you pass an empty `TLS_CERT_FILE` or `TLS_KEY_FILE`, it will fall back to running without TLS.
+
+The server only reads certificates at startup so it needs to be restarted when the certificates are renewed.
+</details>
+
+<details>
+<summary>Without TLS</summary>
+
+> [!WARNING]
+> This server has no TLS/authentication/authorization enabled
+
+Fill in `SERVER_DIR` and start the server:
 
 ```sh
 SERVER_DIR=
 mkdir -p "$SERVER_DIR"
-# Can use any available port, 50051 is just an example. This will produce a lot of logs
-abfs server --port 50051 file-based --local-dir "$SERVER_DIR"
+# sample rate of 1 will log every request
+LOG_SAMPLE_RATE=.01
+# Can use any available port, 50051 is just an example
+abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE file-based --local-dir "$SERVER_DIR"
 ```
+
+</details>
 
 ### Configuration
 
@@ -40,16 +103,32 @@ Some configuration of ABFS is still done through command-line flags, but we are 
 
 The bootstrapping process could use some improvements here, but you currently need an abfs client configured to write these hashpaths. So start by running `init` on your client machine to set up the background cache manager (cacheman) systemd service:
 
+<details>
+<summary>With TLS</summary>
+
+If you used a private CA, also pass `--root-ca-file` with the absolute path to the certificate file before the `init` part of the command.
+
+```sh
+SERVER= # must match a name in the certificate
+abfs --remote-servers $SERVER:50051 init
+```
+
+</details>
+<details>
+<summary>Without TLS</summary>
+
 ```sh
 SERVER=
 abfs --remote-servers $SERVER:50051 --disable-tls init
 ```
 
+</details>
+
 Ensure the below exits successfully, which shows that it has a connection to the CAS server. It prints `retrying...` while cacheman is still starting.
 
 ```sh
 abfs cacheman remote-ok
-# No output is good output, but you can also check the exit code
+# 0 exit code means connected
 echo $?
 ```
 
@@ -69,6 +148,8 @@ Replace the default values in the YAML below and then run this command to create
 
 > [!WARNING]
 > By default, git-pusher sleeps for 1 minute between runs of `git fetch` for every project in your manifest file. Ensure your Gerrit host can handle this increase in traffic.
+
+Git-pusher assumes it is running inside of a firewalled network, and will listen on the specified `port` below on all interfaces without TLS. Exclude the port and it won't listen on HTTP.
 
 ```sh
 abfs edit -a --stdin config:git-pusher/default << 'EOF'
@@ -105,20 +186,42 @@ For example, to authenticate against a Gerrit instance as a Google user, you wou
 
 On each of your git-pusher servers, run the following:
 
+<details>
+<summary>With TLS</summary>
+
+If you used a private CA, also pass `--root-ca-file` with the certificate path before the `git-pusher` part of the command.
+
+```sh
+PUSHER_DIR=
+SERVER= # must match a name in the certificate
+mkdir -p "$PUSHER_DIR"
+# pass --instance <name> after `git-pusher` if you don't want to use the default of `hostname` output
+# this will produce a lot of logs
+abfs --remote-servers $SERVER:50051 git-pusher --storage-path $PUSHER_DIR
+```
+
+</details>
+<details>
+<summary>Without TLS</summary>
+
 ```sh
 PUSHER_DIR=
 SERVER=
 mkdir -p "$PUSHER_DIR"
-# pass --instance <name> if you don't want to use the default of `hostname` output
+# pass --instance <name> after `git-pusher` if you don't want to use the default of `hostname` output
 # this will produce a lot of logs
 abfs --remote-servers $SERVER:50051 --disable-tls git-pusher --storage-path $PUSHER_DIR
 ```
+
+</details>
 
 ### Default Client Configuration
 
 This is run on the client you set up above.
 
 Every client running abfs has their own configuration file. This is written by their initial `abfs init` and can be viewed and edited with `abfs config` flags and subcommands. However, most clients connected to your CAS server should be using the same configuration, so we have this feature to manage most of the configuration centrally.
+
+Don't put `disable-tls` or `root-ca-file` into this central configuration. Clients must already set these flags with correct values locally to be able to connect to the server and download this config.
 
 Replace the `manifest-server:` and any other needed values below for your setup. On your client machine, run the following:
 
