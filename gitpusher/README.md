@@ -42,6 +42,10 @@ repos:
       files:
         - branch: main
           file: default.xml
+    overrides:
+      - name: "^device/"
+        regex: true
+        push-interval: 10m
 
 projects:
   - url: github.com/bazil/fuse
@@ -95,7 +99,7 @@ Defines a repository to watch, typically a manifest repository that points to ot
 |---|---|---|
 | `manifest` | [`ManifestConfig`](#manifestconfig) | Configuration for the manifest file. |
 | `project-defaults` | [`FetchConfig`](#fetchconfig) | Default fetch settings for projects found in the manifest. |
-| `overrides` | map of string -> [`OverrideFetchConfig`](#overridefetchconfig) | Config overrides for specific projects (non-zero values replace project-defaults) |
+| `overrides` | list of [`OverrideFetchConfig`](#overridefetchconfig) | Config overrides for matching projects, applied in order (non-zero values replace project-defaults) |
 
 ### `ManifestConfig`
 
@@ -129,8 +133,9 @@ Defines an individual project to sync.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `name` | string | - | Project name to match, or a regex if `regex` is true. |
 | `exclude` | bool | `false` | If true, this project will be excluded. |
-| `regex` | bool | `false` | If true, the key is a regex to match project name. |
+| `regex` | bool | `false` | If true, `name` is a regex ([RE2 syntax](https://github.com/google/re2/wiki/Syntax)) that can match anywhere in the project name. Use `^` and `$` to match the whole name. |
 | *(inline)* | [`FetchConfig`](#fetchconfig) | Inherits all fields from FetchConfig. |
 
 ### `FetchConfig`

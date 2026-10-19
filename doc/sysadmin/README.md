@@ -45,15 +45,19 @@ SERVER=
 abfs --remote-servers $SERVER:50051 --disable-tls init
 ```
 
-Ensure the below exits with no output which shows that it has a connection to the CAS server.
+Ensure the below exits successfully, which shows that it has a connection to the CAS server. It prints `retrying...` while cacheman is still starting.
 
 ```sh
 abfs cacheman remote-ok
+# No output is good output, but you can also check the exit code
+echo $?
 ```
 
 If there are issues, you need to inspect `abfs cacheman tail` and debug.
 
 #### Create required Hashpaths
+
+This is run on the client you set up above.
 
 Create the main config ref for storing hashpaths
 
@@ -74,7 +78,7 @@ defaults:
     port: 9998 # HTTP listening port for info and debug
 
 pushers:
-  - name: pusher-0 # replace with $HOSTNAME of your pusher
+  - name: pusher-0 # each pusher's --instance name (defaults to `hostname` output)
   - name: pusher-1
   - name: pusher-2
 
@@ -88,6 +92,8 @@ EOF
 ```
 
 ### Git-pusher servers
+
+This is run on each of the git-pusher servers.
 
 #### Authentication with git
 
@@ -103,11 +109,14 @@ On each of your git-pusher servers, run the following:
 PUSHER_DIR=
 SERVER=
 mkdir -p "$PUSHER_DIR"
+# pass --instance <name> if you don't want to use the default of `hostname` output
 # this will produce a lot of logs
 abfs --remote-servers $SERVER:50051 --disable-tls git-pusher --storage-path $PUSHER_DIR
 ```
 
 ### Default Client Configuration
+
+This is run on the client you set up above.
 
 Every client running abfs has their own configuration file. This is written by their initial `abfs init` and can be viewed and edited with `abfs config` flags and subcommands. However, most clients connected to your CAS server should be using the same configuration, so we have this feature to manage most of the configuration centrally.
 
@@ -134,6 +143,36 @@ EOF
 
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
+### Push repo
+
+This is run on the client you set up above.
+
+To enable faster source control operations, ABFS requires a slightly patched version of the [`repo` tool](https://gerrit.googlesource.com/git-repo). The patches enable `repo` to use the content-addressable feature of ABFS to speed up some operations. We store the patched version of `repo` inside the ABFS CAS server so that it can be cloned when developers mount a workspace. This will guide you through the initial seeding steps to patch `repo` and push it into the CAS.
+
+1. Clone `repo` and apply the ABFS patches to it:
+
+    ```sh
+    abfs repo-setup
+    ```
+
+    It prints the directory of the patched clone, e.g. `Repository patched successfully in /tmp/repo-setup-1234567890`, followed by the commands for the next step.
+
+2. Enter the `REPO_DIR` value below. Then push the patched clone to the CAS server and point `stable-abfs` at it:
+
+    ```sh
+    REPO_DIR= # the directory printed by abfs repo-setup
+    abfs --no-local-cache push -r "$REPO_DIR"
+    echo "$(git -C "$REPO_DIR" rev-parse HEAD) refs/heads/stable-abfs" | abfs test-client put-ref -s gerrit.googlesource.com -p git-repo
+    ```
+
+3. Check that the ref is there. This prints the commit hash followed by `refs/heads/stable-abfs`:
+
+    ```sh
+    echo refs/heads/stable-abfs | abfs test-client get-ref -s gerrit.googlesource.com -p git-repo
+    ```
+
+To update `repo` later, repeat these steps.
+
 ## First Mount
 
 Unfortunately git-pusher does not yet have a great way to tell when it is complete and ready for clients to start mounting the source code. This is an area we need to improve. It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers.
@@ -146,7 +185,15 @@ mkdir $MOUNT
 abfs mount --branch android-latest-release --tmp-ws $MOUNT
 ```
 
-If you want more details, each git-pusher exposes an HTTP `/info` endpoint that returns JSON on the port we set in the git-pusher config above. You can use `jq` to summarize the project info with something like below run on **each** of the git-pushers:
+Projects that haven't been pushed yet are reported as `project <name>: remote branch <revision> not found in upstream <server>/<name>`, followed by a `Failing projects:` list.
+
+A failed mount stays mounted, so unmount it before you try again:
+
+```sh
+abfs unmount -k $MOUNT
+```
+
+If you want more details, each git-pusher exposes an HTTP `/info` endpoint that returns JSON on the port we set in the git-pusher config above. You can use `jq` (`sudo apt-get install jq` or see https://jqlang.org/download/) to summarize the project info with something like below run on **each** of the git-pushers:
 
 ```sh
 curl -s localhost:9998/info | jq '{
