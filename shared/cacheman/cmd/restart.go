@@ -97,8 +97,12 @@ func (c *restartCmd) waitFor(ctx context.Context, name string, check func() erro
 	if c.CachemanProvider == nil || c.Cacheman == nil {
 		return errors.New("cacheman client not initialized")
 	}
+	return waitForCacheman(ctx, c.timeout, name, check)
+}
 
-	timeoutTime := time.Now().Add(c.timeout)
+// waitForCacheman polls check until it succeeds or timeout expires.
+func waitForCacheman(ctx context.Context, timeout time.Duration, name string, check func() error) error {
+	timeoutTime := time.Now().Add(timeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 

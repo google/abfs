@@ -48,6 +48,14 @@ func NewHTTPClient(cacheDir string) *HttpClient {
 	}
 }
 
+// NewHTTPClientWithTimeout is like NewHTTPClient, but every request fails if
+// cacheman has not answered within timeout.
+func NewHTTPClientWithTimeout(cacheDir string, timeout time.Duration) *HttpClient {
+	c := NewHTTPClient(cacheDir)
+	c.http.Timeout = timeout
+	return c
+}
+
 func (c *HttpClient) SendNewMap(from, to entities.Hash, localOnly bool) error {
 
 	req := protocol.NewMapMessage{

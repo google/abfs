@@ -161,8 +161,20 @@ func (c *cachemanCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return clierr.NoSubcommandErr(fl)
 }
 
+// SystemctlSupported reports whether a systemd user manager is reachable via
+// `systemctl --user`.
 func SystemctlSupported() bool {
-	return exec.Command("systemctl", "--user").Run() == nil
+	return checkSystemctlUser() == nil
+}
+
+// checkSystemctlUser runs `systemctl --user` and, if it fails, returns an error
+// that includes systemctl's output so callers can tell the user why.
+func checkSystemctlUser() error {
+	out, err := exec.Command("systemctl", "--user").CombinedOutput()
+	if out = bytes.TrimSpace(out); err != nil && len(out) > 0 {
+		return fmt.Errorf("%w: %s", err, out)
+	}
+	return err
 }
 
 func instanceSocketLockPath(inst *instance.Instance) string {
