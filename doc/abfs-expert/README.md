@@ -6,7 +6,7 @@ At Google, we have a whole team of people who work to keep the Android build det
 
 ## ABFS Objects
 
-ABFS uses its own CAS for storing all of its internal object types. This is nice because everything is stored and content-adressable. Many objects link to other objects using their SHA1 hash. Anytime you see a hex-encoded SHA1 hash, there are some CLI tools to help.
+ABFS uses its own CAS for storing all of its internal object types. This is nice because everything is stored and content-addressable. Many objects link to other objects using their SHA1 hash. Anytime you see a hex-encoded SHA1 hash, there are some CLI tools to help.
 
 You can inspect objects:
 
@@ -60,6 +60,8 @@ repo manifest -r -o pinned.xml
 Then you can use this file in future mounts to get a consistent state.
 
 ```sh
+DIR=mnt
+mkdir -p $DIR
 abfs mount --file pinned.xml $DIR --tmp-ws # --tmp-ws since we aren't changing code
 ```
 

@@ -1,9 +1,5 @@
 # ABFS Workspaces
 
-> [!WARNING]
-> ABFS Workspaces are still under development so the CLI is subject to
-change.
-
 ## The Concept: What is an ABFS Workspace?
 
 An ABFS workspace is a personal view of the
@@ -13,6 +9,13 @@ sessions. A workspace could be mounted multiple times on the same machine or
 across different machines and the files will stay in sync.
 
 ## Current limitations
+
+### NOT FOR PERMANENT SOURCE CONTROL
+
+> [!WARNING]
+> Important changes should be backed up in a remote location like Gerrit.
+
+Your ABFS System Admin can provide you with more details, but the current server-side release only supports a single disk and will fill up and need to be wiped periodically. So while ABFS will use best effort to sync your workspaces to the server, the server will not live indefinitely to persist them. Staging your changes on a Gerrit server or some other remote location is recommended if you aren't merging or discarding them.
 
 ### `out` directory missing
 

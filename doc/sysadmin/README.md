@@ -18,6 +18,16 @@ We suggest 5 machines total:
 * 3 git-pusher servers. We run 3 96 core VMs with 768GB of RAM, but again the CPU utilization is low. The initial run where they need to push your entire git history is more demanding than the maintenance running where only new changes are fetched and pushed. It’s possible to downsize the VMs after the initial push is complete, but the minimum has not been tested.  
 * 1 client machine used for configuring and testing out the CAS server
 
+<details>
+<summary>CAS Server</summary>
+
+The current release stores all source code, developer code changes, intermediate and build artifacts, etc. on a single server. This will need to be periodically wiped and started over since the contents are not garbage collected. The plan is to make this smoother in upcoming releases. There is a warning for developers in [WORKSPACES.md](../android-dev/WORKSPACES.md#not-for-permanent-source-control) that their changes should be merged or backed up to a different source control system since the ABFS server won't live forever.
+
+Depending on your Android history, the full git-pusher source code run could take 2 TB or more. An initial full Android build can add around 150 GB with all intermediates, images, and zip files. If another ABFS build is done with the same exact source, it will take close to 0 GB incremental storage and just store some user metadata. As the source code changes, ABFS will deduplicate all of the intermediates that it can. But full builds on top of changed source code will still lead to changed images and zips. So you can still expect 25-40 GB of new data per full build that has source code changes.
+
+
+</details>
+
 ### CAS server
 
 Start the main CAS gRPC server with an existing backing directory.
@@ -149,7 +159,8 @@ Replace the default values in the YAML below and then run this command to create
 > [!WARNING]
 > By default, git-pusher sleeps for 1 minute between runs of `git fetch` for every project in your manifest file. Ensure your Gerrit host can handle this increase in traffic.
 
-Git-pusher assumes it is running inside of a firewalled network, and will listen on the specified `port` below on all interfaces without TLS. Exclude the port and it won't listen on HTTP.
+* **port**: Git-pusher assumes it is running inside of a firewalled network, and will listen on the specified `port` below on all interfaces without TLS. Exclude the port and it won't listen on HTTP.
+* **fetch-ref-spec**: By default, git-pusher will fetch and push all refs for every project in the provided manifest file. This is great if you want a complete history and the ability to mount based on any branch, tag, or change. But it isn't great if you only care about limited branches and minimizing disk usage by the CAS Server. See the comment in the YAML below if you want to include a **fetch-ref-spec** to limit the branches fetched and pushed.
 
 ```sh
 abfs edit -a --stdin config:git-pusher/default << 'EOF'
@@ -169,6 +180,10 @@ repos:
       files:
         - branch: android-latest-release
           file: default.xml
+    # uncomment the below 3 lines and use your manifest's default revision instead of "android17-release" if you only want limited branches pushed
+    # project-defaults:
+    #   fetch-ref-spec:
+    #     - +refs/heads/android17-release:refs/heads/android17-release
 EOF
 ```
 

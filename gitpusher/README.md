@@ -66,7 +66,7 @@ projects:
 
 ### `GitPusherDefaultsConfig`
 
-Defines default configuration for pushers. These can be overriden per pusher.
+Defines default configuration for pushers. These can be overridden per pusher.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
