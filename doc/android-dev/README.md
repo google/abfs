@@ -4,7 +4,8 @@
 
 ### Prerequisites
 
-Ensure you have ABFS and CASFS installed from the main [README doc](../../README.md).
+* Ensure you have ABFS and CASFS installed from the main [README doc](../../README.md).
+* Ensure that you have already set up your machine for Android development and installed the required packages, see https://source.android.com/docs/setup/start#install-packages.
 
 ### One-Time Setup
 
