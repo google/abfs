@@ -11,7 +11,7 @@ ABFS enables lightweight code checkouts and enables builds to share a cache of p
 
 ### What speedup can I expect with ABFS?
 
-Below is the mean time of 3 Android checkouts and builds on a GCE n2d-standard-64 VM with 64 vCPUs and 256GB of RAM. The ABFS remote server was running in the same VPC as the client.
+Below is the mean time of 3 Android checkouts and builds on a GCE `n2d-standard-64` VM with 64 vCPUs and 256GB of RAM. The ABFS remote server was running in the same VPC as the client.
 
 #### Checkout
 
@@ -36,13 +36,13 @@ All of these builds used `lunch aosp_cf_x86_64_only_phone-aosp_current-userdebug
 
 The “ABFS build with cache use disabled” is expected to be slower than a traditional build. ABFS’s speedups come from caching and reusing previously built actions. If a build step is being executed for the first time, ABFS still needs to execute the step. ABFS’s Content-Addressable Storage Filesystem (CASFS) has some overhead to provide the content-addressable features. It also has the overhead of “tapping”. Tapping records the actual reads/writes/deletes of each action. The tapping feature enables caching of the build steps.
 
-The “ABFS build with empty local cache but full remote cache” is the common experience developers can expect before editing files. They might frequently sync to HEAD or check out a new branch. When they build for the first time, they will pull from the remote ABFS build cache that has been populated by a Continuous Integration setup or by other developers.
+The “ABFS build with empty local cache but full remote cache” is the common experience developers can expect before editing files. They might frequently sync to `HEAD` or check out a new branch. When they build for the first time, they will pull from the remote ABFS build cache that has been populated by a Continuous Integration setup or by other developers.
 
 ### How does it work?
 
-At its core, ABFS has a Content-Addressable Storage Filesystem (called CASFS, implemented as a kernel module at [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs)). This custom filesystem allows the directory structure and file info to be available while the file content is lazy-loaded and streamed on demand. This enables checkouts in seconds because clients only need to download project and directory info.
+At its core, ABFS has a **Content-Addressable Storage Filesystem (CASFS)** implemented as a kernel module at [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs). This custom filesystem allows the directory structure and file info to be available while the file content is lazy-loaded and streamed on demand. This enables checkouts in seconds because clients only need to download project and directory info.
 
-The second main part is a content-addressable build. Traditional Android builds use Soong to write ninja files, then use Ninja to execute those ninja files. Ninja is similar to Make in that it uses file modified timestamps to determine when to rebuild an output. Ninja-go ([github.com/google/ninja-go](https://github.com/google/ninja-go)) is our ninja compatible implementation that supports multiple backends. This repository contains a backend that is content-addressable. Ninja-go can use file content hashes to determine when to rebuild an output. It also works with the shared remote cache to use read and write build steps.
+In addition to the content-addressable storage filesystem, is a **content-addressable build**. Traditional Android builds use Soong to write ninja files, then use Ninja to execute those ninja files. Ninja is similar to Make in that it uses file modified timestamps to determine when to rebuild an output. **Ninja-go** ([github.com/google/ninja-go](https://github.com/google/ninja-go)) is our ninja compatible implementation that supports multiple backends. This repository contains a backend that is content-addressable. Ninja-go can use file content hashes to determine when to rebuild an output. It also works with the shared remote cache to use read and write build steps.
 
 ### Who will struggle with ABFS?
 
@@ -102,7 +102,7 @@ With just `abfs` installed, you can set up the background systemd service (`cach
 
 ## Install CASFS
 
-See [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs) for more details, but we unfortunately have only built the CASFS kernel module against a limited number of kernel versions and tested it on fewer. If you run into failures building here, you will need to fix the issues.
+See [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs) for more details, we have only built the CASFS kernel module against a limited number of kernel versions and tested it on fewer. If you run into failures building here, you will need to fix the issues.
 
 1. Clone the abfs-casfs repo.
 2. `cd abfs-casfs`
@@ -118,7 +118,8 @@ See [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs) for mor
     sudo insmod casfs.ko
     ```
 
-This won’t persist across reboots.
+> [!NOTE]
+> This won’t persist across reboots.
 
 ## Hello World
 
