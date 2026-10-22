@@ -25,6 +25,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/google/abfs/shared/entities"
@@ -36,7 +37,7 @@ type LogRefStore struct {
 	dir           string
 	mu            sync.RWMutex
 	servers       map[string]*serverRefs
-	setupComplete bool
+	setupComplete atomic.Bool
 	setupErr      error
 	setupMu       sync.RWMutex
 }
@@ -51,9 +52,8 @@ func NewLogRefStore(dir string) (*LogRefStore, error) {
 	}
 
 	s := &LogRefStore{
-		dir:           dir,
-		servers:       make(map[string]*serverRefs, len(files)),
-		setupComplete: false,
+		dir:     dir,
+		servers: make(map[string]*serverRefs, len(files)),
 	}
 
 	for _, fn := range files {
@@ -79,7 +79,7 @@ func NewLogRefStore(dir string) (*LogRefStore, error) {
 			s.setupErr = fmt.Errorf("error initializing log ref store so all ref requests will fail, error was: %w", err)
 			return
 		}
-		s.setupComplete = true
+		s.setupComplete.Store(true)
 	}()
 
 	return s, nil
@@ -87,7 +87,7 @@ func NewLogRefStore(dir string) (*LogRefStore, error) {
 
 // ensureSetup must be called before any operation to ensure we're set up
 func (s *LogRefStore) ensureSetup() error {
-	if !s.setupComplete {
+	if !s.setupComplete.Load() {
 		s.setupMu.RLock()
 		defer s.setupMu.RUnlock()
 		if s.setupErr != nil {
