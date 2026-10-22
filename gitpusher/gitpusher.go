@@ -34,6 +34,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/hashpath"
 	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote"
 	abfsclient "github.com/google/abfs/shared/remote/grpc/client"
 )
@@ -50,6 +51,8 @@ type GitPusher struct {
 	shgit              *shellgit.ShellGit
 
 	startTime     time.Time
+	ctx           context.Context
+	metrics       *pusherMetrics
 	abfsClient    *abfsclient.ABFSClient
 	limitedRemote *remote.LimitedRemoteProvider
 	projectSched  *pushersScheduler
@@ -82,6 +85,8 @@ func NewGitPusher(args *NewGitPusherArgs) *GitPusher {
 
 func (g *GitPusher) Run(ctx context.Context) error {
 	g.startTime = time.Now()
+	g.ctx = ctx
+	g.metrics = newPusherMetrics(metrics.GetProvider())
 
 	client, err := abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
 		Servers:  g.servers,
@@ -138,6 +143,7 @@ func (g *GitPusher) handleConfigChange(newConfig *GitPusherPoolConfig, configHas
 
 	if g.repoSched == nil {
 		g.repoSched = newRepoScheduler(g.newProjectLister, g.projectSched)
+		go g.recordMetrics(g.ctx, g.projectSched, g.repoSched)
 	}
 
 	g.handleReposChange(newConfig)

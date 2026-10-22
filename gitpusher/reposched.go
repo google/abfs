@@ -43,6 +43,8 @@ type RepoStat struct {
 	FetchDuration float64
 	LastSuccess   string
 	LastError     string
+
+	lastSuccess time.Time
 }
 
 type repoScheduler struct {

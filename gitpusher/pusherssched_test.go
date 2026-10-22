@@ -486,3 +486,30 @@ func TestRemoveProject_MultiRepoWaitsForStoppingPusherAfterSetIndex(t *testing.T
 
 	require.NoError(t, sched.Stop())
 }
+
+func TestProjectsStats_PoolSize(t *testing.T) {
+	sched := newPushersScheduler(0, 2, 1, 0, func(pc *ProjectConfig) Pusher {
+		return &mockPusher{}
+	})
+
+	assigned := 0
+	for i := 0; i < 20; i++ {
+		p := &ProjectConfig{
+			Server:      "example.com",
+			Project:     fmt.Sprintf("proj-%d", i),
+			URL:         fmt.Sprintf("example.com/proj-%d", i),
+			FetchConfig: FetchConfig{PushInterval: time.Hour},
+		}
+		if sched.cHasher.IsAssignedToCurrentWorker(p.Name().String()) {
+			assigned++
+		}
+		require.NoError(t, sched.AddProject(p, "test-repo"))
+	}
+	require.NotZero(t, assigned)
+	require.Less(t, assigned, 20)
+
+	stats, pool := sched.projectsStats()
+	require.Len(t, stats, assigned)
+	require.Equal(t, 20, pool)
+	require.NoError(t, sched.Stop())
+}

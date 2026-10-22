@@ -96,6 +96,7 @@ type pusher struct {
 	shgit          *shellgit.ShellGit
 	objAccesser    *dagSyncObjectAccessor
 	pusherName     string
+	metrics        *pusherMetrics
 
 	// statMu guards state, dagSync, pushStart, syncDuration, lastPushed and
 	// lastErr, which Stat and the sync handlers read while Push runs.
@@ -138,6 +139,7 @@ func newPusher(config *ProjectConfig, g *GitPusher, pusherName string) *pusher {
 		state:          PushStateCreated,
 		shgit:          g.shgit,
 		pusherName:     pusherName,
+		metrics:        g.metrics,
 		deepTreeMap:    make(map[entities.Hash]entities.Hash),
 	}
 	return p
@@ -178,6 +180,7 @@ func (s *pusher) currentDAGSync() *dagsync.DAGSync {
 }
 
 func (s *pusher) Stat() PusherStat {
+	mirrorBytes := packBytes(s.dirPath)
 	s.statMu.Lock()
 	defer s.statMu.Unlock()
 	ds := s.dagSync
@@ -190,7 +193,7 @@ func (s *pusher) Stat() PusherStat {
 	if s.lastErr != nil {
 		lastErr = s.lastErr.Error()
 	}
-	return PusherStat{
+	stat := PusherStat{
 		Name:         s.config.Name(),
 		Remote:       s.remoteName,
 		URL:          s.config.URL,
@@ -198,8 +201,14 @@ func (s *pusher) Stat() PusherStat {
 		UploadStart:  s.pushStart.Format(time.RFC3339),
 		LastError:    lastErr,
 		SyncDuration: s.syncDuration.Seconds(),
+		MirrorBytes:  mirrorBytes,
 		DagSync:      dagStat,
+		lastPushed:   s.lastPushed,
 	}
+	if !s.lastPushed.IsZero() {
+		stat.LastUpload = s.lastPushed.Format(time.RFC3339)
+	}
+	return stat
 }
 
 func (s *pusher) setInitStatus(ctx context.Context) error {
@@ -284,6 +293,9 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 		defer s.statMu.Unlock()
 		s.syncDuration = time.Since(s.pushStart)
 		s.state = PushStateSleep
+		if s.metrics != nil {
+			s.metrics.recordPush(s.syncDuration, returnErr)
+		}
 	}()
 
 	s.setState(PushStateFetch)

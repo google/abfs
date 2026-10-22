@@ -109,16 +109,20 @@ func (m *RepoWatcher) Stat() RepoStat {
 	if m.lastErr != nil {
 		lastErr = m.lastErr.Error()
 	}
-	return RepoStat{
+	stat := RepoStat{
 		Name:          m.config.Name(),
 		Remote:        m.config.Manifest.Server,
 		URL:           m.config.Manifest.URL,
 		State:         m.state.String(),
 		FetchStart:    m.listStart.Format(time.RFC3339),
 		FetchDuration: m.listDuration.Seconds(),
-		LastSuccess:   m.lastSuccess.Format(time.RFC3339),
 		LastError:     lastErr,
+		lastSuccess:   m.lastSuccess,
 	}
+	if !m.lastSuccess.IsZero() {
+		stat.LastSuccess = m.lastSuccess.Format(time.RFC3339)
+	}
+	return stat
 }
 func (m *RepoWatcher) writeGitConfig() error {
 	var specs strings.Builder

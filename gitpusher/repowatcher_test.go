@@ -287,5 +287,7 @@ func TestRepoWatcher_StatDuringList(t *testing.T) {
 	}
 	cancel()
 	<-done
-	require.NotEmpty(t, m.Stat().LastError)
+	stat := m.Stat()
+	require.NotEmpty(t, stat.LastError)
+	require.Empty(t, stat.LastSuccess, "a repository never listed successfully has no last success")
 }

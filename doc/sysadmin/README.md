@@ -230,6 +230,29 @@ abfs --remote-servers $SERVER:50051 --disable-tls git-pusher --storage-path $PUS
 
 </details>
 
+#### Seed progress
+
+If you collect metrics from the git-pushers, you can follow the seed in your monitoring system as well as with the `/info` check under [First Mount](#first-mount). Each pusher reports `abfs_pusher_projects` for its own projects, labeled by push state and by `seeded` (pushed successfully at least once), and `abfs_pusher_pool_projects` for all projects in the pool. The seed progress is:
+
+```promql
+sum(abfs_pusher_projects{seeded="true"}) / max(abfs_pusher_pool_projects)
+```
+
+The denominator is the pool gauge because a pusher that has stopped also stops reporting, so a sum over the running pushers alone would look complete. A pusher is missing or has not reported yet when this is above 0:
+
+```promql
+max(abfs_pusher_pool_projects) - sum(abfs_pusher_projects)
+```
+
+The seed is ready when all of these hold. The first line rules out a pool whose manifests are not listed yet.
+
+```promql
+max(abfs_pusher_pool_projects) > 0
+sum(abfs_pusher_projects{seeded="true"}) == max(abfs_pusher_pool_projects)
+sum(abfs_pusher_projects_failing) == 0
+sum(abfs_pusher_repos{listed="false"}) == 0
+```
+
 ### Default Client Configuration
 
 This is run on the client you set up above.

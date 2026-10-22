@@ -27,6 +27,7 @@ import (
 	"github.com/google/abfs/binding"
 	shellgit "github.com/google/abfs/git"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
@@ -354,6 +355,8 @@ func TestPusher_StatDuringPush(t *testing.T) {
 		state:      PushStateInitialized,
 		lastStatus: &binding.ProjectStatus{},
 	}
+	b := newRecordingBackend()
+	p.metrics = newPusherMetrics(metrics.WrapBackend(b))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -368,5 +371,9 @@ func TestPusher_StatDuringPush(t *testing.T) {
 	}
 	cancel()
 	<-done
-	require.NotEmpty(t, p.Stat().LastError)
+	stat := p.Stat()
+	require.NotEmpty(t, stat.LastError)
+	require.Empty(t, stat.LastUpload, "a project that never pushed has no last upload")
+	require.Equal(t, int64(0), stat.MirrorBytes, "an empty mirror has no packs")
+	require.Equal(t, 3.0, b.value("abfs_pusher_pushes_total", "error"))
 }
