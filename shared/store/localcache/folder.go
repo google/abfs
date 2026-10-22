@@ -102,7 +102,7 @@ func (f *Folder) GetChildren(p string) map[string]entities.Hash {
 	if c == nil {
 		return result
 	}
-	if p != "" {
+	if p != "" && !strings.HasSuffix(p, "/") {
 		p += "/"
 	}
 	c.addChildren(p, result)
