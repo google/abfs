@@ -97,6 +97,9 @@ type pusher struct {
 	objAccesser    *dagSyncObjectAccessor
 	pusherName     string
 
+	// statMu guards state, dagSync, pushStart, syncDuration, lastPushed and
+	// lastErr, which Stat and the sync handlers read while Push runs.
+	statMu         sync.Mutex
 	state          PushState
 	dagSync        *dagsync.DAGSync
 	packPusher     *PackPusher
@@ -144,7 +147,39 @@ func (s *pusher) String() string {
 	return s.config.Name().String()
 }
 
+func (s *pusher) setState(state PushState) {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	s.state = state
+}
+
+func (s *pusher) setLastErr(err error) {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	s.lastErr = err
+}
+
+func (s *pusher) setLastPushed(t time.Time) {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	s.lastPushed = t
+}
+
+func (s *pusher) setDAGSync(ds *dagsync.DAGSync) {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	s.dagSync = ds
+}
+
+func (s *pusher) currentDAGSync() *dagsync.DAGSync {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
+	return s.dagSync
+}
+
 func (s *pusher) Stat() PusherStat {
+	s.statMu.Lock()
+	defer s.statMu.Unlock()
 	ds := s.dagSync
 	var dagStat *dagsync.Stats
 	if ds != nil {
@@ -173,9 +208,9 @@ func (s *pusher) setInitStatus(ctx context.Context) error {
 		return err
 	}
 	s.lastStatus = status
-	s.lastPushed = status.LastSuccess
+	s.setLastPushed(status.LastSuccess)
 	if status.LastError != "" {
-		s.lastErr = errors.New(status.LastError)
+		s.setLastErr(errors.New(status.LastError))
 	}
 	return nil
 }
@@ -199,7 +234,7 @@ func (s *pusher) init() error {
 		return fmt.Errorf("failed to write git config: %w", err)
 	}
 
-	s.state = PushStateInitialized
+	s.setState(PushStateInitialized)
 	return nil
 }
 
@@ -225,12 +260,12 @@ func (s *pusher) writeGitConfig() error {
 
 func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	defer func() {
-		s.lastErr = returnErr
+		s.setLastErr(returnErr)
 		if err := s.putProjectStatus(ctx); err != nil {
 			log.Printf("failed to put project status for %s: %v", s.config.Name(), err)
 			if s.lastErr == nil {
 				returnErr = fmt.Errorf("failed to put project status for %s: %w", s.config.Name(), err)
-				s.lastErr = returnErr
+				s.setLastErr(returnErr)
 			}
 		}
 	}()
@@ -241,18 +276,22 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 		}
 	}
 
+	s.statMu.Lock()
 	s.pushStart = time.Now()
+	s.statMu.Unlock()
 	defer func() {
+		s.statMu.Lock()
+		defer s.statMu.Unlock()
 		s.syncDuration = time.Since(s.pushStart)
 		s.state = PushStateSleep
 	}()
 
-	s.state = PushStateFetch
+	s.setState(PushStateFetch)
 	if err := fetchWithRetry(s.shgit, s.dirPath); err != nil {
 		return fmt.Errorf("failed to fetch: %w", err)
 	}
 
-	s.state = PushStateDiff
+	s.setState(PushStateDiff)
 	if err := s.refreshRefObjects(); err != nil {
 		return err
 	}
@@ -309,14 +348,14 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	}
 
 	if time.Since(s.lastPackPushed) > s.config.PackPushInterval {
-		s.state = PushStatePushPacks
+		s.setState(PushStatePushPacks)
 		if err := s.packPusher.Push(ctx); err != nil {
 			return err
 		}
 		s.lastPackPushed = time.Now()
 	}
 
-	s.lastPushed = time.Now()
+	s.setLastPushed(time.Now())
 	log.Printf("successfully processed %s", s)
 	return nil
 }
@@ -502,7 +541,7 @@ func (s *pusher) pushLFSObjects(ctx context.Context, client remote.RemoteProvide
 }
 
 func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []entities.Hash, refHashes []entities.RefHash) error {
-	s.state = PushStatePushBlobs
+	s.setState(PushStatePushBlobs)
 	ds := dagsync.New(&dagsync.DagSyncOpts{
 		Updater:      s.abfsClient,
 		Accessor:     s.objAccesser,
@@ -511,10 +550,8 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 	// We don't care much about the maintenance operations since we will create a new dagsync every time.
 	// Running too frequently (default is every 5 seconds) wastes a lot of loop cycles while dagsync is locked.
 	ds.MaintenanceRunInterval = 24 * time.Hour
-	s.dagSync = ds
-	defer func() {
-		s.dagSync = nil
-	}()
+	s.setDAGSync(ds)
+	defer s.setDAGSync(nil)
 
 	ticker := time.NewTicker(printStatusInterval)
 	defer ticker.Stop()
@@ -555,7 +592,7 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 		return fmt.Errorf("timed out waiting for uploads to complete: %w", err)
 	}
 
-	s.state = PushStatePushObjects
+	s.setState(PushStatePushObjects)
 	log.Printf("%s objects: %d found, %d needed upload", s, len(s.newObjects), len(newObjects))
 	for i, h := range newObjects {
 		ds.PutObject(h)
@@ -719,19 +756,21 @@ func readPushedRefs(fileName string) (result map[string]entities.Hash, retErr er
 }
 
 func (s *pusher) SyncDump(ctx context.Context, w io.Writer) {
-	if s.dagSync == nil {
+	ds := s.currentDAGSync()
+	if ds == nil {
 		_, _ = fmt.Fprintf(w, "%s: dagSync is nil. It is not running yet.\n", s)
 		return
 	}
-	s.dagSync.Dump(ctx, w)
+	ds.Dump(ctx, w)
 }
 
 func (s *pusher) SyncValidate(ctx context.Context, w io.Writer, nodeStaleTimeout time.Duration) {
-	if s.dagSync == nil {
+	ds := s.currentDAGSync()
+	if ds == nil {
 		_, _ = fmt.Fprintf(w, "%s: dagSync is nil. It is not running yet.\n", s)
 		return
 	}
-	s.dagSync.Validate(ctx, w, nodeStaleTimeout)
+	ds.Validate(ctx, w, nodeStaleTimeout)
 }
 
 // saveTreeHelperObjects saves deep-tree and digest-map helper objects
