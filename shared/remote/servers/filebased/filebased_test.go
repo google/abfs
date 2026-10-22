@@ -157,3 +157,29 @@ func TestPutObject_DuplicateBig(t *testing.T) {
 	require.NoError(err, "error reading content")
 	require.Equal(got, content)
 }
+
+func TestAddMapResult_Duplicate(t *testing.T) {
+	require := require.New(t)
+
+	s, cleanup := Setup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	put := func(content []byte) Hash {
+		key := objects.HashBytes(content)
+		require.NoError(s.PutObject(ctx, key, remote.NewZStdContentReader(content)), "error from PutObject")
+		return key
+	}
+	from := put([]byte("blob 4\x00from"))
+	to := put([]byte("blob 2\x00to"))
+	other := put([]byte("blob 5\x00other"))
+
+	for range 3 {
+		require.NoError(s.AddMapResult(ctx, from, to), "error from AddMapResult")
+	}
+	require.NoError(s.AddMapResult(ctx, from, other), "error from AddMapResult")
+
+	results, err := s.MapResults(ctx, from)
+	require.NoError(err, "error from MapResults")
+	require.ElementsMatch([]Hash{to, other}, results)
+}

@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -381,6 +382,9 @@ func (s *fileBasedServer) AddMapResult(ctx context.Context, from Hash, to Hash) 
 		}
 
 		s.putMaps(from, result)
+	}
+	if slices.Contains(result, to) {
+		return nil
 	}
 
 	s.acquireIOSem()
