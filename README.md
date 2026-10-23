@@ -2,9 +2,6 @@
 
 Another Build File Service (ABFS) speeds up the checkouts and builds of large code repositories. The initial focus is on accelerating Android development but there is also some ongoing work to add Bazel support. Internally at Google, we see Android checkouts in seconds and builds in minutes.
 
-> [!NOTE]
-> This is not an officially supported Google product.
-
 ## Why ABFS?
 
 ABFS enables lightweight code checkouts and enables builds to share a cache of previously performed build actions. If you have CI running builds, multiple developers running builds, or develop across multiple Android branches, ABFS can help you.
