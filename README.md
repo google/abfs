@@ -9,6 +9,8 @@ Another Build File Service (ABFS) speeds up the checkouts and builds of large co
 
 ABFS enables lightweight code checkouts and enables builds to share a cache of previously performed build actions. If you have CI running builds, multiple developers running builds, or develop across multiple Android branches, ABFS can help you.
 
+[![ABFS vs Traditional](https://img.youtube.com/vi/YfXxfH337m8/0.jpg)](https://www.youtube.com/watch?v=YfXxfH337m8)
+
 ### What speedup can I expect with ABFS?
 
 Below is the mean time of 3 Android checkouts and builds on a GCE `n2d-standard-64` VM with 64 vCPUs and 256GB of RAM. The ABFS remote server was running in the same VPC as the client.
