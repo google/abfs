@@ -53,6 +53,71 @@ func TestMaybeRemoveScheme(t *testing.T) {
 	}
 }
 
+func TestHost(t *testing.T) {
+	require := require.New(t)
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "android.googlesource.com",
+			want: "android.googlesource.com",
+		},
+		{
+			in:   "https://android.googlesource.com/",
+			want: "android.googlesource.com",
+		},
+		{
+			in:   "https://gerrit.example.com/a/",
+			want: "gerrit.example.com",
+		},
+		{
+			in:   "https://github.com/google/",
+			want: "github.com",
+		},
+		{
+			in:   "android.googlesource.com/child1/child2",
+			want: "android.googlesource.com",
+		},
+		{
+			in:   "android.googlesource.com:2914",
+			want: "android.googlesource.com:2914",
+		},
+		{
+			in:   "ssh://user@gerrit.example.com:29418/",
+			want: "gerrit.example.com:29418",
+		},
+		{
+			in:   "https://[::1]:8080/a/",
+			want: "[::1]:8080",
+		},
+		{
+			in:   "https://Gerrit.Example.COM./a/",
+			want: "Gerrit.Example.COM.",
+		},
+		{
+			in:   "https://gerrit.example.com/a/?x=1#f",
+			want: "gerrit.example.com",
+		},
+		{
+			in:   "file:///srv/git/",
+			want: "",
+		},
+		{
+			in:   "https://gerrit.example.com/%zz",
+			want: "https://gerrit.example.com/%zz",
+		},
+		{
+			in:   "",
+			want: "",
+		},
+	}
+
+	for _, test := range tests {
+		require.Equal(test.want, Host(test.in), test.in)
+	}
+}
+
 func TestMaybeAddScheme(t *testing.T) {
 	require := require.New(t)
 	tests := []struct {

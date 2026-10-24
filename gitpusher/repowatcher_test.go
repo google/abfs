@@ -247,3 +247,38 @@ func TestForAllManifests_CycleInfiniteLoop(t *testing.T) {
 	})
 	require.NoError(err)
 }
+
+type testContentorRemotesWithPath struct {
+}
+
+func (t *testContentorRemotesWithPath) Contents(manifestFile string) (string, error) {
+	switch manifestFile {
+	case "default.xml":
+		return `<manifest>
+  <remote fetch="https://gerrit.example.com/a/" name="gerrit" />
+  <remote fetch="https://github.com/google/" name="github" />
+  <default dest-branch="main" remote="gerrit" revision="main" />
+  <project name="platform/foo" />
+  <project name="uuid" remote="github" />
+</manifest>`, nil
+	default:
+		return "", fmt.Errorf("unsupported file %q", manifestFile)
+	}
+}
+
+func TestProjectRemoteURLSet_RemotesWithPath(t *testing.T) {
+	require := require.New(t)
+
+	mappings, err := projectMappingsForFile(&testContentorRemotesWithPath{}, "https://gerrit.example.com/a/platform/manifest", "default.xml")
+	require.NoError(err)
+	set := make(map[projectRemoteSchemeURL]struct{})
+	require.NoError(mappings.updateProjectRemoteURLSet(set))
+
+	// Clients look refs up under the host of the remote and the manifest name, so the
+	// path of the remote stays in the fetch URL only.
+	want := map[projectRemoteSchemeURL]struct{}{
+		{name: "platform/foo", server: "gerrit.example.com", remote: "gerrit", scheme: "https", url: "gerrit.example.com/a/platform/foo"}: {},
+		{name: "uuid", server: "github.com", remote: "github", scheme: "https", url: "github.com/google/uuid"}:                            {},
+	}
+	require.Equal(want, set)
+}

@@ -1113,7 +1113,7 @@ func (a *ABFS) createProjectFromFSOperation(ctx context.Context, man *manifest.M
 	if err != nil {
 		return err
 	}
-	server = instance.MaybeRemoveScheme(server)
+	server = instance.Host(server)
 
 	status, err := a.projectStatus(ctx, server, project)
 	if err != nil {

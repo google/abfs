@@ -16,6 +16,8 @@ package repo
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"path"
 	"runtime"
@@ -27,6 +29,7 @@ import (
 	"github.com/google/abfs/cas/cas"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
 )
 
 func NewTestRepo(manifestServer, manifestProjectName, manifestScheme string) *Repo {
@@ -306,9 +309,9 @@ func TestNonHTTPSRemoteResolution(t *testing.T) {
 	mainHash := entities.NewHash("1234567890abcdef1234567890abcdef12345678")
 
 	store.searchRefsFunc = func(server, project, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
-		// CRITICAL ASSERTION: The repo package should pass the ssh:// URL directly
-		// to the store, and let the store client handle the scheme stripping.
-		require.Equal("ssh://git.example.com/", server)
+		// The repo package looks refs up under the remote's host, the server name
+		// the git-pusher stores them under.
+		require.Equal("git.example.com", server)
 
 		if refPrefix == "main" || refPrefix == "refs/heads/main" {
 			return []entities.ProjectRefHash{
@@ -328,4 +331,86 @@ func TestNonHTTPSRemoteResolution(t *testing.T) {
 	require.NotNil(man)
 	require.Len(man.Project, 1)
 	require.Equal(mainHash.String(), man.Project[0].Revision)
+}
+
+func TestRemoteWithPathResolution(t *testing.T) {
+	mainHash := entities.NewHash("1234567890abcdef1234567890abcdef12345678")
+	tests := []struct {
+		name           string
+		manifestServer string
+		fetch          string
+		project        string
+		host           string
+	}{
+		{
+			name:           "gerrit /a/ prefix",
+			manifestServer: "gerrit.example.com",
+			fetch:          "https://gerrit.example.com/a/",
+			project:        "platform/foo",
+			host:           "gerrit.example.com",
+		},
+		{
+			name:           "path-style remote",
+			manifestServer: "gerrit.example.com",
+			fetch:          "https://github.com/google/",
+			project:        "uuid",
+			host:           "github.com",
+		},
+		{
+			name:           "deeper path",
+			manifestServer: "gerrit.example.com",
+			fetch:          "https://gerrit.example.com/a/platform/",
+			project:        "foo",
+			host:           "gerrit.example.com",
+		},
+		{
+			name:           "host remote",
+			manifestServer: "android.googlesource.com",
+			fetch:          "https://android.googlesource.com/",
+			project:        "platform/build",
+			host:           "android.googlesource.com",
+		},
+		{
+			name:           "relative remote",
+			manifestServer: "android.googlesource.com",
+			fetch:          "..",
+			project:        "platform/build",
+			host:           "android.googlesource.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			manifestXML := fmt.Sprintf(`
+<manifest>
+  <remote name="origin" fetch=%q />
+  <default revision="main" remote="origin" />
+  <project name=%q />
+</manifest>
+`, tt.fetch, tt.project)
+
+			// The git-pusher stores a project from a manifest under the host of its
+			// URL and its manifest name. The gRPC client strips the scheme, and the
+			// file-based server fails a search under any other server name.
+			store := &testStore{}
+			store.searchRefsFunc = func(server, project, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
+				if instance.MaybeRemoveScheme(server) != tt.host {
+					return nil, errors.New("no such file or directory")
+				}
+				if refPrefix == "main" || refPrefix == "refs/heads/main" {
+					return []entities.ProjectRefHash{{Project: tt.project, Ref: refPrefix, Hash: mainHash}}, nil
+				}
+				return nil, nil
+			}
+			r := New(store, &testCASGit{}, tt.manifestServer, "platform/manifest", "https", "", false)
+
+			require.NoError(r.ManifestFromBytes([]byte(manifestXML)))
+
+			man := r.PinnedManifest()
+			require.Len(man.Project, 1)
+			require.Equal(mainHash.String(), man.Project[0].Revision)
+		})
+	}
 }

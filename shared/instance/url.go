@@ -51,6 +51,27 @@ func MaybeRemoveScheme(in string) string {
 	return path.Clean(strings.TrimPrefix(parsed.String(), "//"))
 }
 
+// Host returns the host and port of a URL, without scheme, user info or path, or the
+// input unchanged when it does not parse. It is the server name refs are stored under.
+func Host(in string) string {
+	if in == "" {
+		return in
+	}
+
+	// Same as MaybeRemoveScheme: make host:port parse as a host, not as a scheme.
+	raw := in
+	if !strings.Contains(raw, "://") {
+		raw = "//" + raw
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return in
+	}
+
+	return parsed.Host
+}
+
 // Adds a scheme to input URL if one does not exist.
 func MaybeAddScheme(in, scheme string) string {
 	// The parsing library can get tripped up by something like:
