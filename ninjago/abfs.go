@@ -154,6 +154,8 @@ func (c *ABFSBackend) Init(params *ninjaruntime.RunParameters, cmd *string, args
 		c.config.NoFallbackIfRemoteFails = true
 	}
 
+	// Every cache checker and every running step can have a request open at once.
+	client.SetMaxIdleConnsPerHost(params.CacheCheckersCount + params.CliFlags.ConcurrencyLevel)
 	c.cacheman = client.NewClient(c.config.CacheDir, c.config.FetchTimeout)
 
 	abfs, err := binding.NewClient(".", entities.ABFSSocketFileName, c.config.CacheDir, c.config.LocalOnly, c.config.FetchTimeout)
