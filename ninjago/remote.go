@@ -293,7 +293,7 @@ func (c *ABFSBackend) remoteOrderOnlyPatch(ctx context.Context, eval *Eval) (ent
 			continue
 		}
 		// Ignore phony order-only inputs.
-		if n := c.graph.Targets.Get(f); n != nil && n.Build.Rule.IsPhony() {
+		if n := c.graph.Targets.Get(f); n != nil && isPhonyNode(n) {
 			continue
 		}
 		stat, err := c.lookup(f)
