@@ -117,6 +117,7 @@ type NinjaStats struct {
 	CacheHitCount   uint32
 	CacheMissCount  uint32
 	CacheForceCount uint32
+	CacheErrorCount uint32
 	CacheHitPercent float64
 
 	NinjaEntryFile string

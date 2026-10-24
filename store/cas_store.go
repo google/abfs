@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 )
 
 var ErrNoProvider = errors.New("no remote providers are enabled")
+
+var ErrProviderNotify = errors.New("cannot notify cacheman of a new object")
 
 type CASStore struct {
 	local     *localcache.LocalCache
@@ -213,7 +216,7 @@ func (c *CASStore) PutObject(ctx context.Context, key entities.Hash, content []b
 	if err != nil || c.localOnly {
 		return err
 	}
-	return c.provider.NewObject(ctx, key)
+	return c.notifyNewObject(ctx, key)
 }
 
 // Write implements entities.CASStore
@@ -222,7 +225,14 @@ func (c *CASStore) WriteObject(ctx context.Context, key entities.Hash, reader io
 	if err != nil || c.localOnly {
 		return err
 	}
-	return c.provider.NewObject(ctx, key)
+	return c.notifyNewObject(ctx, key)
+}
+
+func (c *CASStore) notifyNewObject(ctx context.Context, key entities.Hash) error {
+	if err := c.provider.NewObject(ctx, key); err != nil {
+		return fmt.Errorf("%w %s: %w", ErrProviderNotify, key, err)
+	}
+	return nil
 }
 
 // ObjectHeader implements entities.CASStore

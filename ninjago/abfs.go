@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/ninja-go/backends"
@@ -46,6 +47,7 @@ import (
 	"github.com/google/abfs/shared/cacheman/client"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
+	"github.com/google/abfs/store"
 )
 
 const (
@@ -70,6 +72,7 @@ type ABFSBackend struct {
 	useRemote       bool
 	remotableRules  map[string]struct{}
 	abfs            *binding.Client
+	store           entities.CASStore
 	cacheman        *client.Client
 	graph           *graph.Graph
 	log             ninjaruntime.Logger
@@ -90,6 +93,7 @@ type ABFSBackend struct {
 	hashFetchC      chan HashFetchReq
 	pendingJobs     sync.WaitGroup
 	matchFiles      *matchFiles
+	cacheErrors     atomic.Int64
 }
 
 func NewABFSBackend() *ABFSBackend {
@@ -126,6 +130,7 @@ type Eval struct {
 	start         time.Time
 	end           time.Time
 	remotePatches []entities.Hash
+	cacheErr      bool
 }
 
 type FailedStep struct {
@@ -163,6 +168,7 @@ func (c *ABFSBackend) Init(params *ninjaruntime.RunParameters, cmd *string, args
 		return fmt.Errorf("could not create ABFS client: %w", err)
 	}
 	c.abfs = abfs
+	c.store = abfs.Store()
 
 	envVars := NormalizedEnvVars()
 	envVarsHash, err := abfs.StoreEnvVars(envVars)
@@ -396,12 +402,12 @@ func (c *ABFSBackend) evalReqResp(reqHash, respHash entities.Hash) (req *binding
 
 	grp.Go(func() error {
 		var err error
-		req, err = binding.FetchObject[binding.EvalRequest](ctx, c.abfs.Store(), reqHash)
+		req, err = binding.FetchObject[binding.EvalRequest](ctx, c.store, reqHash)
 		return err
 	})
 	grp.Go(func() error {
 		var err error
-		resp, err = binding.FetchObject[binding.EvalResponse](ctx, c.abfs.Store(), respHash)
+		resp, err = binding.FetchObject[binding.EvalResponse](ctx, c.store, respHash)
 		return err
 	})
 
@@ -527,13 +533,15 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 	for i := range 2 {
 		if i > 0 {
 			eval.lastRefresh = time.Now()
-			if err := c.abfs.Store().RefreshMapResults(ctx, eval.req.Hash); err != nil {
-				return false, err
+			if err := c.store.RefreshMapResults(ctx, eval.req.Hash); err != nil {
+				c.cacheCheckFailed(eval, err, "cannot refresh map results, building locally")
+				return false, nil
 			}
 		}
-		respHashes, err := c.abfs.Store().MapResults(context.Background(), eval.req.Hash)
+		respHashes, err := c.store.MapResults(context.Background(), eval.req.Hash)
 		if err != nil {
-			return false, err
+			c.cacheCheckFailed(eval, err, "cannot read map results, building locally")
+			return false, nil
 		}
 		slices.Reverse(respHashes) // More recent responses have higher chance of a match
 
@@ -541,9 +549,11 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 			if _, done := eval.triedResps[hash]; done {
 				continue
 			}
-			resp, err := binding.FetchObject[binding.EvalResponse](ctx, c.abfs.Store(), hash)
+			resp, err := binding.FetchObject[binding.EvalResponse](ctx, c.store, hash)
 			if err != nil {
-				return false, err
+				c.cacheCheckFailed(eval, err, "cannot fetch resp=%s, skipping it", hash)
+				eval.triedResps[hash] = struct{}{}
+				continue
 			}
 
 			targetsMap := make(map[string]struct{}, len(eval.step.Node.Targets))
@@ -587,6 +597,15 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 		}
 	}
 	return false, nil
+}
+
+// cacheCheckFailed logs a cache check that could not reach cacheman or the server and counts the step once.
+func (c *ABFSBackend) cacheCheckFailed(eval *Eval, err error, format string, a ...any) {
+	c.log.Warnf("cache check for %s req=%s: %s: %v", eval.step, eval.req.Hash, fmt.Sprintf(format, a...), err)
+	if !eval.cacheErr {
+		eval.cacheErr = true
+		c.cacheErrors.Add(1)
+	}
 }
 
 func (c *ABFSBackend) updateCacheWithResp(resp *binding.EvalResponse) {
@@ -894,7 +913,7 @@ func (c *ABFSBackend) execNoTapLocal(ctx context.Context, eval *Eval) (*binding.
 	resp.ReadPatch = eval.req.InputPatch
 	resp.WritePatch = writePatch
 
-	if err := c.StoreResults(ctx, eval, resp); err != nil {
+	if err := c.recordResults(ctx, eval, resp, false); err != nil {
 		return resp, err
 	}
 
@@ -927,14 +946,8 @@ func (c *ABFSBackend) execTapLocal(ctx context.Context, eval *Eval) (*binding.Ev
 		ChrootToStrip: c.chroot,
 	})
 
-	if err := c.StoreResults(ctx, eval, resp); err != nil {
+	if err := c.recordResults(ctx, eval, resp, tapResult.ExitCode == 0); err != nil {
 		return resp, err
-	}
-
-	if tapResult.ExitCode == 0 {
-		if err := c.abfs.Store().AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
-		}
 	}
 
 	return resp, nil
@@ -954,8 +967,12 @@ func (c *ABFSBackend) lookup(fname string) (*HashStat, error) {
 	return hs, nil
 }
 
+// StoreResults writes the request and response to the store and returns any notify errors after both writes.
 func (c *ABFSBackend) StoreResults(ctx context.Context, eval *Eval, resp *binding.EvalResponse) error {
-	if err := c.abfs.Store().PutObject(ctx, eval.req.Hash, eval.req.Encoded); err != nil {
+	var notifyErrs []error
+	if err := c.store.PutObject(ctx, eval.req.Hash, eval.req.Encoded); errors.Is(err, store.ErrProviderNotify) {
+		notifyErrs = append(notifyErrs, err)
+	} else if err != nil {
 		return fmt.Errorf("failed to write eval-req %s for %s: %w", eval.req.Hash, eval.step, err)
 	}
 
@@ -963,8 +980,29 @@ func (c *ABFSBackend) StoreResults(ctx context.Context, eval *Eval, resp *bindin
 		return fmt.Errorf("failed to encode eval-resp (req=%s) for %s: %w", eval.req.Hash, eval.step, err)
 	}
 
-	if err := c.abfs.Store().PutObject(ctx, resp.Hash, resp.Encoded); err != nil {
+	if err := c.store.PutObject(ctx, resp.Hash, resp.Encoded); errors.Is(err, store.ErrProviderNotify) {
+		notifyErrs = append(notifyErrs, err)
+	} else if err != nil {
 		return fmt.Errorf("failed to write eval-resp %s (req=%s) for %s: %w", resp.Hash, eval.req.Hash, eval.step, err)
+	}
+	return errors.Join(notifyErrs...)
+}
+
+// recordResults stores the results of a step that ran and, if addMap is set, maps the request to the response.
+// A failed notify to cacheman is logged and adds no map entry.
+func (c *ABFSBackend) recordResults(ctx context.Context, eval *Eval, resp *binding.EvalResponse, addMap bool) error {
+	err := c.StoreResults(ctx, eval, resp)
+	if errors.Is(err, store.ErrProviderNotify) {
+		c.log.Warnf("results of %s req=%s stay local: %v", eval.step, eval.req.Hash, err)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if addMap {
+		if err := c.store.AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
+		}
 	}
 	return nil
 }
@@ -1188,8 +1226,8 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 		hitRate = float64(cached) / float64(cached+done) * 100
 	}
 	msg := fmt.Sprintf(
-		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f",
-		time.Since(c.startTime), failed, cached, done, hitRate,
+		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, check errors: %d",
+		time.Since(c.startTime), failed, cached, done, hitRate, c.cacheErrors.Load(),
 	)
 	c.log.Warnf("%s", msg)
 

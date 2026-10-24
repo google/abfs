@@ -123,7 +123,7 @@ func (c *ABFSBackend) addPathInterposer(ctx context.Context, filePath string, pa
 		"/bin",
 	}
 	content := []byte(strings.Join(pathInterposer, ":"))
-	hash, size, err := store.StoreBlob(ctx, c.abfs.Store(), content)
+	hash, size, err := store.StoreBlob(ctx, c.store, content)
 	if err != nil {
 		return err
 	}
@@ -230,7 +230,7 @@ func (c *ABFSBackend) loadRemote() error {
 		return fmt.Errorf("cannot encode PatchObject: %w", err)
 	}
 
-	if err := c.abfs.Store().PutObject(ctx, c.remoteBasePatch.Hash, c.remoteBasePatch.Encoded); err != nil {
+	if err := c.store.PutObject(ctx, c.remoteBasePatch.Hash, c.remoteBasePatch.Encoded); err != nil {
 		return fmt.Errorf("cannot store remote base PatchObject %s: %w", c.remoteBasePatch.Hash, err)
 	}
 	fmt.Printf("Remote enabled base=%s\n", c.remoteBasePatch.Hash)
@@ -325,7 +325,7 @@ func (c *ABFSBackend) remoteOrderOnlyPatch(ctx context.Context, eval *Eval) (ent
 		return r.Hash, nil
 	}
 
-	if err := c.abfs.Store().PutObject(ctx, r.Hash, r.Encoded); err != nil {
+	if err := c.store.PutObject(ctx, r.Hash, r.Encoded); err != nil {
 		return entities.ZeroHash, err
 	}
 
@@ -549,7 +549,7 @@ func (c *ABFSBackend) remoteDepsPatchHash(ctx context.Context, eval *Eval) (enti
 		return entities.ZeroHash, err
 	}
 
-	if err := c.abfs.Store().PutObject(ctx, r.Hash, r.Encoded); err != nil {
+	if err := c.store.PutObject(ctx, r.Hash, r.Encoded); err != nil {
 		return entities.ZeroHash, err
 	}
 
@@ -557,7 +557,7 @@ func (c *ABFSBackend) remoteDepsPatchHash(ctx context.Context, eval *Eval) (enti
 }
 
 func (c *ABFSBackend) runRemote(ctx context.Context, eval *Eval) (*binding.EvalResponse, error) {
-	if err := c.abfs.Store().PutObject(ctx, eval.req.Hash, eval.req.Encoded); err != nil {
+	if err := c.store.PutObject(ctx, eval.req.Hash, eval.req.Encoded); err != nil {
 		return nil, err
 	}
 
@@ -592,7 +592,7 @@ func (c *ABFSBackend) runRemote(ctx context.Context, eval *Eval) (*binding.EvalR
 		return nil, fmt.Errorf("failed to execute req %v with patches %v on remote: %v", eval.req.Hash, eval.remotePatches, err)
 	}
 
-	return binding.FetchObjectWarnOnRetry[binding.EvalResponse](ctx, c.abfs.Store(), respHash, remoteRespFetchTimeout)
+	return binding.FetchObjectWarnOnRetry[binding.EvalResponse](ctx, c.store, respHash, remoteRespFetchTimeout)
 }
 
 func (c *ABFSBackend) execRemote(ctx context.Context, eval *Eval) (*binding.EvalResponse, error) {
