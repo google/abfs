@@ -978,13 +978,19 @@ func shouldIgnoreInput(fname string) bool {
 	return false
 }
 
-// addInput uses the inputSet to efficiently look recursively through phony rules to see if the input needs to be added.
+// isPhonyNode reports whether the outputs of n are not files: a phony build, or a build with
+// phony_output set on it or on its rule. Kati writes a .PHONY target with a recipe that way.
+func isPhonyNode(n *graph.Node) bool {
+	return n.Build.Rule.IsPhony() || n.Build.Scope.ExpandField("phony_output") != ""
+}
+
+// addInput uses the inputSet to efficiently look recursively through phony and phony_output builds to see if the input needs to be added.
 func (c *ABFSBackend) addInput(fname string, isOrderOnly bool, inputs *[]entities.PatchEntry, inputSet map[string]struct{}) error {
 	if shouldIgnoreInput(fname) {
 		return nil
 	}
-	if n := c.graph.Targets.Get(fname); n != nil && n.Build.Rule.IsPhony() {
-		// Traverse phony targets recursively to add to the input list
+	if n := c.graph.Targets.Get(fname); n != nil && isPhonyNode(n) {
+		// Traverse phony and phony_output targets recursively to add to the input list
 		for i, ins := range n.Build.AllInputs() {
 			for _, in := range ins {
 				if _, exists := inputSet[in]; !exists {
