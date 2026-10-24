@@ -24,6 +24,7 @@ import (
 	ninjaruntime "github.com/google/ninja-go/runtime"
 	"github.com/stretchr/testify/require"
 
+	"github.com/google/abfs/binding"
 	"github.com/google/abfs/shared/entities"
 )
 
@@ -203,4 +204,57 @@ func TestRemoteOrderOnlyPatch_PhonyOutputInput(t *testing.T) {
 	h, err := c.remoteOrderOnlyPatch(context.Background(), &Eval{step: loadedStep(g, "out/result")})
 	require.NoError(t, err)
 	require.Equal(t, entities.ZeroHash, h)
+}
+
+const nilStorePanic = "runtime error: invalid memory address or nil pointer dereference"
+
+func TestPhonyOutputStep_SkipsCache(t *testing.T) {
+	g := loadTestGraph(t, testNinjaFile(
+		phonyOutputBuild("qssi_violators", "src/rules.txt"),
+		resultBuild([]string{"qssi_violators"}, nil)), "out/result")
+
+	tests := []struct {
+		name      string
+		target    string
+		wantStore bool
+	}{
+		{name: "phony_output step", target: "qssi_violators"},
+		{name: "regular step", target: "out/result", wantStore: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestBackend(t, g, &Configuration{}, "src/rules.txt")
+			// binding.Client takes its store only from NewClient, which needs a mounted
+			// workspace. A zero Client has a nil store, so every store call panics.
+			c.abfs = &binding.Client{}
+			eval := &Eval{
+				step:       loadedStep(g, tt.target),
+				req:        &binding.EvalRequest{},
+				triedResps: make(map[entities.Hash]struct{}),
+			}
+
+			for _, delayed := range []bool{false, true} {
+				lookup := func() {
+					cached, err := c.applyIfCached(context.Background(), eval, delayed)
+					require.NoError(t, err)
+					require.False(t, cached)
+				}
+				if tt.wantStore {
+					require.PanicsWithError(t, nilStorePanic, lookup)
+				} else {
+					require.NotPanics(t, lookup)
+				}
+			}
+
+			record := func() {
+				c.addMapResult(context.Background(), eval, &binding.EvalResponse{})
+			}
+			if tt.wantStore {
+				require.PanicsWithError(t, nilStorePanic, record)
+			} else {
+				require.NotPanics(t, record)
+			}
+		})
+	}
 }
