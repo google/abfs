@@ -95,7 +95,7 @@ func (r *GitRepo) Project() string {
 	return r.project
 }
 
-func (r *GitRepo) setRemoteURL(remoteURL string) error {
+func (r *GitRepo) setRemoteURL(remoteURL, refServer, refProject string) error {
 	parsed, err := url.Parse(remoteURL)
 	if err != nil {
 		return fmt.Errorf("failed to parse repository URL %s: %v", remoteURL, err)
@@ -107,6 +107,10 @@ func (r *GitRepo) setRemoteURL(remoteURL string) error {
 	r.remoteURL = remoteURL
 	r.server = parsed.Host
 	r.project = strings.Trim(parsed.Path, "/")
+	if refServer != "" && refProject != "" {
+		r.server = refServer
+		r.project = refProject
+	}
 	return nil
 }
 

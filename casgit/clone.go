@@ -62,6 +62,11 @@ type CloneOptions struct {
 	PrefetchIndices  bool
 	PrefetchSymlinks bool
 	DetachedHead     bool
+
+	// RefServer and RefProject are the server and project the refs are stored
+	// under. When either is empty, they are the host and the path of RemoteRepo.
+	RefServer  string
+	RefProject string
 }
 
 type GitClone struct {
@@ -142,7 +147,7 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 		fmt.Printf("Cloning %s branch %s into %q...\n", c.RemoteRepo, c.Branch, c.Directory)
 	}
 
-	if err := c.setRemoteURL(c.RemoteRepo); err != nil {
+	if err := c.setRemoteURL(c.RemoteRepo, c.RefServer, c.RefProject); err != nil {
 		return err
 	}
 

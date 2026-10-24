@@ -1256,6 +1256,8 @@ func (a *ABFS) newCloneOptions(project *manifest.Project, projectURL string) cas
 
 	opts := casgit.CloneOptions{
 		RemoteRepo: projectURL,
+		RefServer:  instance.Host(projectURL),
+		RefProject: project.Name,
 		Directory:  fullPath,
 		Origin:     "origin",
 		GitDir:     filepath.Join(fullPath, ".git"),

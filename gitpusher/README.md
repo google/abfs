@@ -131,6 +131,8 @@ Defines an individual project to sync.
 | `url` | string | Full URL (alternative to server/project). |
 | *(inline)* | [`FetchConfig`](#fetchconfig) | Inherits all fields from FetchConfig. |
 
+`server` and `project` default to the host and the path of `url`. Clients look a project from a manifest up under the host of its remote and its manifest name, so when a manifest lists this project under a remote with a path, such as `https://github.com/google/` with name `uuid`, set `project` to the manifest name.
+
 ### `OverrideFetchConfig`
 
 | Field | Type | Default | Description |
