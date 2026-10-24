@@ -67,6 +67,9 @@ type CloneOptions struct {
 	// under. When either is empty, they are the host and the path of RemoteRepo.
 	RefServer  string
 	RefProject string
+
+	// Ref is the branch or tag Commit was resolved from; the clone then skips the lookup.
+	Ref string
 }
 
 type GitClone struct {
@@ -151,19 +154,8 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if !c.Commit.IsZero() {
-		c.cloneSource = cloneSourceCommit
-		c.sourceHash = c.Commit
-	} else if c.Branch == "" {
-		if err := c.setDefaultBranch(ctx); err != nil {
-			return err
-		}
-	}
-
-	if c.cloneSource != cloneSourceCommit {
-		if err := c.resolveBranch(ctx); err != nil {
-			return err
-		}
+	if err := c.selectSource(ctx); err != nil {
+		return err
 	}
 
 	commit, err := c.casgit.ResolveCommit(ctx, c.sourceHash)
@@ -230,6 +222,35 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 	}
 
 	return nil
+}
+
+func (c *GitClone) selectSource(ctx context.Context) error {
+	if !c.Commit.IsZero() {
+		c.cloneSource = cloneSourceCommit
+		c.sourceHash = c.Commit
+		c.useResolvedRef()
+		return nil
+	}
+	if c.Branch == "" {
+		if err := c.setDefaultBranch(ctx); err != nil {
+			return err
+		}
+	}
+	return c.resolveBranch(ctx)
+}
+
+// useResolvedRef leaves a ref outside refs/heads/ and refs/tags/ a commit clone.
+func (c *GitClone) useResolvedRef() {
+	if name, ok := strings.CutPrefix(c.Ref, "refs/heads/"); ok {
+		c.cloneSource = cloneSourceBranch
+		c.Branch = name
+	} else if name, ok := strings.CutPrefix(c.Ref, "refs/tags/"); ok {
+		c.cloneSource = cloneSourceTag
+		c.Branch = name
+	} else {
+		return
+	}
+	c.branchRef = c.Ref
 }
 
 func (c *GitClone) resolveBranch(ctx context.Context) error {

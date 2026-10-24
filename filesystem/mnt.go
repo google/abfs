@@ -22,7 +22,9 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/object"
+
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/casgit"
@@ -164,7 +166,7 @@ func ProjectGitConfig(info ProjectInfo) ([]byte, error) {
 		return []byte(configTemplate + casfsTemplate), nil
 	}
 
-	fetch, err := manifest.ExpandFetch(remote.Fetch, info.SchemeManProjURL)
+	fetch, err := resolve.FetchURL(remote.Fetch, info.SchemeManProjURL)
 	if err != nil {
 		return nil, errors.New("could not expand fetch URL")
 	}

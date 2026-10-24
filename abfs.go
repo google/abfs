@@ -32,7 +32,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -43,6 +42,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/casgit"
@@ -1433,26 +1433,7 @@ func (a *ABFS) copyFiles(ctx context.Context, project *manifest.Project, root bi
 }
 
 func shouldExcludeProject(p *manifest.Project, groups []string) bool {
-	projectGroups := append([]string{"all"}, p.Groups...)
-	if !slices.Contains(projectGroups, "notdefault") {
-		projectGroups = append(projectGroups, "default")
-	}
-	manifestGroups := groups
-	if len(manifestGroups) == 0 {
-		manifestGroups = []string{"default"}
-	}
-	match := false
-	for _, manifestGroup := range manifestGroups {
-		if len(manifestGroup) == 0 {
-			continue
-		}
-		if manifestGroup[0] == '-' && slices.Contains(projectGroups, manifestGroup[1:]) {
-			match = false
-		} else if slices.Contains(projectGroups, manifestGroup) {
-			match = true
-		}
-	}
-	return !match
+	return !resolve.MatchGroups(p.Groups, groups)
 }
 
 func (a *ABFS) initWorktreeWithDotGit(ctx context.Context, root bindcas.Dir, projectPath, dotGitPath, commit string) error {
@@ -1480,6 +1461,7 @@ func (a *ABFS) initWorktreeWithDotGit(ctx context.Context, root bindcas.Dir, pro
 func (a *ABFS) setupRepo() error {
 	ctx := context.Background()
 	a.repo = repo.New(a.store, a.git, a.ManifestServer, a.ManifestProjectName, a.ManifestScheme, a.LocalManifestDir, a.IgnoreMissingProjects)
+	a.repo.SetGroups(a.MountGroups)
 	if err := a.repo.AddChanges(a.ChangeIDs); err != nil {
 		return fmt.Errorf("AddChanges failed: %v", err)
 	}

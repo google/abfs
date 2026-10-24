@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"regexp"
 	"strings"
 )
@@ -492,27 +491,4 @@ func (mf *Manifest) RemoteFromName(remote string) *Remote {
 		return nil
 	}
 	return mf.remotes[remote]
-}
-
-// ExpandFetch handles the special case value of ".."
-func ExpandFetch(fetchURL, manifestProjectURL string) (string, error) {
-	if !strings.HasPrefix(fetchURL, "..") {
-		return fetchURL, nil
-	}
-
-	if manifestProjectURL == "" {
-		return "", errors.New("cannot resolve '..' without a manifest project URL")
-	}
-
-	parsedFetchURL, err := url.Parse(fetchURL)
-	if err != nil {
-		return "", err
-	}
-	parsedManifestProjectURL, err := url.Parse(manifestProjectURL)
-	if err != nil {
-		return "", err
-	}
-
-	// This matches the Python urljoin behavior that the repo tool uses.
-	return parsedManifestProjectURL.ResolveReference(parsedFetchURL).String(), nil
 }

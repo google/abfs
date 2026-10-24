@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/casgit"
 	"github.com/google/abfs/shared/bindcas"
@@ -97,7 +98,7 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		return err
 	}
 
-	remoteURL, err := manifest.ExpandFetch(remote.Fetch, r.manifestURL)
+	remoteURL, err := resolve.FetchURL(remote.Fetch, r.manifestURL)
 	if err != nil {
 		return err
 	}
@@ -122,9 +123,11 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		return fmt.Errorf("cannot stat git dir %s: %w", gitDir, err)
 	}
 
-	var cloneBranch string
+	var cloneBranch, cloneRef string
 	var cloneCommit entities.Hash
-	if entities.IsHash(revision) {
+	if res, ok := r.resolved[project.Name]; ok {
+		cloneCommit, cloneRef = res.Hash, res.Ref
+	} else if entities.IsHash(revision) {
 		cloneCommit = entities.NewHash(revision)
 	} else {
 		cloneBranch = revision
@@ -139,6 +142,7 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		Origin:           remoteName,
 		Branch:           cloneBranch,
 		Commit:           cloneCommit,
+		Ref:              cloneRef,
 		PrefetchIndices:  r.PrefetchIndices,
 		PrefetchSymlinks: r.PrefetchSymlinks,
 		Quiet:            true,
@@ -322,8 +326,12 @@ func (r *Repo) updateManifest(ctx context.Context, fallbackToGit bool) error {
 }
 
 func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision, refServer string, opts SyncOpts) error {
+	target := revision
+	if res, ok := r.resolved[project.Name]; ok {
+		target = res.Hash.String()
+	}
 	gitRepo := casgit.NewGitRepo(r.Git, workDir, gitDir, objDir)
-	err := r.updateGitRepo(ctx, gitRepo, project.Name, workDir, gitDir, objDir, remoteName, revision, refServer, project.Name, opts)
+	err := r.updateGitRepo(ctx, gitRepo, project.Name, workDir, gitDir, objDir, remoteName, target, refServer, project.Name, opts)
 	if err != nil && opts.FallbackToGit {
 		log.Printf("ABFS update for %s failed (%v), falling back to git...", project.Name, err)
 		if fetchErr := r.shellGit.Fetch(gitDir); fetchErr != nil {

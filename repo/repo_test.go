@@ -21,6 +21,7 @@ import (
 	"io"
 	"path"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -413,4 +414,159 @@ func TestRemoteWithPathResolution(t *testing.T) {
 			require.Equal(mainHash.String(), man.Project[0].Revision)
 		})
 	}
+}
+
+// refTable answers SearchRefs as the stores do: the exact ref, else every ref below it.
+type refTable map[string]map[string]entities.Hash
+
+func (s refTable) search(server, project, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
+	var results []entities.ProjectRefHash
+	for name, refs := range s {
+		if project != "" && project != name {
+			continue
+		}
+		if h, ok := refs[refPrefix]; ok {
+			results = append(results, entities.ProjectRefHash{Project: name, Ref: refPrefix, Hash: h})
+			continue
+		}
+		for ref, h := range refs {
+			if strings.HasPrefix(ref, refPrefix+"/") {
+				results = append(results, entities.ProjectRefHash{Project: name, Ref: ref, Hash: h})
+			}
+		}
+	}
+	return results, nil
+}
+
+func TestManifest_RevisionForms(t *testing.T) {
+	branchHash := entities.NewHash("1111111111111111111111111111111111111111")
+	tagHash := entities.NewHash("2222222222222222222222222222222222222222")
+	bothBranchHash := entities.NewHash("3333333333333333333333333333333333333333")
+	bothTagHash := entities.NewHash("4444444444444444444444444444444444444444")
+	pinnedHash := entities.NewHash("5555555555555555555555555555555555555555")
+
+	refs := refTable{
+		"platform/foo": {
+			"refs/heads/main": branchHash,
+			"refs/tags/v1":    tagHash,
+			"refs/heads/both": bothBranchHash,
+			"refs/tags/both":  bothTagHash,
+		},
+	}
+
+	tests := []struct {
+		name     string
+		revision string
+		want     entities.Hash
+	}{
+		{name: "bare branch", revision: "main", want: branchHash},
+		{name: "full branch ref", revision: "refs/heads/main", want: branchHash},
+		{name: "bare tag", revision: "v1", want: tagHash},
+		{name: "full tag ref", revision: "refs/tags/v1", want: tagHash},
+		{name: "branch and tag of the same name", revision: "both", want: bothBranchHash},
+		{name: "commit", revision: pinnedHash.String(), want: pinnedHash},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			manifestXML := fmt.Sprintf(`
+<manifest>
+  <remote name="origin" fetch="https://gerrit.example.com/" />
+  <default remote="origin" />
+  <project name="platform/foo" path="foo" revision=%q />
+</manifest>
+`, tt.revision)
+
+			store := &testStore{searchRefsFunc: refs.search}
+			r := New(store, &testCASGit{}, "gerrit.example.com", "platform/manifest", "https", "", false)
+			require.NoError(r.ManifestFromBytes([]byte(manifestXML)))
+			require.Equal(tt.want.String(), r.PinnedManifest().Project[0].Revision)
+		})
+	}
+}
+
+func TestManifest_NamesEveryUnresolvedProject(t *testing.T) {
+	require := require.New(t)
+
+	manifestXML := `
+<manifest>
+  <remote name="origin" fetch="https://gerrit.example.com/" />
+  <default revision="main" remote="origin" />
+  <project name="platform/missing-a" />
+  <project name="platform/present" />
+  <project name="platform/missing-b" />
+</manifest>
+`
+	refs := refTable{
+		"platform/present": {"refs/heads/main": entities.NewHash("1111111111111111111111111111111111111111")},
+	}
+	store := &testStore{searchRefsFunc: refs.search}
+	r := New(store, &testCASGit{}, "gerrit.example.com", "platform/manifest", "https", "", false)
+
+	err := r.ManifestFromBytes([]byte(manifestXML))
+	require.Error(err)
+	require.ErrorContains(err, "platform/missing-a")
+	require.ErrorContains(err, "platform/missing-b")
+	require.NotContains(err.Error(), "platform/present")
+}
+
+func TestManifest_UnresolvedProjectOutsideGroups(t *testing.T) {
+	manifestXML := `
+<manifest>
+  <remote name="origin" fetch="https://gerrit.example.com/" />
+  <default revision="main" remote="origin" />
+  <project name="platform/present" />
+  <project name="platform/tools" groups="tools" />
+</manifest>
+`
+	presentHash := entities.NewHash("1111111111111111111111111111111111111111")
+	refs := refTable{
+		"platform/present": {"refs/heads/main": presentHash},
+	}
+
+	tests := []struct {
+		name    string
+		groups  []string
+		wantErr bool
+	}{
+		{name: "selected", groups: []string{"default"}, wantErr: true},
+		{name: "deselected", groups: []string{"default", "-tools"}, wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			r := New(&testStore{searchRefsFunc: refs.search}, &testCASGit{}, "gerrit.example.com", "platform/manifest", "https", "", false)
+			r.SetGroups(tt.groups)
+			err := r.ManifestFromBytes([]byte(manifestXML))
+			if tt.wantErr {
+				require.ErrorContains(err, "platform/tools")
+				return
+			}
+			require.NoError(err)
+			man := r.PinnedManifest()
+			require.Equal(presentHash.String(), man.Project[0].Revision)
+			require.Equal("main", man.Project[1].Revision)
+		})
+	}
+}
+
+func TestManifest_SearchFailureAborts(t *testing.T) {
+	require := require.New(t)
+
+	manifestXML := `
+<manifest>
+  <remote name="origin" fetch="https://gerrit.example.com/" />
+  <default revision="main" remote="origin" />
+  <project name="platform/foo" />
+</manifest>
+`
+	// An unknown host reaches the client through cacheman as a plain error, not as "not found".
+	store := &testStore{searchRefsFunc: func(server, project, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
+		return nil, errors.New("rpc error: code = Unknown desc = no such file or directory")
+	}}
+	r := New(store, &testCASGit{}, "gerrit.example.com", "platform/manifest", "https", "", false)
+	require.ErrorContains(r.ManifestFromBytes([]byte(manifestXML)), "failed to search")
 }

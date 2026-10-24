@@ -185,23 +185,3 @@ func TestAddNotice(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, m.AddNotice(new(Notice)))
 }
-
-func TestExpandFetch(t *testing.T) {
-	tests := [][]string{
-		{"..", "https://android.googlesource.com/platform/manifest"},
-		{"../aosp", "https://android.googlesource.com/platform/manifest"},
-		{"../../aosp", "https://android.googlesource.com/platform/manifests/release"},
-		{"https://android.googlesource.com/foobar", "https://android.googlesource.com/platform/manifest"},
-	}
-	want := []string{
-		"https://android.googlesource.com/",
-		"https://android.googlesource.com/aosp",
-		"https://android.googlesource.com/aosp",
-		"https://android.googlesource.com/foobar",
-	}
-	for idx, test := range tests {
-		got, err := ExpandFetch(test[0], test[1])
-		require.NoError(t, err)
-		require.Equal(t, want[idx], got)
-	}
-}
