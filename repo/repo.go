@@ -221,16 +221,38 @@ func (r *Repo) ManifestFromBranch(ctx context.Context, branch, manifestProjectNa
 	h := refHash[0].Hash
 	log.Printf("Using the manifest from commit %s for %s", h, branch)
 
-	commit, err := r.git.GetCommit(ctx, h)
+	manifestHash, err := r.manifestFileAt(ctx, h, manifestBranchFile)
 	if err != nil {
-		return fmt.Errorf("cannot load manifest commit %s: %w", h, err)
-	}
-	r.rootHash = entities.Hash(commit.TreeHash)
-	manifestHash, err := bindcas.ResolveToHash(r.store, r.rootHash, manifestBranchFile)
-	if err != nil {
-		return fmt.Errorf("cannot get file %q from %s: %s", manifestBranchFile, h, err)
+		return err
 	}
 	return r.manifestFromBlobHash(ctx, manifestHash)
+}
+
+// PinManifestAt pins a manifest file of a manifest project commit as a mount does,
+// returning the selected projects that do not resolve instead of failing.
+func (r *Repo) PinManifestAt(ctx context.Context, commit entities.Hash, manifestFile string) (*manifest.Manifest, []resolve.Request, error) {
+	manifestHash, err := r.manifestFileAt(ctx, commit, manifestFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	man, err := r.readManifest(ctx, manifestHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.pin(ctx, man)
+}
+
+func (r *Repo) manifestFileAt(ctx context.Context, commitHash entities.Hash, manifestFile string) (entities.Hash, error) {
+	commit, err := r.git.GetCommit(ctx, commitHash)
+	if err != nil {
+		return entities.Hash{}, fmt.Errorf("cannot load manifest commit %s: %w", commitHash, err)
+	}
+	r.rootHash = entities.Hash(commit.TreeHash)
+	manifestHash, err := bindcas.ResolveToHash(r.store, r.rootHash, manifestFile)
+	if err != nil {
+		return entities.Hash{}, fmt.Errorf("cannot get file %q from %s: %w", manifestFile, commitHash, err)
+	}
+	return manifestHash, nil
 }
 
 func (r *Repo) manifestProjectFileBytes(ctx context.Context, name string) ([]byte, error) {
@@ -247,17 +269,21 @@ func localManifestFileBytes(path string) ([]byte, error) {
 }
 
 func (r *Repo) manifestFromBlobHash(ctx context.Context, manifestHash entities.Hash) error {
-	manBytes, err := store.ReadAllBlob(ctx, r.store, manifestHash)
-	if err != nil {
-		return fmt.Errorf("cannot read default.xml (blob=%s): %s", manifestHash, err)
-	}
-
-	manifest, err := manifest.Parse(manBytes)
+	manifest, err := r.readManifest(ctx, manifestHash)
 	if err != nil {
 		return err
 	}
 
 	return r.setManifest(ctx, manifest)
+}
+
+func (r *Repo) readManifest(ctx context.Context, manifestHash entities.Hash) (*manifest.Manifest, error) {
+	manBytes, err := store.ReadAllBlob(ctx, r.store, manifestHash)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read default.xml (blob=%s): %w", manifestHash, err)
+	}
+
+	return manifest.Parse(manBytes)
 }
 
 func (r *Repo) ManifestFromBlobHash(ctx context.Context, manifestHash string) error {
@@ -300,9 +326,26 @@ func (r *Repo) updateRemoteCache(man *manifest.Manifest) error {
 }
 
 func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
-	pinned, err := manifest.CloneManifest(man)
+	pinned, missing, err := r.pin(ctx, man)
 	if err != nil {
 		return err
+	}
+	if len(missing) > 0 {
+		return &resolve.UnresolvedError{Requests: missing}
+	}
+
+	r.manifest = man
+	r.pinned = pinned
+	r.manifestSet = true
+	return nil
+}
+
+// pin returns a copy of the manifest with every resolved project pinned to its commit,
+// and the selected projects that do not resolve.
+func (r *Repo) pin(ctx context.Context, man *manifest.Manifest) (*manifest.Manifest, []resolve.Request, error) {
+	pinned, err := manifest.CloneManifest(man)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	manifestBytes := func(ctx context.Context, name string) ([]byte, error) {
@@ -314,24 +357,24 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 
 	if len(pinned.Include) > 0 {
 		if r.rootHash == entities.ZeroHash {
-			return errors.New("cannot include a file from an unknown manifest project revision. Please mount with `-b` or provide a flat manifest file")
+			return nil, nil, errors.New("cannot include a file from an unknown manifest project revision. Please mount with `-b` or provide a flat manifest file")
 		}
 		if err := pinned.FlattenIncludes(ctx, manifestBytes); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
 	if r.localManifestDir != "" {
 		entries, err := os.ReadDir(r.localManifestDir)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 
 		for _, ent := range entries {
 			if strings.HasSuffix(ent.Name(), ".xml") {
 				path := filepath.Join(r.localManifestDir, ent.Name())
 				if err := pinned.IncludeManifestFile(ctx, path, localManifestBytes); err != nil {
-					return err
+					return nil, nil, err
 				}
 			}
 		}
@@ -340,7 +383,7 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 	// Create fast lookup of remote properties.
 	err = r.updateRemoteCache(pinned)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// Resolve the project values that can be inherited.
@@ -358,7 +401,7 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 	reqs := make([]resolve.Request, len(pinned.Project))
 	for i, p := range pinned.Project {
 		if p.Revision == "" {
-			return fmt.Errorf("revision for %s is not specified", p.Name)
+			return nil, nil, fmt.Errorf("revision for %s is not specified", p.Name)
 		}
 		remSchemeURL := r.remoteCache[p.Remote].fetchSchemeURL
 		if remSchemeURL == "" {
@@ -370,7 +413,7 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 	results, err := resolve.Revisions(r.store, reqs)
 	var unresolved *resolve.UnresolvedError
 	if err != nil && !errors.As(err, &unresolved) {
-		return err
+		return nil, nil, err
 	}
 
 	// A project outside the mount groups is pinned when it resolves and never fails the mount.
@@ -382,14 +425,7 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 			missing = append(missing, reqs[i])
 		}
 	}
-	if len(missing) > 0 {
-		return &resolve.UnresolvedError{Requests: missing}
-	}
-
-	r.manifest = man
-	r.pinned = pinned
-	r.manifestSet = true
-	return nil
+	return pinned, missing, nil
 }
 
 func (r *Repo) applyInheritedProjectValues(def *manifest.Default, project *manifest.Project) {
