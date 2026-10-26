@@ -22,12 +22,17 @@ import (
 
 const DefaultFetchTimeout = 2 * time.Minute
 
+// DefaultServerWaitTimeout covers a server restart. It stays below DefaultFetchTimeout so a
+// read waiting for the server ends with the server's error, not a fetch timeout.
+const DefaultServerWaitTimeout = time.Minute
+
 var defaultConfig = &Config{
 	Class:               "default",
 	ManifestScheme:      "https",
 	FSType:              "kmod",
 	AuthType:            AuthTypeNone,
 	FetchTimeout:        DefaultFetchTimeout,
+	ServerWaitTimeout:   DefaultServerWaitTimeout,
 	ManifestProjectName: "platform/manifest",
 	EnableIndex:         true,
 	EvictThreshold:      uint64(1024 * 1024 * 1024 * 1024), // 1 TB

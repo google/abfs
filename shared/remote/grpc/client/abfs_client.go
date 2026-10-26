@@ -50,6 +50,8 @@ type ABFSClientOpts struct {
 	Servers         []string
 	AuthInfo        instance.AuthInfo
 	SkipHealthCheck bool
+	// ServerWaitTimeout is how long calls wait for an unreachable server before they fail. Zero means no wait.
+	ServerWaitTimeout time.Duration
 }
 
 func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
@@ -60,7 +62,7 @@ func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	cm, err := newConnectionManager(o.Servers, tokenSource, o.AuthInfo.RootCAFile, o.AuthInfo.DisableTLS, o.SkipHealthCheck)
+	cm, err := newConnectionManager(o.Servers, tokenSource, o.AuthInfo.RootCAFile, o.AuthInfo.DisableTLS, o.SkipHealthCheck, o.ServerWaitTimeout)
 	if err != nil {
 		return nil, err
 	}

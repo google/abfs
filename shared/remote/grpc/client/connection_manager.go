@@ -67,10 +67,11 @@ type connectionManager struct {
 	bytesReceived atomic.Int64
 	lastReceived  atomic.Int64
 
-	tokenSource     auth.TokenSource
-	rootCAFile      string
-	disableTLS      bool
-	skipHealthCheck bool
+	tokenSource       auth.TokenSource
+	rootCAFile        string
+	disableTLS        bool
+	skipHealthCheck   bool
+	serverWaitTimeout time.Duration
 }
 
 var _ abfsgrpc.BytesStatHandler = (*connectionManager)(nil)
@@ -85,15 +86,16 @@ func (cm *connectionManager) AddBytesReceived(n int64) {
 	cm.lastReceived.Store(time.Now().UnixNano())
 }
 
-func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCAFile string, disableTLS bool, skipHealthCheck bool) (*connectionManager, error) {
+func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCAFile string, disableTLS bool, skipHealthCheck bool, serverWaitTimeout time.Duration) (*connectionManager, error) {
 	cm := &connectionManager{
-		clients:         make(map[string]remote.RemoteProvider, len(servers)),
-		conns:           make(map[string]*grpc.ClientConn, len(servers)),
-		hasher:          rendezvous.New(),
-		tokenSource:     tokenSource,
-		rootCAFile:      rootCAFile,
-		disableTLS:      disableTLS,
-		skipHealthCheck: skipHealthCheck,
+		clients:           make(map[string]remote.RemoteProvider, len(servers)),
+		conns:             make(map[string]*grpc.ClientConn, len(servers)),
+		hasher:            rendezvous.New(),
+		tokenSource:       tokenSource,
+		rootCAFile:        rootCAFile,
+		disableTLS:        disableTLS,
+		skipHealthCheck:   skipHealthCheck,
+		serverWaitTimeout: serverWaitTimeout,
 	}
 
 	if err := cm.dial(servers); err != nil {
@@ -112,6 +114,7 @@ func (cm *connectionManager) dial(servers []string) error {
 	for index, server := range servers {
 		// dialing in parallel because the connections wait for healthy before returning
 		g.Go(func() error {
+			clock := abfsgrpc.NewOutageClock(cm.serverWaitTimeout)
 			conn, err := abfsgrpc.GrpcDialHealthy(&abfsgrpc.GrpcDialOpts{
 				ServiceName:      pb.ABFS_ServiceDesc.ServiceName,
 				Address:          server,
@@ -123,6 +126,7 @@ func (cm *connectionManager) dial(servers []string) error {
 				RetryPolicy:      retryPolicy,
 				DisableTLS:       cm.disableTLS,
 				SkipHealthCheck:  cm.skipHealthCheck,
+				OutageClock:      clock,
 			})
 			if err != nil {
 				helpText := ""

@@ -25,6 +25,7 @@ import (
 
 func registerConfigFlags(fl *pflag.FlagSet, c *instance.ConfigOptional) {
 	optflags.OptDuration(fl, &c.FetchTimeout, "fetch-timeout", "", "The timeout for fetching remote objects (override config)")
+	optflags.OptDuration(fl, &c.ServerWaitTimeout, "server-wait-timeout", "", "How long calls wait for an unreachable server before they fail, 0 to fail at once (override config)")
 	optflags.OptString(fl, &c.CacheDir, "cache-dir", "c", fmt.Sprintf("The %s cache directory (override config)", flavor.Name))
 	optflags.OptBool(fl, &c.LocalOnly, "local-only", "l", fmt.Sprintf("Run %s locally without remote access (override config)", flavor.Name))
 	optflags.OptVar(fl, &c.AuthType, "auth-type", "", fmt.Sprintf("Auth type [%s] (override config)", instance.AuthTypes()))

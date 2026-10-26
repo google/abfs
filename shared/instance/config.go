@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"gopkg.in/yaml.v3"
@@ -383,6 +385,16 @@ func (c *Config) EffectiveRemoteServers() []string {
 		}
 	}
 	return servers
+}
+
+// EffectiveServerWaitTimeout returns how long calls wait for an unreachable server. It is kept
+// below the fetch timeout, so a read that waits fails with the server's error, not a timeout.
+func (c *Config) EffectiveServerWaitTimeout() time.Duration {
+	if c.FetchTimeout > 0 && c.ServerWaitTimeout >= c.FetchTimeout {
+		log.Printf("Warning: server-wait-timeout %s is not below fetch-timeout %s, using %s", c.ServerWaitTimeout, c.FetchTimeout, c.FetchTimeout/2)
+		return c.FetchTimeout / 2
+	}
+	return c.ServerWaitTimeout
 }
 
 func (c *Config) GetAuthInfo() AuthInfo {

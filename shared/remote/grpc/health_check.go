@@ -132,6 +132,8 @@ type GrpcDialOpts struct {
 	RetryPolicy      string
 	DisableTLS       bool
 	SkipHealthCheck  bool
+	// OutageClock, if set, makes calls to the ABFS service wait for an unreachable server.
+	OutageClock *OutageClock
 }
 
 type tokenSourceCreds struct {
@@ -168,6 +170,9 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	if o.RetryPolicy != "" {
 		opts = append(opts, grpc.WithDefaultServiceConfig(o.RetryPolicy))
 	}
+	if o.OutageClock != nil {
+		opts = append(opts, grpc.WithChainUnaryInterceptor(serverWaitInterceptor(o.ServiceName, o.OutageClock)))
+	}
 
 	var creds credentials.TransportCredentials
 	if o.DisableTLS {
@@ -203,6 +208,9 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(o.Address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial address %s: %v", o.Address, err)
+	}
+	if o.OutageClock != nil {
+		o.OutageClock.conn = conn
 	}
 
 	if !o.SkipHealthCheck {

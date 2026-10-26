@@ -93,12 +93,13 @@ func (c *gitPusherCmd) run(ctx context.Context) error {
 	}
 
 	pusher := gitpusher.NewGitPusher(&gitpusher.NewGitPusherArgs{
-		InstanceName: c.instance,
-		ConfigHP:     hp,
-		GitBin:       c.gitBin,
-		StoragePath:  c.storagePath,
-		Servers:      config.EffectiveRemoteServers(),
-		AuthInfo:     config.GetAuthInfo(),
+		InstanceName:      c.instance,
+		ConfigHP:          hp,
+		GitBin:            c.gitBin,
+		StoragePath:       c.storagePath,
+		Servers:           config.EffectiveRemoteServers(),
+		AuthInfo:          config.GetAuthInfo(),
+		ServerWaitTimeout: config.EffectiveServerWaitTimeout(),
 	})
 
 	return pusher.Run(ctx)

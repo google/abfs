@@ -453,3 +453,24 @@ func TestConfigReadValidation(t *testing.T) {
 	require.NotNil(cfg.FSType)
 	require.Equal(CASFSTypeKmod, *cfg.FSType)
 }
+
+func TestConfig_EffectiveServerWaitTimeout(t *testing.T) {
+	tests := []struct {
+		name         string
+		wait         time.Duration
+		fetchTimeout time.Duration
+		want         time.Duration
+	}{
+		{"default", DefaultServerWaitTimeout, DefaultFetchTimeout, DefaultServerWaitTimeout},
+		{"disabled", 0, DefaultFetchTimeout, 0},
+		{"no fetch timeout", 5 * time.Minute, 0, 5 * time.Minute},
+		{"capped below fetch timeout", 5 * time.Minute, 2 * time.Minute, time.Minute},
+		{"equal to fetch timeout", 2 * time.Minute, 2 * time.Minute, time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{ServerWaitTimeout: tt.wait, FetchTimeout: tt.fetchTimeout}
+			require.Equal(t, tt.want, c.EffectiveServerWaitTimeout())
+		})
+	}
+}

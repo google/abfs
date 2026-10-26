@@ -1057,9 +1057,10 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 	}
 
 	abfsClient, err := client.NewABFSClient(&client.ABFSClientOpts{
-		Servers:         abfsServers,
-		AuthInfo:        config.GetAuthInfo(),
-		SkipHealthCheck: true,
+		Servers:           abfsServers,
+		AuthInfo:          config.GetAuthInfo(),
+		SkipHealthCheck:   true,
+		ServerWaitTimeout: config.EffectiveServerWaitTimeout(),
 	})
 	if err != nil {
 		return err

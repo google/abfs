@@ -521,8 +521,9 @@ func (c *unmountCmd) saveUnmountDetails(ctx context.Context) error {
 
 	servers := conf.EffectiveRemoteServers()
 	cli, err := client.NewABFSClient(&client.ABFSClientOpts{
-		Servers:  servers,
-		AuthInfo: conf.GetAuthInfo(),
+		Servers:           servers,
+		AuthInfo:          conf.GetAuthInfo(),
+		ServerWaitTimeout: conf.EffectiveServerWaitTimeout(),
 	})
 	if err != nil {
 		return fmt.Errorf("error building ABFS client for servers %s: %w", servers, err)

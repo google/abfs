@@ -238,8 +238,9 @@ func newABFSClientProvider(c *CliExec) (*ABFSClientProvider, error) {
 		return nil, errors.New("remote address is required")
 	}
 	client, err := client.NewABFSClient(&client.ABFSClientOpts{
-		Servers:  servers,
-		AuthInfo: config.GetAuthInfo(),
+		Servers:           servers,
+		AuthInfo:          config.GetAuthInfo(),
+		ServerWaitTimeout: config.EffectiveServerWaitTimeout(),
 	})
 	if err != nil {
 		return nil, err

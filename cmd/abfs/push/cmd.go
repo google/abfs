@@ -178,8 +178,9 @@ func (c *pushCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 		var err error
 		client, err = abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
-			Servers:  servers,
-			AuthInfo: c.Config.GetAuthInfo(),
+			Servers:           servers,
+			AuthInfo:          c.Config.GetAuthInfo(),
+			ServerWaitTimeout: c.Config.EffectiveServerWaitTimeout(),
 		})
 		if err != nil {
 			log.Fatalf("Error: unable to start abfsclient: %v", err)
