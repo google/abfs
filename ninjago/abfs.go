@@ -90,6 +90,7 @@ type ABFSBackend struct {
 	hashFetchC      chan HashFetchReq
 	pendingJobs     sync.WaitGroup
 	matchFiles      *matchFiles
+	metadata        *binding.BuildMetadata
 }
 
 func NewABFSBackend() *ABFSBackend {
@@ -1214,6 +1215,14 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 		time.Since(c.startTime), failed, cached, done, hitRate,
 	)
 	c.log.Warnf("%s", msg)
+
+	c.metadata = c.buildMetadata()
+	if c.metadata != nil {
+		c.log.Infof("Build metadata: BUILD_USERNAME=%s BUILD_NUMBER=%s", c.metadata.Username, c.metadata.BuildNumber)
+		if !c.metadata.Pinned {
+			c.log.Warnf("BUILD_NUMBER is not set, so it follows the user name and builds by other users miss part of the cache; set BUILD_USERNAME and BUILD_NUMBER to the same value for every build")
+		}
+	}
 
 	return writeStats(c, err)
 }

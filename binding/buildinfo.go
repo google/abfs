@@ -120,9 +120,18 @@ type NinjaStats struct {
 	CacheHitPercent float64
 
 	NinjaEntryFile string
-	BuildFiles     []string `json:",omitempty"`
+	BuildFiles     []string       `json:",omitempty"`
+	BuildMetadata  *BuildMetadata `json:",omitempty"`
 
 	Error string
+}
+
+// BuildMetadata holds the soong_ui build metadata that is part of cache keys.
+type BuildMetadata struct {
+	Username    string
+	BuildNumber string
+	// Pinned is false when BUILD_NUMBER was not set, so it follows the user name.
+	Pinned bool
 }
 
 var _ Object = (*BuildInfo)(nil)
