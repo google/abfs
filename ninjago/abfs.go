@@ -276,8 +276,32 @@ func (c *ABFSBackend) GraphLoaded(g *graph.Graph) error {
 		return true
 	})
 
+	// Targets holds a build once per output, and GoRange visits shards concurrently, so
+	// rewrite inputs once per node.
+	g.Nodes.GoRange(func(n *graph.Node) bool {
+		c.buildMetadataAsOrderOnly(n.Build)
+		return true
+	})
+
 	c.graph = g
 	return nil
+}
+
+// buildMetadataAsOrderOnly moves declared build metadata inputs to the order-only
+// inputs, so that their content stays out of the request key.
+func (c *ABFSBackend) buildMetadataAsOrderOnly(b *ninja.Build) {
+	if !slices.ContainsFunc(b.ImplicitInputs, c.isBuildMetadata) {
+		return
+	}
+	ins := make([]string, 0, len(b.ImplicitInputs))
+	for _, in := range b.ImplicitInputs {
+		if c.isBuildMetadata(in) {
+			b.OrderOnlyInputs = append(b.OrderOnlyInputs, in)
+		} else {
+			ins = append(ins, in)
+		}
+	}
+	b.ImplicitInputs = ins
 }
 
 func (c *ABFSBackend) addFileGlobs(glob string, g *graph.Graph, n *graph.Node) {

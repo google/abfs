@@ -27,20 +27,22 @@ import (
 )
 
 type matchFiles struct {
-	buildDate        string
-	soongBuildDate   string
-	soongTemp        string
-	soongMetricsAggr string
-	soongBuild       string
+	buildDate          string
+	soongBuildDate     string
+	soongBuildHostname string
+	soongTemp          string
+	soongMetricsAggr   string
+	soongBuild         string
 }
 
 func newMatchFiles(outDir string) *matchFiles {
 	return &matchFiles{
-		buildDate:        path.Join(outDir, "build_date.txt"),
-		soongBuildDate:   path.Join(outDir, "soong/build_date.txt"),
-		soongTemp:        path.Join(outDir, "soong/.temp") + "/",
-		soongMetricsAggr: path.Join(outDir, "soong/metrics_aggregation"),
-		soongBuild:       path.Join(outDir, "soong/build"),
+		buildDate:          path.Join(outDir, "build_date.txt"),
+		soongBuildDate:     path.Join(outDir, "soong/build_date.txt"),
+		soongBuildHostname: path.Join(outDir, "soong/build_hostname.txt"),
+		soongTemp:          path.Join(outDir, "soong/.temp") + "/",
+		soongMetricsAggr:   path.Join(outDir, "soong/metrics_aggregation"),
+		soongBuild:         path.Join(outDir, "soong/build"),
 	}
 }
 
@@ -51,6 +53,9 @@ func (c *ABFSBackend) isBuildMetadata(p string) bool {
 		return true
 	}
 	if strings.HasPrefix(p, c.matchFiles.soongBuildDate) {
+		return true
+	}
+	if strings.HasPrefix(p, c.matchFiles.soongBuildHostname) {
 		return true
 	}
 	return false
