@@ -15,6 +15,7 @@
 package resolve
 
 import (
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -22,6 +23,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/remote/grpc/server"
+	"github.com/google/abfs/shared/remote/servers"
+	"github.com/google/abfs/shared/remote/servers/filebased"
 )
 
 // refTable answers SearchRefs as the stores do: the exact ref, else every ref below it.
@@ -206,4 +213,46 @@ func TestMatchGroups(t *testing.T) {
 			require.Equal(tt.want, MatchGroups(tt.project, tt.filter))
 		})
 	}
+}
+
+// fileBasedStore serves a file-based server over gRPC and returns a client store for it.
+func fileBasedStore(t *testing.T) *remote.RemoteStore {
+	require := require.New(t)
+	fserver, err := filebased.New(t.TempDir(), servers.NoLinkValidationOpt(true))
+	require.NoError(err)
+	s, err := server.NewGRPCServer(&server.GRPCServerOpts{Server: fserver})
+	require.NoError(err)
+	lis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(err)
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			t.Errorf("Failed to serve the ABFS Server: %v", err)
+		}
+	}()
+	c, err := client.NewABFSClient(&client.ABFSClientOpts{Servers: []string{lis.Addr().String()}, AuthInfo: instance.CreateAuthInfo(instance.AuthTypeNone, "", "", true)})
+	require.NoError(err)
+	t.Cleanup(func() {
+		_ = c.Close()
+		s.GracefulStop()
+		_ = fserver.Close()
+	})
+	return remote.NewRemoteStore(c)
+}
+
+func TestRevisions_UnknownHostOverGRPC(t *testing.T) {
+	require := require.New(t)
+	store := fileBasedStore(t)
+	main := entities.NewHash("1111111111111111111111111111111111111111")
+	require.NoError(store.PutRefs("gerrit.example.com", "platform/foo", []entities.RefHash{{Ref: "refs/heads/main", Hash: main}}))
+
+	reqs := []Request{
+		{Project: "platform/foo", FetchURL: "https://gerrit.example.com/platform/foo", Revision: "main"},
+		{Project: "vendor/a", FetchURL: "https://vendor.example.com/vendor/a", Revision: "main"},
+		{Project: "vendor/b", FetchURL: "https://vendor.example.com/vendor/b", Revision: "refs/tags/v1"},
+	}
+	results, err := Revisions(store, reqs)
+	var unresolved *UnresolvedError
+	require.ErrorAs(err, &unresolved)
+	require.Equal(reqs[1:], unresolved.Requests)
+	require.Equal(main, results[0].Hash)
 }
