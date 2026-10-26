@@ -308,7 +308,7 @@ For each missing project it reads the git-pusher config (the same `config:git-pu
 | `not pushed yet` | git-pusher has not pushed this revision yet; the detail gives the last push it reported for the project, which can lag by up to 20 minutes |
 | `last push failed` | the last push of the project failed; the detail has the error |
 | `manifest not in the git-pusher config` | no `repos` entry has this manifest |
-| `branch not in the git-pusher config` | the branch and file are not in the `manifest.files` of that repo, and git-pusher has not pushed the project for another file yet |
+| `branch not in the git-pusher config` | no `manifest.files` entry of that repo has this file and the branch, or a branch pattern that matches it, and git-pusher has not pushed the project for another file yet |
 | `excluded by the git-pusher config` | an override with `exclude: true` matches the project |
 | `invalid fetch-ref-spec in the git-pusher config` | git-pusher rejects the project's `fetch-ref-spec`, so it pushes nothing of that repo |
 | `outside the git-pusher fetch-ref-spec` | the project's `fetch-ref-spec` does not fetch this revision |

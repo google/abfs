@@ -113,6 +113,20 @@ repos:
     files:
     - branch: release
       file: default.xml`, want: reasonBranchNotInPool},
+		{name: "branch pattern lists the branch", config: `
+repos:
+- manifest:
+    url: https://gerrit.example.com/platform/manifest
+    files:
+    - branch: ma*
+      file: default.xml`, want: reasonNotPushed},
+		{name: "branch pattern does not list the branch", config: `
+repos:
+- manifest:
+    url: https://gerrit.example.com/platform/manifest
+    files:
+    - branch: release/*
+      file: default.xml`, want: reasonBranchNotInPool},
 		{name: "excluded", config: poolConfig + `
   overrides:
   - name: platform/a

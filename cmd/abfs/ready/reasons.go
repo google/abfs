@@ -65,9 +65,7 @@ func explain(ctx context.Context, store entities.CASStore, o opts, r *report) {
 		}
 	}
 	// The pusher finds the projects of a manifest through every branch and file configured for it.
-	branchInPool := repo != nil && slices.ContainsFunc(repo.Manifest.Files, func(f gitpusher.ManifestFile) bool {
-		return f.Branch == o.branch && f.File == o.branchFile
-	})
+	branchInPool := repo != nil && repo.ListsManifestFile(o.branch, o.branchFile)
 	// With one repo only its config can push a project; with more, the pusher keeps the first one it registers.
 	sole := len(pool.Repos) == 1
 
