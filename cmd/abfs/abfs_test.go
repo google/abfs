@@ -177,6 +177,28 @@ func (p *serverProcess) requireRefusesConnections(t *testing.T) {
 	t.Fatal("server still accepts connections 10s after the signal")
 }
 
+// waitForOutput waits until the server prints text, and fails if the server
+// exits first.
+func (p *serverProcess) waitForOutput(t *testing.T, text string) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p.mu.Lock()
+		found := strings.Contains(p.out.String(), text)
+		p.mu.Unlock()
+		if found {
+			return
+		}
+		select {
+		case <-p.done:
+			t.Fatalf("server exited before printing %q: %v", text, p.waitErr)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not print %q within 10s", text)
+		}
+	}
+}
+
 // pendingPut is a PutObject stream that has sent the first half of an object.
 type pendingPut struct {
 	stream pb.ABFS_PutObjectClient
@@ -277,4 +299,41 @@ func TestServer_ShutdownTimeoutClosesPendingRPC(t *testing.T) {
 	require.NoError(p.wait(t, 15*time.Second), "error from the server process")
 	require.Equal(codes.Unavailable, status.Code(put.finish()))
 	require.Empty(tempFiles(t, dir), "temporary files left in the object store")
+}
+
+func TestServer_SecondSignal(t *testing.T) {
+	tests := []struct {
+		name       string
+		first      os.Signal
+		second     os.Signal
+		wantForced bool
+	}{
+		{name: "SIGTERM after SIGINT keeps draining", first: os.Interrupt, second: syscall.SIGTERM},
+		{name: "SIGTERM after SIGTERM keeps draining", first: syscall.SIGTERM, second: syscall.SIGTERM},
+		{name: "SIGINT after SIGTERM exits at once", first: syscall.SIGTERM, second: os.Interrupt, wantForced: true},
+		{name: "SIGINT after SIGINT exits at once", first: os.Interrupt, second: os.Interrupt, wantForced: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			dir := t.TempDir()
+			p := startServer(t, dir)
+			put := startPut(t, p.addr)
+
+			require.NoError(p.cmd.Process.Signal(tt.first))
+			p.requireRefusesConnections(t)
+			require.NoError(p.cmd.Process.Signal(tt.second))
+
+			if tt.wantForced {
+				var exitErr *exec.ExitError
+				require.ErrorAs(p.wait(t, 15*time.Second), &exitErr)
+				require.Equal(1, exitErr.ExitCode())
+				return
+			}
+			p.waitForOutput(t, "Received another shutdown signal (SIGTERM)")
+			require.NoError(put.finish(), "error from the pending PutObject")
+			require.NoError(p.wait(t, 15*time.Second), "error from the server process")
+			requireObjectStored(t, dir, put.key)
+		})
+	}
 }

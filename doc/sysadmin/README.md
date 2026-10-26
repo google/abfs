@@ -114,7 +114,7 @@ abfs server --port 50051 --shutdown-timeout 60s file-based --local-dir "$SERVER_
 ```
 
 * The signal must reach the `abfs` process. If a wrapper script starts the server, start it with `exec` so that the server replaces the script.
-* A second signal makes the server exit at once, without waiting for in-flight requests.
+* A repeated `SIGTERM` is ignored while the server shuts down. A `SIGINT` after the first signal makes it exit at once, without waiting for in-flight requests. Every command of the `abfs` binary (including cacheman and git-pusher) handles signals this way.
 * With `--ares-enabled`, proxied ARES requests can run much longer than the default timeout; set `--shutdown-timeout` to match.
 
 ### Configuration
