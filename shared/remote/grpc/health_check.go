@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/mod/semver"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -170,6 +171,17 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	if o.RetryPolicy != "" {
 		opts = append(opts, grpc.WithDefaultServiceConfig(o.RetryPolicy))
 	}
+	// gRPC's default reconnect backoff grows to 120 s, so after a long outage a client could
+	// keep failing calls for minutes after the server is back.
+	opts = append(opts, grpc.WithConnectParams(grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay:  time.Second,
+			Multiplier: 1.6,
+			Jitter:     0.2,
+			MaxDelay:   5 * time.Second,
+		},
+		MinConnectTimeout: 20 * time.Second,
+	}))
 	if o.OutageClock != nil {
 		opts = append(opts, grpc.WithChainUnaryInterceptor(serverWaitInterceptor(o.ServiceName, o.OutageClock)))
 	}
