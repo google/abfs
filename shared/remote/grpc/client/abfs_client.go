@@ -74,6 +74,12 @@ func NewABFSClient(o *ABFSClientOpts) (*ABFSClient, error) {
 	return c, nil
 }
 
+// WaitingForServer reports whether calls are waiting for the server that Version asks, within the
+// server wait timeout.
+func (c *ABFSClient) WaitingForServer() bool {
+	return c.cm.waitingForRefsServer()
+}
+
 // Close closes the server connections. It is safe to call more than once.
 func (c *ABFSClient) Close() error {
 	var err error

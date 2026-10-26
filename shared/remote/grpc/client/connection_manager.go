@@ -41,7 +41,8 @@ The server may have TLS handshaking enabled. Please do the following:
 2. If the server uses a private CA, place its root CA certificate (PEM) at <instance dir>/abfs_root_ca.crt
 `
 
-// retryPolicy allows gRPC to transparently retry on transient errors
+// retryPolicy allows gRPC to transparently retry on transient errors.
+// GetVersion is not retried: health checks call it and must report an outage at once.
 const retryPolicy = `{
   "methodConfig": [{
     "name": [{}],
@@ -52,6 +53,8 @@ const retryPolicy = `{
       "backoffMultiplier": 2,
       "retryableStatusCodes": ["UNAVAILABLE", "UNKNOWN"]
     }
+  }, {
+    "name": [{"service": "abfs.ABFS", "method": "GetVersion"}]
   }]
 }`
 
@@ -59,6 +62,7 @@ const retryPolicy = `{
 type connectionManager struct {
 	clients map[string]remote.RemoteProvider
 	conns   map[string]*grpc.ClientConn
+	clocks  map[string]*abfsgrpc.OutageClock
 
 	hasher *rendezvous.Hasher
 
@@ -90,6 +94,7 @@ func newConnectionManager(servers []string, tokenSource auth.TokenSource, rootCA
 	cm := &connectionManager{
 		clients:           make(map[string]remote.RemoteProvider, len(servers)),
 		conns:             make(map[string]*grpc.ClientConn, len(servers)),
+		clocks:            make(map[string]*abfsgrpc.OutageClock, len(servers)),
 		hasher:            rendezvous.New(),
 		tokenSource:       tokenSource,
 		rootCAFile:        rootCAFile,
@@ -142,6 +147,7 @@ func (cm *connectionManager) dial(servers []string) error {
 			mu.Lock()
 			cm.clients[s] = provider
 			cm.conns[s] = conn
+			cm.clocks[s] = clock
 			cm.hasher.Add(s)
 			mu.Unlock()
 			return nil
@@ -161,6 +167,11 @@ func (cm *connectionManager) get(h Hash) remote.RemoteProvider {
 	// https://git-scm.com/book/en/v2/Git-Tools-Revision-Selection#_short_sha_1
 	// in the future we might add support for abbreviated hash retrieval
 	return cm.clients[cm.hasher.Get(hashStr(h))]
+}
+
+// waitingForRefsServer reports whether calls are waiting for the refs server, the one Version asks.
+func (cm *connectionManager) waitingForRefsServer() bool {
+	return cm.clocks[cm.hasher.Get(hashStr(entities.ZeroHash))].Waiting()
 }
 
 func (cm *connectionManager) close() error {

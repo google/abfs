@@ -63,6 +63,7 @@ import (
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/rbe"
 	"github.com/google/abfs/shared/remote"
+	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/client"
 	"github.com/google/abfs/shared/store/localcache"
 	"github.com/google/abfs/shared/version"
@@ -97,6 +98,9 @@ const (
 	maintenanceDelay        = 3 * time.Hour
 	localGCThreshold        = -1 * time.Hour
 	remoteHealthCheckPeriod = 10 * time.Second
+	// remoteHealthRetryPeriod is the check period while the server does not answer, so a server
+	// that came back is noticed within seconds.
+	remoteHealthRetryPeriod = 2 * time.Second
 	HealthBypassFileName    = "health_bypass"
 	StatusDirName           = "status"
 	RemoteErrFileName       = "remote.err"
@@ -174,6 +178,8 @@ type CacheMan struct {
 	newARES              NewARESFunc
 	checkCredsFn         CheckCredsFunc
 	healthStatusCode     atomic.Int32
+	remoteFailing        atomic.Bool
+	waitingForServer     atomic.Bool
 	healthCheckGroup     singleflight.Group
 	initDeeptreeGroup    singleflight.Group // see (*CacheMan).resolveDeeptree
 	healthCheckTrigger   chan struct{}
@@ -1984,12 +1990,24 @@ func (c *CacheMan) remoteHealthWorker(ctx context.Context) {
 				}
 			}
 			_ = c.checkRemoteHealth(ctx)
-			timer.Reset(remoteHealthCheckPeriod)
+			timer.Reset(c.remoteHealthPeriod())
 		case <-timer.C:
 			_ = c.checkRemoteHealth(ctx)
-			timer.Reset(remoteHealthCheckPeriod)
+			timer.Reset(c.remoteHealthPeriod())
 		}
 	}
+}
+
+func (c *CacheMan) remoteHealthPeriod() time.Duration {
+	if c.remoteFailing.Load() {
+		return remoteHealthRetryPeriod
+	}
+	return remoteHealthCheckPeriod
+}
+
+// serverWaiter is implemented by remote clients whose calls wait for an unreachable server.
+type serverWaiter interface {
+	WaitingForServer() bool
 }
 
 func (c *CacheMan) triggerHealthCheck() {
@@ -2038,6 +2056,7 @@ func (c *CacheMan) doCheckRemoteHealth() error {
 	}
 
 	if _, err := os.Stat(bypassFile); err == nil || c.config.LocalOnly {
+		c.remoteFailing.Store(false)
 		c.setHealthStatusCode(0, "")
 		removeErrFiles()
 		return nil
@@ -2058,13 +2077,15 @@ func (c *CacheMan) doCheckRemoteHealth() error {
 	}
 
 	var errs error
+	versionFailed := false
 	if c.abfsClient == nil {
 		errs = multierr.Append(errs, errors.New("remote client not initialized"))
 	} else if _, ok := c.abfsClient.(*localOnlyClient); ok {
 		errs = multierr.Append(errs, errors.New("remote client not initialized (running with local-only fallback)"))
 	} else {
-		if _, err := c.abfsClient.Version(checkCtx); err != nil {
+		if _, err := c.abfsClient.Version(abfsgrpc.WithoutServerWait(checkCtx)); err != nil {
 			errs = multierr.Append(errs, err)
+			versionFailed = true
 		}
 	}
 
@@ -2082,10 +2103,13 @@ func (c *CacheMan) doCheckRemoteHealth() error {
 	}
 
 	if errs == nil {
+		c.remoteFailing.Store(false)
+		c.waitingForServer.Store(false)
 		c.setHealthStatusCode(0, "")
 		removeErrFiles()
 		return nil
 	}
+	c.remoteFailing.Store(versionFailed)
 
 	if err := os.MkdirAll(statusDir, 0755); err != nil {
 		c.printer.Printf("failed to create status dir %s: %v\n", statusDir, err)
@@ -2111,7 +2135,17 @@ func (c *CacheMan) doCheckRemoteHealth() error {
 		}
 		return multierr.Append(errs, credsErr)
 	} else {
-		c.setHealthStatusCode(int32(syscall.ENOTCONN), errs.Error())
+		// Calls wait for the server for a while, and reads in the mount with them. Keep the mount
+		// usable for that time; reporting the outage would make casfs refuse writes at once.
+		if w, ok := c.abfsClient.(serverWaiter); ok && w.WaitingForServer() {
+			if !c.waitingForServer.Swap(true) {
+				c.printer.Printf("Remote unreachable, waiting for it before reporting: %v\n", errs)
+			}
+			c.setHealthStatusCode(0, "")
+		} else {
+			c.waitingForServer.Store(false)
+			c.setHealthStatusCode(int32(syscall.ENOTCONN), errs.Error())
+		}
 		_ = os.Remove(credsErrFile)
 		_ = os.Remove(credsErrTmpFile)
 		return errs
