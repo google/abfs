@@ -120,6 +120,42 @@ warning: ninja: Evaluation took 1m25.840705899s, fail: 0, cache: hits: 192249, m
 ...
 ```
 
+#### Build metadata
+
+Android builds put `BUILD_USERNAME` and `BUILD_NUMBER` into `build.prop`, into the Kati
+cache key and into binaries that carry a version symbol. Builds share these cache entries only
+when both values are the same. `abfs setup` writes `vendor/abfs/vendorsetup.sh`, which
+`source build/envsetup.sh` reads and which sets them (and `BUILD_HOSTNAME` and
+`BUILD_DATETIME`) to fixed values unless they are already set. The values do not apply when:
+
+* the build does not run `source build/envsetup.sh` first, for example a script that calls
+  `build/soong/soong_ui.bash` directly;
+* the tree has an `allowed-vendorsetup_sh-files` file that does not list
+  `vendor/abfs/vendorsetup.sh`;
+* the environment already sets them, for example a CI system that sets `BUILD_NUMBER` for
+  every job.
+
+In those cases, set `BUILD_USERNAME` and `BUILD_NUMBER` yourself to values that stay the same
+across builds. At the end of the build, ninjago prints the values it saw and warns when
+`BUILD_NUMBER` was not set, because soong_ui then derives it from the user name:
+
+```
+# example `m` output
+...
+ninja: Build metadata: BUILD_USERNAME=abfs-builder BUILD_NUMBER=eng
+...
+```
+
+The build date and host name do not affect cache hits, so a cached `build.prop` keeps the
+date and host of the build that produced it.
+
+In containers, the container runtime sets `HOSTNAME`, and CI systems add variables for every
+job. soong_ui writes the whole environment to a file that Soong analysis reads, so with
+ninjago that step misses the cache whenever any variable differs.
+`ignore-soong-env-avail: true` in the client config keeps that step cached. Soong then does not
+notice when a variable that it reads changes, so leave the setting off when your builds change
+such variables between runs.
+
 ### Sync
 
 `repo` and `git` are expected to work normally. Try syncing:
