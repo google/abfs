@@ -20,11 +20,13 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/google/abfs/binding"
 )
@@ -127,6 +129,76 @@ func (f *FetchConfig) Override(g *FetchConfig) {
 	if g.PackingStrategy != "" {
 		f.PackingStrategy = g.PackingStrategy
 	}
+}
+
+// ValidateRefSpecs checks the fetch ref specs as git would read them.
+func (f *FetchConfig) ValidateRefSpecs() error {
+	for _, spec := range f.FetchRefSpecs {
+		if strings.HasPrefix(spec, "^") {
+			if strings.Contains(spec, ":") {
+				return fmt.Errorf("negative-ref-spec %q must not contain a : character", spec)
+			}
+		} else {
+			newSpec := config.RefSpec(spec)
+			if err := newSpec.Validate(); err != nil {
+				return fmt.Errorf("fetch-ref-spec %q is invalid: %w", spec, err)
+			}
+		}
+	}
+	return nil
+}
+
+// StoresRef reports whether these ref specs map a remote ref to the local name ref, the name the pusher
+// pushes it under. Tags that git fetches because they point into fetched history are not covered.
+func (f *FetchConfig) StoresRef(ref string) bool {
+	specs := f.FetchRefSpecs
+	if len(specs) == 0 {
+		specs = defaultRefSpecs
+	}
+	var negative []config.RefSpec
+	for _, spec := range specs {
+		if pattern, ok := strings.CutPrefix(spec, "^"); ok {
+			negative = append(negative, config.RefSpec(pattern+":"+pattern))
+		}
+	}
+	for _, spec := range specs {
+		if strings.HasPrefix(spec, "^") || !strings.Contains(spec, ":") || config.RefSpec(spec).Validate() != nil {
+			continue
+		}
+		spec = strings.TrimPrefix(spec, "+")
+		reversed := config.RefSpec(spec).Reverse()
+		if !reversed.Match(plumbing.ReferenceName(ref)) {
+			continue
+		}
+		src := reversed.Dst(plumbing.ReferenceName(ref))
+		if !slices.ContainsFunc(negative, func(n config.RefSpec) bool { return n.Match(src) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProjectFetchConfig returns the fetch config of a manifest project and whether an override excludes it.
+func (c *RepoConfig) ProjectFetchConfig(name string) (FetchConfig, bool) {
+	fetchConfig := c.ProjectDefaults
+	excluded := false
+	for _, override := range c.Overrides {
+		matches := false
+		if override.Regex {
+			if override.RegexPattern.MatchString(name) {
+				matches = true
+			}
+		} else if override.Name == name {
+			matches = true
+		}
+		if matches {
+			if override.Exclude {
+				excluded = true
+			}
+			fetchConfig.Override(&override.FetchConfig)
+		}
+	}
+	return fetchConfig, excluded
 }
 
 func (c *GitPusherPoolConfig) Instance(name string) (*GitPusherConfig, error) {
@@ -324,17 +396,8 @@ func (c *ProjectConfig) Validate() error {
 		c.FetchRefSpecs = defaultRefSpecs
 	}
 
-	for _, spec := range c.FetchRefSpecs {
-		if strings.HasPrefix(spec, "^") {
-			if strings.Contains(spec, ":") {
-				return fmt.Errorf("negative-ref-spec %q must not contain a : character", spec)
-			}
-		} else {
-			newSpec := config.RefSpec(spec)
-			if err := newSpec.Validate(); err != nil {
-				return fmt.Errorf("fetch-ref-spec %q is invalid: %w", spec, err)
-			}
-		}
+	if err := c.ValidateRefSpecs(); err != nil {
+		return err
 	}
 
 	if c.PackingStrategy == "" {

@@ -257,3 +257,67 @@ pushers:
 		})
 	}
 }
+
+func TestFetchConfigStoresRef(t *testing.T) {
+	tests := []struct {
+		name  string
+		specs []string
+		ref   string
+		want  bool
+	}{
+		{"default branch", nil, "refs/heads/main", true},
+		{"default tag", nil, "refs/tags/v1", true},
+		{"exact", []string{"+refs/heads/main:refs/heads/main"}, "refs/heads/main", true},
+		{"exact other branch", []string{"+refs/heads/main:refs/heads/main"}, "refs/heads/dev", false},
+		{"exact does not map tags", []string{"+refs/heads/main:refs/heads/main"}, "refs/tags/v1", false},
+		{"invalid spec", []string{"+refs/heads/*:refs/heads/main"}, "refs/heads/main", false},
+		{"glob", []string{"+refs/heads/*:refs/heads/*"}, "refs/heads/android15-release", true},
+		{"negative", []string{"+refs/heads/*:refs/heads/*", "^refs/heads/wip/*"}, "refs/heads/wip/x", false},
+		{"negative other branch", []string{"+refs/heads/*:refs/heads/*", "^refs/heads/wip/*"}, "refs/heads/main", true},
+		{"renamed source", []string{"+refs/heads/*:refs/remotes/origin/*"}, "refs/heads/main", false},
+		{"renamed destination", []string{"+refs/heads/*:refs/remotes/origin/*"}, "refs/remotes/origin/main", true},
+		{"no destination", []string{"refs/heads/main"}, "refs/heads/main", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := FetchConfig{FetchRefSpecs: tt.specs}
+			require.Equal(t, tt.want, f.StoresRef(tt.ref))
+		})
+	}
+}
+
+func TestRepoConfigProjectFetchConfig(t *testing.T) {
+	rawConfig := `
+manifest:
+  url: https://android.googlesource.com/platform/manifest
+project-defaults:
+  fetch-ref-spec: ["+refs/heads/main:refs/heads/main"]
+overrides:
+- name: platform/prebuilts/.*
+  regex: true
+  exclude: true
+- name: platform/build
+  fetch-ref-spec: ["+refs/heads/*:refs/heads/*"]`
+
+	var c RepoConfig
+	require.NoError(t, yaml.Unmarshal([]byte(rawConfig), &c))
+	require.NoError(t, c.Validate())
+
+	f, excluded := c.ProjectFetchConfig("platform/frameworks/base")
+	require.False(t, excluded)
+	require.Equal(t, []string{"+refs/heads/main:refs/heads/main"}, f.FetchRefSpecs)
+
+	_, excluded = c.ProjectFetchConfig("platform/prebuilts/clang")
+	require.True(t, excluded)
+
+	f, excluded = c.ProjectFetchConfig("platform/build")
+	require.False(t, excluded)
+	require.True(t, f.StoresRef("refs/heads/android15-release"))
+}
+
+func TestFetchConfigValidateRefSpecs(t *testing.T) {
+	require.NoError(t, (&FetchConfig{FetchRefSpecs: []string{"+refs/heads/*:refs/heads/*", "^refs/heads/wip/*"}}).ValidateRefSpecs())
+	require.Error(t, (&FetchConfig{FetchRefSpecs: []string{"+refs/heads/*:refs/heads/main"}}).ValidateRefSpecs())
+	require.Error(t, (&FetchConfig{FetchRefSpecs: []string{"^refs/heads/wip:refs/heads/wip"}}).ValidateRefSpecs())
+}

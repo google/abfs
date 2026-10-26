@@ -301,6 +301,20 @@ abfs ready -b android-latest-release
 
 It exits 0 when every project resolves, 1 when something is still missing and 2 on other errors. Add `--wait` to check again every 30 seconds until the branch is ready or `--timeout` (one hour by default) runs out, and `--json` for a report that scripts can read.
 
+For each missing project it reads the git-pusher config (the same `config:git-pusher/default` hash-path as git-pusher, or `--pusher-config`) and the project's push status, and gives the cause:
+
+| Cause | Meaning |
+|---|---|
+| `not pushed yet` | git-pusher has not pushed this revision yet; the detail gives the last push it reported for the project, which can lag by up to 20 minutes |
+| `last push failed` | the last push of the project failed; the detail has the error |
+| `manifest not in the git-pusher config` | no `repos` entry has this manifest |
+| `branch not in the git-pusher config` | the branch and file are not in the `manifest.files` of that repo, and git-pusher has not pushed the project for another file yet |
+| `excluded by the git-pusher config` | an override with `exclude: true` matches the project |
+| `invalid fetch-ref-spec in the git-pusher config` | git-pusher rejects the project's `fetch-ref-spec`, so it pushes nothing of that repo |
+| `outside the git-pusher fetch-ref-spec` | the project's `fetch-ref-spec` does not fetch this revision |
+
+The config causes only go away when the config changes. When nothing else in the config could still push the revision, the report marks the cause as blocked (`"blocked": true` in `--json`) and `--wait` stops at once. That is not the case when the config has more than one repo or a `projects` entry for the project, when the branch is not in `manifest.files` (another file may list the project), or for a revision that could be a tag (git also fetches tags that point into fetched branches).
+
 Once it reports ready, mount the branch:
 
 ```sh
@@ -329,7 +343,6 @@ Some things to know:
 - `abfs ready` writes `pinned.xml` only when the branch is ready, and removes it when not, so a later step cannot mount an old file.
 - Pass the same `-b` and `-g` to both commands, and do not pass `--local-manifest-dir` with a pinned file.
 - If the branch uses a manifest file other than `default.xml`, pass it to `abfs ready` with `--branch-file` and mount the pinned file.
-- A project that the git-pusher config excludes, or whose revision is outside its `fetch-ref-spec`, is never pushed, so the branch stays not ready until the config changes.
 - A ref can resolve before git-pusher has written its deep tree helper objects. The mount then builds them itself, which is slower.
 
 `abfs ready` can report a branch as not ready while a mount would still work in a few cases:

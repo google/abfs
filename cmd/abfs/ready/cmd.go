@@ -34,6 +34,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/hashpath"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/grpc/client"
@@ -51,14 +52,15 @@ const (
 type readyCmd struct {
 	*root.RootCmd
 	*cmd.ConfigProvider
-	branch     string
-	branchFile string
-	groups     []string
-	output     string
-	jsonOut    bool
-	wait       bool
-	timeout    time.Duration
-	interval   time.Duration
+	branch               string
+	branchFile           string
+	groups               []string
+	output               string
+	pusherConfigHashPath string
+	jsonOut              bool
+	wait                 bool
+	timeout              time.Duration
+	interval             time.Duration
 }
 
 // report is the readiness of one manifest file on one manifest branch.
@@ -68,9 +70,12 @@ type report struct {
 	ManifestRef    string       `json:"manifest_ref,omitempty"`
 	ManifestCommit string       `json:"manifest_commit,omitempty"`
 	Ready          bool         `json:"ready"`
+	Blocked        bool         `json:"blocked"`
 	Total          int          `json:"total"`
 	Resolved       int          `json:"resolved"`
 	Unresolved     []unresolved `json:"unresolved"`
+
+	PusherConfigError string `json:"pusher_config_error,omitempty"`
 
 	pinned *manifest.Manifest
 }
@@ -83,6 +88,8 @@ type unresolved struct {
 	Groups   []string `json:"groups,omitempty"`
 	URL      string   `json:"url,omitempty"`
 	Reason   string   `json:"reason"`
+	Detail   string   `json:"detail,omitempty"`
+	Blocked  bool     `json:"blocked,omitempty"`
 }
 
 type opts struct {
@@ -92,6 +99,7 @@ type opts struct {
 	branch              string
 	branchFile          string
 	groups              []string
+	pusherConfig        *hashpath.HashPath
 }
 
 func NewCmd(rootCmd *root.RootCmd) *readyCmd {
@@ -101,9 +109,11 @@ func NewCmd(rootCmd *root.RootCmd) *readyCmd {
 func (c *readyCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:    "ready",
-		Usage:   "-b <branch> [--branch-file <file>] [-g <groups>] [-o <pinned.xml>] [--json] [--wait [--timeout <d>] [--interval <d>]]",
+		Usage:   "-b <branch> [--branch-file <file>] [-g <groups>] [-o <pinned.xml>] [--pusher-config <hash-path>] [--json] [--wait [--timeout <d>] [--interval <d>]]",
 		Aliases: []string{},
 		Desc: `Report whether every project of a manifest branch is on the server, so a mount of it resolves.
+Each missing project gets a cause from the git-pusher config and push status (see --pusher-config);
+--wait stops early when only a config change can make the branch ready.
 Exits 0 when ready, 1 when not (also when --timeout runs out), 2 on other errors, including an interrupt.
 With -o, writes the pinned manifest when ready and removes the file when not. Mount it with the same
 -b and -g: "abfs mount -b <branch> -g <groups> -f <pinned.xml>", with or without --ws, and without --local-manifest-dir.`,
@@ -115,6 +125,7 @@ func (c *readyCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVarP(&c.branchFile, "branch-file", "", "default.xml", "Manifest file to use from the manifest branch")
 	fl.StringSliceVarP(&c.groups, "groups", "g", nil, "Groups to filter. Same as repo init -g")
 	fl.StringVarP(&c.output, "output", "o", "", "Write the pinned manifest to this file when ready")
+	fl.StringVar(&c.pusherConfigHashPath, "pusher-config", "config:git-pusher/default", "The hash-path of the git-pusher config, used to explain missing projects")
 	fl.BoolVar(&c.jsonOut, "json", false, "Output the report as JSON")
 	fl.BoolVar(&c.wait, "wait", false, "Check again until ready or the timeout")
 	fl.DurationVar(&c.timeout, "timeout", time.Hour, "How long to check, across all rounds with --wait, before reporting not ready")
@@ -137,6 +148,10 @@ func (c *readyCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	if len(servers) == 0 {
 		return clierr.CLIErrWithExitCode(2, "remote address is required")
 	}
+	pusherConfig, err := hashpath.Parse(c.pusherConfigHashPath)
+	if err != nil {
+		return clierr.CLIErrWithExitCode(2, "invalid --pusher-config: %v", err)
+	}
 
 	o := opts{
 		manifestServer:      c.Config.ManifestServer,
@@ -145,6 +160,7 @@ func (c *readyCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		branch:              c.branch,
 		branchFile:          c.branchFile,
 		groups:              c.groups,
+		pusherConfig:        pusherConfig,
 	}
 
 	// The client connects inside the check, so --wait retries an unreachable server.
@@ -154,7 +170,7 @@ func (c *readyCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			_ = server.Close()
 		}
 	}()
-	err := c.run(ctx, func(ctx context.Context) (*report, error) {
+	err = c.run(ctx, func(ctx context.Context) (*report, error) {
 		if server == nil {
 			cli, err := client.NewABFSClient(&client.ABFSClientOpts{
 				Servers:  servers,
@@ -180,16 +196,21 @@ func (c *readyCmd) run(ctx context.Context, check func(context.Context) (*report
 	var r *report
 	var err error
 	timedOut := false
+	var configWarning string
 	deadline := time.Now().Add(c.timeout)
 	for {
 		checkCtx, cancel := context.WithDeadline(ctx, deadline)
 		r, err = check(checkCtx)
 		timedOut = err != nil && checkCtx.Err() != nil
 		cancel()
+		if err == nil && r.PusherConfigError != "" && r.PusherConfigError != configWarning {
+			configWarning = r.PusherConfigError
+			log.Printf("Warning: missing projects show no cause: %s", configWarning)
+		}
 		if ctx.Err() != nil {
 			return clierr.CLIErrWithExitCode(2, "%v", ctx.Err())
 		}
-		if !c.wait || timedOut || (err == nil && r.Ready) || !time.Now().Before(deadline) {
+		if !c.wait || timedOut || (err == nil && (r.Ready || r.Blocked)) || !time.Now().Before(deadline) {
 			break
 		}
 		if err != nil {
@@ -259,10 +280,15 @@ func (c *readyCmd) print(r *report) error {
 		if u.URL != "" {
 			line += " at " + u.URL
 		}
+		if u.Detail != "" {
+			line += " (" + u.Detail + ")"
+		}
 		fmt.Println(line)
 	}
 	state := "Ready"
-	if !r.Ready {
+	if r.Blocked {
+		state = "Not ready until the git-pusher config changes"
+	} else if !r.Ready {
 		state = "Not ready"
 	}
 	fmt.Printf("%s: %d of %d projects resolve\n", state, r.Resolved, r.Total)
@@ -346,6 +372,7 @@ func check(ctx context.Context, server remote.RemoteCloser, o opts) (*report, er
 			URL:      instance.MaybeAddScheme(manifestServer, o.manifestScheme) + "/" + o.manifestProjectName,
 			Reason:   reason,
 		})
+		explain(ctx, store, o, r)
 		return r, nil
 	}
 	commit := hashes[0]
@@ -405,5 +432,8 @@ func check(ctx context.Context, server remote.RemoteCloser, o opts) (*report, er
 		r.Unresolved = append(r.Unresolved, unresolved{Groups: o.groups, Reason: reasonNoProjects})
 	}
 	r.Ready = len(r.Unresolved) == 0
+	if !r.Ready {
+		explain(ctx, store, o, r)
+	}
 	return r, nil
 }
