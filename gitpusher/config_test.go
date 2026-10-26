@@ -321,3 +321,44 @@ func TestFetchConfigValidateRefSpecs(t *testing.T) {
 	require.Error(t, (&FetchConfig{FetchRefSpecs: []string{"+refs/heads/*:refs/heads/main"}}).ValidateRefSpecs())
 	require.Error(t, (&FetchConfig{FetchRefSpecs: []string{"^refs/heads/wip:refs/heads/wip"}}).ValidateRefSpecs())
 }
+
+func TestRepoConfigManifestFiles(t *testing.T) {
+	rawConfig := `
+manifest:
+  url: https://android.googlesource.com/platform/manifest
+  files:
+  - file: default.xml
+  - branch: release/*
+  - branch: release/*
+    file: other.xml`
+
+	var c RepoConfig
+	require.NoError(t, yaml.Unmarshal([]byte(rawConfig), &c))
+	require.NoError(t, c.Validate())
+	require.Equal(t, []ManifestFile{
+		{Branch: "main", File: "default.xml"},
+		{Branch: "release/*", File: "manifest.xml"},
+		{Branch: "release/*", File: "other.xml"},
+	}, c.Manifest.Files)
+
+	require.True(t, c.ListsManifestFile("main", "default.xml"))
+	require.True(t, c.ListsManifestFile("release/b/1", "other.xml"))
+	require.False(t, c.ListsManifestFile("release", "manifest.xml"))
+	require.False(t, c.ListsManifestFile("main", "other.xml"))
+
+	lts := ManifestFile{Branch: "rel-*-lts"}
+	require.True(t, lts.MatchesBranch("rel-15-lts"))
+	require.False(t, lts.MatchesBranch("rel-15"))
+}
+
+func TestRepoConfigManifestFilesInvalid(t *testing.T) {
+	for _, branch := range []string{"release/*/x/*", "**", "a:b"} {
+		t.Run(branch, func(t *testing.T) {
+			c := RepoConfig{Manifest: ManifestConfig{
+				URL:   "https://android.googlesource.com/platform/manifest",
+				Files: []ManifestFile{{Branch: branch, File: "default.xml"}},
+			}}
+			require.Error(t, c.Validate())
+		})
+	}
+}

@@ -73,9 +73,24 @@ type GitPusherConfig struct {
 	MaxMemoryUsage   float64 `yaml:"max-memory-usage"`
 }
 type ManifestFile struct {
+	// Branch is a branch name, or a pattern with one "*" as in a git refspec.
 	Branch string `yaml:"branch"`
 	File   string `yaml:"file"`
 }
+
+func (f ManifestFile) fetchRefSpec(remote string) config.RefSpec {
+	return config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", f.Branch, remote, f.Branch))
+}
+
+func (f ManifestFile) isPattern() bool {
+	return strings.Contains(f.Branch, "*")
+}
+
+// MatchesBranch reports whether branch is the branch of f, or matches it as a pattern.
+func (f ManifestFile) MatchesBranch(branch string) bool {
+	return f.fetchRefSpec(defaultRemoteName).Match(plumbing.ReferenceName("refs/heads/" + branch))
+}
+
 type ManifestConfig struct {
 	URL           string         `yaml:"url"`
 	Server        string         `yaml:"server"`
@@ -313,9 +328,16 @@ func (c *RepoConfig) Validate() error {
 		c.Manifest.Files = []ManifestFile{{File: defaultManifestFile, Branch: defaultManifestBranch}}
 	}
 
-	for _, f := range c.Manifest.Files {
+	for i := range c.Manifest.Files {
+		f := &c.Manifest.Files[i]
 		if f.Branch == "" {
-			f.Branch = "main"
+			f.Branch = defaultManifestBranch
+		}
+		if f.File == "" {
+			f.File = defaultManifestFile
+		}
+		if err := f.fetchRefSpec(defaultRemoteName).Validate(); err != nil {
+			return fmt.Errorf("invalid manifest branch %q: %w", f.Branch, err)
 		}
 	}
 
@@ -332,6 +354,13 @@ func (c *RepoConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ListsManifestFile reports whether the git-pusher reads file on branch to find the projects of this repo.
+func (c *RepoConfig) ListsManifestFile(branch, file string) bool {
+	return slices.ContainsFunc(c.Manifest.Files, func(f ManifestFile) bool {
+		return f.File == file && f.MatchesBranch(branch)
+	})
 }
 
 func (c *RepoConfig) Name() RepoName {
