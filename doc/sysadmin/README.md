@@ -351,6 +351,41 @@ Some things to know:
 - `abfs mount --fallback-to-git` clones projects that are missing from ABFS with git.
 - With `--tmp-ws` or `--ws`, an exclude in `-g` wins over a later include (`-g -tools,tools`), so the mount can select fewer projects.
 
+### Release branches
+
+To push new release branches without a config change, list them in `manifest.files` with a branch pattern. A pattern has one `*`, as in a git refspec, and `*` also matches `/`. Add one entry per manifest file name:
+
+```yaml
+repos:
+  - manifest:
+      url: https://android.googlesource.com/platform/manifest
+      files:
+        - branch: main
+          file: default.xml
+        - branch: release/*
+          file: default.xml
+        - branch: release/*
+          file: release.xml # for release branches whose manifest has another name
+```
+
+Every `check-interval` (60 seconds by default) each git-pusher fetches every branch of the manifest repository and reads the file on each matching branch that has it. When a release branch is created:
+
+1. Within one `check-interval`, git-pusher adds the projects that only the new branch's manifest lists and starts pushing them; the first push of a project takes as long as its history. Projects it already pushes fetch the new branch on their next run (`push-interval`, 60 seconds by default) if their `fetch-ref-spec` covers it.
+2. Wait for the branch, pin it and mount the pinned file:
+
+   ```sh
+   abfs ready -b release/2026-11 --branch-file release.xml --wait --timeout 2h -o pinned.xml
+   abfs mount -b release/2026-11 -f pinned.xml --tmp-ws $MOUNT
+   ```
+
+Some things to know:
+
+- A narrowed `fetch-ref-spec` has to cover the release branches too, for the projects and for the manifest project, which also gets `project-defaults`. Otherwise `abfs ready` reports `outside the git-pusher fetch-ref-spec`.
+- A pattern pushes the projects of every branch it matches, and each check reads the manifest of every matching branch. Keep patterns to the branches you build.
+- A deleted branch, a missing file or a manifest that fails to parse is skipped: the projects that only it listed stop being pushed, and what is already on the server stays. The other files are read as before. `Skipped` in `/info` lists them per repo.
+- When two files list one project with different URLs, the first file in `files` decides, and the other URL is listed in `Skipped`.
+- A change to `files` takes effect without restarting git-pusher or any project's pusher. A change to `project-defaults` or to an override restarts the pushers of the projects whose fetch settings it changes.
+
 ### git-pusher status
 
 If you want more details, each git-pusher exposes an HTTP `/info` endpoint that returns JSON on the port we set in the git-pusher config above. Each git-pusher reports only its own share of the projects. You can use `jq` (`sudo apt-get install jq` or see https://jqlang.org/download/) to summarize the project info with something like below run on **each** of the git-pushers:
@@ -360,7 +395,7 @@ curl -s localhost:9998/info | jq '{
   total:   (.AllProjects | length),
   done:    ([.Projects[] | select(.State=="sleep" and .LastError=="")] | length),
   failed:  [.Projects[] | select(.LastError!="") | {Name, LastError}],
-  repos:   [.Repos[] | {Name, State, LastSuccess, LastError}]
+  repos:   [.Repos[] | {Name, State, LastSuccess, LastError, Skipped}]
 }'
 ```
 

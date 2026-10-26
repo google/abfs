@@ -115,10 +115,12 @@ Projects listed in the manifest are stored under the host of their URL and their
 
 ### `ManifestFile`
 
-| Field | Type | Description |
-|---|---|---|
-| `branch` | string | Branch to look for the manifest file. |
-| `file` | string | Path to the manifest XML file. |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `branch` | string | `main` | Branch to look for the manifest file, or a pattern with one `*` as in a git refspec (`release/*`). `*` also matches `/`. |
+| `file` | string | `manifest.xml` | Path to the manifest XML file. |
+
+Git-Pusher fetches every branch of the manifest repository and reads `file` on each branch that `branch` names or matches. A branch or file it cannot use (a missing branch or file, a manifest that fails to parse) is skipped, and so is a project whose URL has no host; the other files and projects are read as before. `/info` lists per repo the files the last listing read (`ManifestFiles`) and what it skipped (`Skipped`). When files list one project with different URLs, the first file in the order of `files`, and of branch names within a pattern, decides its URL; the others are listed in `Skipped`.
 
 ### `ProjectConfig`
 
