@@ -16,7 +16,9 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/grpc/server"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
@@ -121,4 +124,70 @@ func TestServerWait_UnaryCallOutlastsRestart(t *testing.T) {
 	_, err = c.Headers(ctx, []remote.Hash{h})
 	require.NoError(err)
 	require.GreaterOrEqual(time.Since(start), outage-time.Second)
+}
+
+func TestServerWait_DownloadOutlastsRestart(t *testing.T) {
+	require := require.New(t)
+	srv := newRestartableServer(t, inmemory.New())
+	c := srv.client(time.Minute)
+	ctx := context.Background()
+	data := make([]byte, 64<<20)
+	_, err := rand.Read(data)
+	require.NoError(err)
+	h := objects.HashBlobBytes(data)
+	require.NoError(c.PutObject(ctx, h, remote.NewBlobReaderFromBytes(data)))
+	want := readObject(t, c, h)
+
+	r, err := c.GetObject(ctx, h)
+	require.NoError(err)
+	defer r.Close()
+	head := make([]byte, 1<<20)
+	_, err = io.ReadFull(r, head)
+	require.NoError(err)
+
+	const outage = 9 * time.Second
+	srv.stop()
+	go func() {
+		time.Sleep(outage)
+		srv.start()
+	}()
+	rest, err := io.ReadAll(r)
+	require.NoError(err)
+	require.Equal(want, append(head, rest...))
+}
+
+func readObject(t *testing.T, c *ABFSClient, h remote.Hash) []byte {
+	r, err := c.GetObject(context.Background(), h)
+	require.NoError(t, err)
+	defer r.Close()
+	b, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return b
+}
+
+func TestServerWait_UploadOutlastsRestart(t *testing.T) {
+	require := require.New(t)
+	srv := newRestartableServer(t, inmemory.New())
+	c := srv.client(time.Minute)
+	ctx := context.Background()
+	data := make([]byte, 100<<10)
+	_, err := rand.Read(data)
+	require.NoError(err)
+	h := objects.HashBlobBytes(data)
+
+	const outage = 9 * time.Second
+	srv.stop()
+	// An upload on the connection that is being closed would be cut, not refused.
+	conn := c.cm.conns[c.cm.hasher.Get(hashStr(h))]
+	require.Eventually(func() bool { return conn.GetState() != connectivity.Ready }, 10*time.Second, 10*time.Millisecond)
+	go func() {
+		time.Sleep(outage)
+		srv.start()
+	}()
+
+	start := time.Now()
+	require.NoError(c.PutObject(ctx, h, remote.NewBlobReaderFromBytes(data)))
+	require.GreaterOrEqual(time.Since(start), outage-time.Second)
+	got := readObject(t, c, h)
+	require.Equal(data, got[len(got)-len(data):])
 }

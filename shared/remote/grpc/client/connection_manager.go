@@ -138,7 +138,7 @@ func (cm *connectionManager) dial(servers []string) error {
 
 			// TODO: need to use a consistent value here like full VM name instead of this index-based value
 			s := fmt.Sprintf("worker-%d", index)
-			provider := remote.NewCompressingProvider(abfsgrpc.NewPBClient(pb.NewABFSClient(conn)))
+			provider := remote.NewCompressingProvider(abfsgrpc.NewPBClientWithClock(pb.NewABFSClient(conn), clock))
 			mu.Lock()
 			cm.clients[s] = provider
 			cm.conns[s] = conn

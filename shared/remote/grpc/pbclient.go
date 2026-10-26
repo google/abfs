@@ -57,12 +57,22 @@ const (
 )
 
 type PBClient struct {
-	pb pb.ABFSClient
+	pb    pb.ABFSClient
+	clock *OutageClock
 }
 
 func NewPBClient(pb pb.ABFSClient) *PBClient {
 	return &PBClient{
 		pb: pb,
+	}
+}
+
+// NewPBClientWithClock creates a PBClient whose downloads wait for an unreachable server on clock,
+// the clock the connection's other calls share.
+func NewPBClientWithClock(pb pb.ABFSClient, clock *OutageClock) *PBClient {
+	return &PBClient{
+		pb:    pb,
+		clock: clock,
 	}
 }
 
@@ -106,7 +116,7 @@ func (c *PBClient) GetObject(ctx context.Context, key remote.Hash) (remote.Conte
 	openStream := func() (Stream, error) {
 		return c.pb.GetObject(ctx, &pb.GetObjectRequest{Key: HashToBytes(key)})
 	}
-	s, err := newResumableRecvStream(openStream, getGetObjectReply, putGetObjectReply)
+	s, err := newResumableRecvStream(ctx, c.clock, openStream, getGetObjectReply, putGetObjectReply)
 	if err != nil {
 		return nil, rewrapNotFound(err)
 	}
@@ -115,9 +125,19 @@ func (c *PBClient) GetObject(ctx context.Context, key remote.Hash) (remote.Conte
 
 // PutObject implements remote.RemoteProvider.
 func (c *PBClient) PutObject(ctx context.Context, key remote.Hash, reader remote.ContentReadCloser) error {
+	if c.clock.gaveUp() {
+		return c.clock.unreachable(ctx, errTransientFailure)
+	}
 	for {
 		stream, err := c.pb.PutObject(ctx)
 		if err != nil {
+			// Nothing was read from reader yet, so the upload can wait for the server.
+			if status.Code(err) == codes.Unavailable {
+				if c.clock.waitForServer(ctx) {
+					continue
+				}
+				err = c.clock.unreachable(ctx, err)
+			}
 			return UnwrapMissingLinkError(err)
 		}
 
@@ -130,6 +150,9 @@ func (c *PBClient) PutObject(ctx context.Context, key remote.Hash, reader remote
 
 		if err == nil {
 			_, err = stream.CloseAndRecv()
+			if err == nil {
+				c.clock.Reached()
+			}
 			return UnwrapMissingLinkError(err)
 		}
 
