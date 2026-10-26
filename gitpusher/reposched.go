@@ -85,24 +85,44 @@ func (s *repoScheduler) AddRepo(config *RepoConfig) error {
 		return fmt.Errorf("repo %q already exists", config.Name())
 	}
 
+	s.startRepo(config, nil)
+	return nil
+}
+
+// startRepo starts the listing loop of a repo whose pushers run the given projects. Must be called with s.mu held.
+func (s *repoScheduler) startRepo(config *RepoConfig, projects []*ProjectConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &repoWrap{
-		config: config,
-		cancel: cancel,
-		lister: s.newLister(config),
+		config:   config,
+		cancel:   cancel,
+		lister:   s.newLister(config),
+		projects: projects,
 	}
 	s.repos[config.Name()] = r
 	r.stopped = make(chan struct{})
 	s.wg.Add(1)
 	go s.runPusherLoop(ctx, cancel, r)
-	return nil
 }
 
+// UpdateRepo replaces the listing loop of a repo. The projects keep running, and the first listing of
+// the new loop adds, removes or updates only the ones the new config changes.
 func (s *repoScheduler) UpdateRepo(config *RepoConfig) error {
-	if err := s.RemoveRepo(config); err != nil {
-		log.Printf("Error removing repo %q: %v", config.Name(), err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Printf("Updating repo %q", config.Name())
+
+	wrapper, found := s.repos[config.Name()]
+	if !found {
+		s.startRepo(config, nil)
+		return nil
 	}
-	return s.AddRepo(config)
+
+	wrapper.cancel()
+	// The old loop writes projects until it stops, and it shares the manifest clone with the new one.
+	<-wrapper.stopped
+	s.startRepo(config, wrapper.projects)
+	return nil
 }
 
 func (s *repoScheduler) RemoveRepo(config *RepoConfig) error {
