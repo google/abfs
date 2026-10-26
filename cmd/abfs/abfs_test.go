@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -336,4 +337,28 @@ func TestServer_SecondSignal(t *testing.T) {
 			requireObjectStored(t, dir, put.key)
 		})
 	}
+}
+
+func TestServer_DrainDelayReportsNotServing(t *testing.T) {
+	require := require.New(t)
+	p := startServer(t, t.TempDir(), "--drain-delay", "2s")
+
+	start := time.Now()
+	require.NoError(p.cmd.Process.Signal(syscall.SIGTERM))
+	p.waitForOutput(t, "Reporting NOT_SERVING")
+
+	// During the delay a new connection is accepted: health checks report
+	// NOT_SERVING and other requests are still served.
+	conn, err := grpc.NewClient(p.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(err)
+	defer func() { _ = conn.Close() }()
+	resp, err := grpc_health_v1.NewHealthClient(conn).Check(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+	require.NoError(err)
+	require.Equal(grpc_health_v1.HealthCheckResponse_NOT_SERVING, resp.Status)
+	ctx := metadata.AppendToOutgoingContext(t.Context(), "client-version", servers.ClientMinVersion)
+	_, err = pb.NewABFSClient(conn).GetVersion(ctx, &pb.GetVersionRequest{})
+	require.NoError(err)
+
+	require.NoError(p.wait(t, 15*time.Second), "error from the server process")
+	require.GreaterOrEqual(time.Since(start), 2*time.Second)
 }

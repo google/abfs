@@ -25,6 +25,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -95,7 +97,7 @@ func TestServeGRPC_GracefulStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() {
-		served <- serveGRPC(ctx, s, lis, time.Minute)
+		served <- serveGRPC(ctx, s, nil, lis, 0, time.Minute)
 	}()
 
 	called := make(chan error, 1)
@@ -127,7 +129,7 @@ func TestServeGRPC_Timeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() {
-		served <- serveGRPC(ctx, s, lis, 100*time.Millisecond)
+		served <- serveGRPC(ctx, s, nil, lis, 0, 100*time.Millisecond)
 	}()
 
 	called := make(chan error, 1)
@@ -147,7 +149,7 @@ func TestServeGRPC_CanceledBeforeServe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	require.NoError(t, serveGRPC(ctx, s, lis, time.Minute))
+	require.NoError(t, serveGRPC(ctx, s, nil, lis, 0, time.Minute))
 }
 
 func TestServeGRPC_ServeError(t *testing.T) {
@@ -155,8 +157,64 @@ func TestServeGRPC_ServeError(t *testing.T) {
 	lis := bufconn.Listen(1024)
 	require.NoError(t, lis.Close(), "error closing listener")
 
-	err := serveGRPC(context.Background(), s, lis, time.Minute)
+	err := serveGRPC(context.Background(), s, nil, lis, 0, time.Minute)
 	require.Error(t, err)
+}
+
+func TestServeGRPC_DrainDelay(t *testing.T) {
+	require := require.New(t)
+
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	close(release)
+	s, lis, conn := newSlowServer(t, started, release)
+	hs := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(s, hs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		served <- serveGRPC(ctx, s, hs, lis, time.Second, time.Minute)
+	}()
+	hc := grpc_health_v1.NewHealthClient(conn)
+	resp, err := hc.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	require.NoError(err)
+	require.Equal(grpc_health_v1.HealthCheckResponse_SERVING, resp.Status)
+
+	start := time.Now()
+	cancel()
+	// Health checks report the shutdown at once, while new requests are still served.
+	require.Eventually(func() bool {
+		resp, err := hc.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+		return err == nil && resp.Status == grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	}, 500*time.Millisecond, 10*time.Millisecond)
+	require.NoError(conn.Invoke(context.Background(), waitMethod, &emptypb.Empty{}, &emptypb.Empty{}))
+
+	require.NoError(receive(t, served, "serveGRPC"), "error from serveGRPC")
+	require.GreaterOrEqual(time.Since(start), time.Second)
+}
+
+func TestServeGRPC_ServeErrorSkipsDrainDelay(t *testing.T) {
+	s := grpc.NewServer()
+	lis := bufconn.Listen(1024)
+	require.NoError(t, lis.Close(), "error closing listener")
+
+	start := time.Now()
+	require.Error(t, serveGRPC(context.Background(), s, health.NewServer(), lis, time.Minute, time.Minute))
+	require.Less(t, time.Since(start), 10*time.Second)
+}
+
+func TestServeGRPC_NotServingWithoutDrainDelay(t *testing.T) {
+	s := grpc.NewServer()
+	hs := health.NewServer()
+	lis := bufconn.Listen(1024)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, serveGRPC(ctx, s, hs, lis, 0, time.Minute))
+	resp, err := hs.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	require.NoError(t, err)
+	require.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, resp.Status)
 }
 
 func TestServerCmd_ShutdownTimeoutDefault(t *testing.T) {
@@ -165,4 +223,5 @@ func TestServerCmd_ShutdownTimeoutDefault(t *testing.T) {
 	c.RegisterFlags(fl)
 	require.NoError(t, fl.Parse(nil))
 	require.Equal(t, 25*time.Second, c.shutdownTimeout)
+	require.Zero(t, c.drainDelay)
 }

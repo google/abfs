@@ -28,6 +28,7 @@ import (
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
 
 	aresgrpc "github.com/google/abfs/ares/grpc"
 	arespb "github.com/google/abfs/ares/grpc/proto"
@@ -50,6 +51,7 @@ type serverCmd struct {
 	noLogging        bool
 	maxConnectionAge time.Duration
 	shutdownTimeout  time.Duration
+	drainDelay       time.Duration
 	aresEnabled      bool
 	tlsCertFile      string
 	tlsKeyFile       string
@@ -66,7 +68,7 @@ func NewCmd(rootCmd *root.RootCmd) *serverCmd {
 func (c *serverCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:        "server",
-		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--shutdown-timeout <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
+		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--drain-delay <duration>] [--shutdown-timeout <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
 		Aliases:     []string{},
 		Desc:        `Start ABFS server for blobs, objects and map results.`,
 		Subcommands: c.subcommands(),
@@ -80,6 +82,7 @@ func (c *serverCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.IntVarP(&c.port, "port", "p", 50051, "The server port")
 	fl.IntVar(&c.httpPort, "http-port", 0, "The http (v1) server port")
 	fl.DurationVar(&c.maxConnectionAge, "max-connection-age", 0, "A duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. Supports units like '1h', '30m', '1s'. Default is 0 (no limit).")
+	fl.DurationVar(&c.drainDelay, "drain-delay", 0, "How long to keep serving after a shutdown signal, while health checks already report NOT_SERVING, so that load balancers and health checkers stop sending new requests before the server stops accepting them. Size it from the health check interval times the unhealthy threshold. 0 means the drain starts at once.")
 	fl.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 25*time.Second, "How long to wait for pending RPCs on shutdown before closing their connections, so that a stalled or vanished client cannot keep the server from exiting. Keep it below the time your process manager waits before killing the server. 0 means no limit.")
 	// TODO: override hashpath or some other solution for local testing?
 	fl.BoolVar(&c.aresEnabled, "ares-enabled", false, fmt.Sprintf("Polls the hashpath %q for the list of ARES servers to proxy to", aresgrpc.ConfigARESServersHashPath))
@@ -134,6 +137,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	hs := health.NewServer()
 	s, err := server.NewGRPCServer(&server.GRPCServerOpts{
 		Server:                   composedServer,
 		ProxyPrefixToConnManager: proxyMap,
@@ -141,6 +145,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		CertFile:                 c.tlsCertFile,
 		KeyFile:                  c.tlsKeyFile,
 		AuthEnabled:              c.authEnabled,
+		Health:                   hs,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create gprc server: %w", err)
@@ -174,16 +179,27 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		}
 	}()
 
-	return serveGRPC(ctx, s, lis, c.shutdownTimeout)
+	return serveGRPC(ctx, s, hs, lis, c.drainDelay, c.shutdownTimeout)
 }
 
-// serveGRPC serves s on lis until ctx is canceled or s fails, then stops s
-// gracefully, closing the remaining connections after timeout.
-func serveGRPC(ctx context.Context, s *grpc.Server, lis net.Listener, timeout time.Duration) error {
+// serveGRPC serves s on lis until ctx is canceled or s fails. It then reports
+// NOT_SERVING on hs, keeps serving for drainDelay and stops s gracefully,
+// closing the remaining connections after timeout.
+func serveGRPC(ctx context.Context, s *grpc.Server, hs *health.Server, lis net.Listener, drainDelay, timeout time.Duration) error {
+	stopCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		<-ctx.Done()
+		if hs != nil {
+			// Health checkers see the shutdown before the listener closes.
+			hs.Shutdown()
+		}
+		// Only a requested stop waits; when Serve failed there is nothing to drain.
+		if drainDelay > 0 && stopCtx.Err() != nil {
+			log.Printf("Reporting NOT_SERVING and serving for %s before shutting down...", drainDelay)
+			time.Sleep(drainDelay)
+		}
 		log.Printf("Shutting down gRPC server gracefully so pending RPCs can finish...")
 		// GracefulStop waits for every handler to return, also for clients
 		// that stopped reading or vanished. Stop cancels their contexts, so the
