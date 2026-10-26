@@ -329,6 +329,10 @@ func (u *manifestUpstream) commit(branch string, files map[string]string) {
 	u.git(u.worktree, "push", "-q", "-f", u.dir, "HEAD:refs/heads/"+branch)
 }
 
+func (u *manifestUpstream) deleteBranch(branch string) {
+	u.git(u.worktree, "push", "-q", u.dir, ":refs/heads/"+branch)
+}
+
 func manifestXML(fetch string, projects ...string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<manifest>\n  <remote name=\"aosp\" fetch=%q />\n  <default remote=\"aosp\" revision=\"main\" />\n", fetch)
@@ -389,6 +393,27 @@ func TestListProjects_BranchPattern(t *testing.T) {
 	require.Equal(t, []string{"https://example.com/a-only", "https://example.com/b-only"}, listProjectURLs(t, w))
 }
 
+func TestListProjects_MissingBranch(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	u.commit("old", map[string]string{"default.xml": manifestXML("https://example.com", "old-only")})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "main", File: "default.xml"},
+		ManifestFile{Branch: "old", File: "default.xml"},
+		ManifestFile{Branch: "next", File: "default.xml"})
+
+	// next does not exist yet; the other branches are still listed.
+	require.Equal(t, []string{"https://example.com/main-only", "https://example.com/old-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"next: no such branch"}, w.Stat().Skipped)
+
+	// A deleted branch drops its projects, and changes on the other branches still arrive.
+	u.deleteBranch("old")
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only", "main-new")})
+	require.Equal(t, []string{"https://example.com/main-new", "https://example.com/main-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"main:default.xml"}, w.Stat().ManifestFiles)
+	require.Equal(t, []string{"old: no such branch", "next: no such branch"}, w.Stat().Skipped)
+}
+
 func TestListProjects_FileNamePerBranch(t *testing.T) {
 	u := newManifestUpstream(t)
 	u.commit("release/a", map[string]string{"default.xml": manifestXML("https://example.com", "a-only")})
@@ -398,8 +423,12 @@ func TestListProjects_FileNamePerBranch(t *testing.T) {
 		ManifestFile{Branch: "release/*", File: "other.xml"})
 
 	require.Equal(t, []string{"https://example.com/a-only", "https://example.com/x-only"}, listProjectURLs(t, w))
-	require.Equal(t, []string{"release/a:default.xml", "release/x:other.xml"}, w.lastReport.read)
-	require.Equal(t, []string{"release/x:default.xml: no such file", "release/a:other.xml: no such file"}, w.lastReport.skipped)
+	require.Equal(t, []string{"release/a:default.xml", "release/x:other.xml"}, w.lastReport.Load().read)
+	require.Equal(t, []string{"release/x:default.xml: no such file", "release/a:other.xml: no such file"}, w.lastReport.Load().skipped)
+
+	w = newTestRepoWatcher(t, u, ManifestFile{Branch: "next/*", File: "default.xml"})
+	require.Empty(t, listProjectURLs(t, w))
+	require.Equal(t, []string{"next/*: no matching branch"}, w.Stat().Skipped)
 }
 
 func TestListProjects_SameProjectFromTwoBranches(t *testing.T) {
@@ -416,5 +445,58 @@ func TestListProjects_SameProjectFromTwoBranches(t *testing.T) {
 	for range 3 {
 		require.Equal(t, []string{"https://example.com/shared"}, listProjectURLs(t, w))
 	}
-	require.Equal(t, []string{"b:default.xml: project example.com/shared also listed as https://example.com/mirror/shared"}, w.lastReport.skipped)
+	require.Equal(t, []string{"b:default.xml: project example.com/shared also listed as https://example.com/mirror/shared"}, w.lastReport.Load().skipped)
+}
+
+func TestListProjects_BrokenManifest(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	u.commit("broken", map[string]string{"default.xml": "<manifest><project"})
+	u.commit("bad-url", map[string]string{"default.xml": `<manifest>
+  <remote name="aosp" fetch="https://example.com" />
+  <remote name="nohost" fetch="file:///nohost" />
+  <default remote="aosp" revision="main" />
+  <project name="good" />
+  <project name="no-host" remote="nohost" />
+</manifest>`})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "main", File: "default.xml"},
+		ManifestFile{Branch: "broken", File: "default.xml"},
+		ManifestFile{Branch: "bad-url", File: "default.xml"})
+
+	// A broken manifest skips its branch; a project URL without a host skips that project only.
+	require.Equal(t, []string{"https://example.com/good", "https://example.com/main-only"}, listProjectURLs(t, w))
+	skipped := w.Stat().Skipped
+	require.Len(t, skipped, 2)
+	require.True(t, strings.HasPrefix(skipped[0], "broken:default.xml: failed to parse"), skipped[0])
+	require.True(t, strings.HasPrefix(skipped[1], "bad-url:default.xml: project no-host:"), skipped[1])
+}
+
+func TestListProjects_UnreadableClone(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	w := newTestRepoWatcher(t, u, ManifestFile{Branch: "main", File: "default.xml"})
+	require.Equal(t, []string{"https://example.com/main-only"}, listProjectURLs(t, w))
+
+	// Remove the branch's tree object from the clone: the read fails, and the listing keeps the previous list.
+	cmd := exec.Command("git", "-C", u.worktree, "rev-parse", "HEAD^{tree}")
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	tree := strings.TrimSpace(string(out))
+	object := filepath.Join(w.dirPath, "objects", tree[:2], tree[2:])
+	require.FileExists(t, object)
+	require.NoError(t, os.Remove(object))
+
+	_, err = w.ListProjects(context.Background())
+	require.Error(t, err)
+}
+
+func TestListProjects_ManifestListsItself(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "platform/manifest", "main-only")})
+	w := newTestRepoWatcher(t, u, ManifestFile{Branch: "main", File: "default.xml"})
+
+	// The configured manifest URL wins over the manifest's own entry for its repository.
+	require.Equal(t, []string{"https://example.com/main-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"main:default.xml: project example.com/platform/manifest also listed as https://example.com/platform/manifest"}, w.lastReport.Load().skipped)
 }

@@ -78,8 +78,8 @@ type ManifestFile struct {
 	File   string `yaml:"file"`
 }
 
-func (f ManifestFile) fetchRefSpec(remote string) config.RefSpec {
-	return config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", f.Branch, remote, f.Branch))
+func (f ManifestFile) refSpec() config.RefSpec {
+	return config.RefSpec(fmt.Sprintf("refs/heads/%s:refs/heads/%s", f.Branch, f.Branch))
 }
 
 func (f ManifestFile) isPattern() bool {
@@ -88,7 +88,7 @@ func (f ManifestFile) isPattern() bool {
 
 // MatchesBranch reports whether branch is the branch of f, or matches it as a pattern.
 func (f ManifestFile) MatchesBranch(branch string) bool {
-	return f.fetchRefSpec(defaultRemoteName).Match(plumbing.ReferenceName("refs/heads/" + branch))
+	return f.refSpec().Match(plumbing.ReferenceName("refs/heads/" + branch))
 }
 
 type ManifestConfig struct {
@@ -336,7 +336,7 @@ func (c *RepoConfig) Validate() error {
 		if f.File == "" {
 			f.File = defaultManifestFile
 		}
-		if err := f.fetchRefSpec(defaultRemoteName).Validate(); err != nil {
+		if err := f.refSpec().Validate(); err != nil {
 			return fmt.Errorf("invalid manifest branch %q: %w", f.Branch, err)
 		}
 	}

@@ -43,6 +43,9 @@ type RepoStat struct {
 	FetchDuration float64
 	LastSuccess   string
 	LastError     string
+	// ManifestFiles lists the branch:file pairs the last listing read, Skipped what it could not use.
+	ManifestFiles []string
+	Skipped       []string
 }
 
 type repoScheduler struct {
