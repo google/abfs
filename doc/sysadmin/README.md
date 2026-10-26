@@ -293,9 +293,15 @@ To update `repo` later, repeat these steps.
 
 ## First Mount
 
-Unfortunately git-pusher does not yet have a great way to tell when it is complete and ready for clients to start mounting the source code. This is an area we need to improve. It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers.
+It could take a few days for the push to complete depending on the size of your git history and the number and size of your git-pusher servers. `abfs ready` tells you when a manifest branch can be mounted. It reads the manifest from the ABFS server, resolves every project the same way `abfs mount` does, and lists the projects that are still missing:
 
-The easiest way is usually just to try it out on your client machine and see which projects are still missing:
+```sh
+abfs ready -b android-latest-release
+```
+
+It exits 0 when every project resolves, 1 when something is still missing and 2 on other errors. Add `--wait` to check again every 30 seconds until the branch is ready or `--timeout` (one hour by default) runs out, and `--json` for a report that scripts can read.
+
+Once it reports ready, mount the branch:
 
 ```sh
 MOUNT=mnt
@@ -303,15 +309,38 @@ mkdir $MOUNT
 abfs mount --branch android-latest-release --tmp-ws $MOUNT
 ```
 
-Projects that haven't been pushed yet are reported as `project <name>: remote branch <revision> not found in upstream <server>/<name>`, followed by a `Failing projects:` list.
-
 A failed mount stays mounted, so unmount it before you try again:
 
 ```sh
 abfs unmount -k $MOUNT
 ```
 
-If you want more details, each git-pusher exposes an HTTP `/info` endpoint that returns JSON on the port we set in the git-pusher config above. You can use `jq` (`sudo apt-get install jq` or see https://jqlang.org/download/) to summarize the project info with something like below run on **each** of the git-pushers:
+### Mounting from CI
+
+A manifest branch keeps moving while you build. To build exactly what was checked, write the pinned manifest with `-o` and mount that file:
+
+```sh
+abfs ready -b android-latest-release --wait --timeout 2h -o pinned.xml
+abfs mount -b android-latest-release -f pinned.xml --tmp-ws $MOUNT
+```
+
+Some things to know:
+
+- `abfs ready` writes `pinned.xml` only when the branch is ready, and removes it when not, so a later step cannot mount an old file.
+- Pass the same `-b` and `-g` to both commands, and do not pass `--local-manifest-dir` with a pinned file.
+- If the branch uses a manifest file other than `default.xml`, pass it to `abfs ready` with `--branch-file` and mount the pinned file.
+- A project that the git-pusher config excludes, or whose revision is outside its `fetch-ref-spec`, is never pushed, so the branch stays not ready until the config changes.
+- A ref can resolve before git-pusher has written its deep tree helper objects. The mount then builds them itself, which is slower.
+
+`abfs ready` can report a branch as not ready while a mount would still work in a few cases:
+
+- It takes `-b` as a branch name under `refs/heads/`. Tags and commit hashes are not accepted.
+- `abfs mount --fallback-to-git` clones projects that are missing from ABFS with git.
+- With `--tmp-ws` or `--ws`, an exclude in `-g` wins over a later include (`-g -tools,tools`), so the mount can select fewer projects.
+
+### git-pusher status
+
+If you want more details, each git-pusher exposes an HTTP `/info` endpoint that returns JSON on the port we set in the git-pusher config above. Each git-pusher reports only its own share of the projects. You can use `jq` (`sudo apt-get install jq` or see https://jqlang.org/download/) to summarize the project info with something like below run on **each** of the git-pushers:
 
 ```sh
 curl -s localhost:9998/info | jq '{
@@ -322,6 +351,6 @@ curl -s localhost:9998/info | jq '{
 }'
 ```
 
-Then it's ready when `done == total`, `failed` is empty and every repo has a `LastSuccess`.
+`failed` lists the projects whose last push failed on that git-pusher, with the error.
 
 Once your mount succeeds, you are ready to move to the [Android Developer docs](../android-dev/README.md) and try out a build before sharing with your other developers.
