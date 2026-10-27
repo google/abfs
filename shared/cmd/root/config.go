@@ -52,6 +52,7 @@ func registerConfigFlags(fl *pflag.FlagSet, c *instance.ConfigOptional) {
 	optflags.OptBool(fl, &c.WriteToConfig, "write-to-config", "", "Overwrite the config file with the flags passed to this command")
 	optflags.OptBool(fl, &c.DisableTLS, "disable-tls", "", "Disable TLS for remote connections (override config)")
 	optflags.OptBool(fl, &c.EagerPush, "eager-push", "", "Eagerly push local objects to the remote server (override config)")
+	optflags.OptBool(fl, &c.IdleLocalGC, "idle-local-gc", "", "Remove unused local-only blobs when no mount is connected (override config)")
 
 	// RBE flags
 	optflags.OptBool(fl, &c.RBEAsCAS, "rbe-as-cas", "", "Use RBE as the primary remote CAS client (override config)")

@@ -307,6 +307,8 @@ type Index interface {
 	Close() error
 	KeepAlive(key entities.Hash) error
 	Sweep(timestampThreshold int64) (deletedCount int, err error)
+	sweepCandidates(timestampThreshold int64) ([]entities.Hash, error)
+	sweepBlobs(hashes []entities.Hash, timestampThreshold int64) (deletedCount int, err error)
 	markObjectRemote(key entities.Hash) error
 	markObjectOffline(key entities.Hash) error
 
@@ -377,6 +379,14 @@ func (e *EmptyIndex) KeepAlive(key entities.Hash) error {
 }
 
 func (e *EmptyIndex) Sweep(timestampThreshold int64) (deletedCount int, err error) {
+	return 0, nil
+}
+
+func (e *EmptyIndex) sweepCandidates(timestampThreshold int64) ([]entities.Hash, error) {
+	return nil, nil
+}
+
+func (e *EmptyIndex) sweepBlobs(hashes []entities.Hash, timestampThreshold int64) (deletedCount int, err error) {
 	return 0, nil
 }
 
@@ -821,36 +831,72 @@ func (i *badgerIndex) KeepAlive(key entities.Hash) error {
 }
 
 func (i *badgerIndex) Sweep(timestampThreshold int64) (deletedCount int, err error) {
-	i.evictCh <- struct{}{}
-	defer func() { <-i.evictCh }()
-	if i.closed.Load() {
-		return 0, nil
-	}
-
-	// Backpressure put() calls during sweep.
-	i.evictRWLock.Lock()
-	defer i.evictRWLock.Unlock()
-
-	t := time.Now()
-	entries, err := i.indexStore.ReadAll()
+	candidates, err := i.sweepCandidates(timestampThreshold)
 	if err != nil {
 		return 0, err
 	}
+	return i.sweepBlobs(candidates, timestampThreshold)
+}
+
+// sweepable reports whether entry is a local-only blob not put or kept alive since
+// timestampThreshold.
+func sweepable(entry *IndexEntry, timestampThreshold int64) bool {
+	// We only sweep unreachable blobs
+	return entry != nil && entry.EntryType == EntryTypeBlob &&
+		entry.Local && !entry.Remote && entry.LastAliveTime.Unix() < timestampThreshold
+}
+
+// Read-Only transaction doesn't need the evict lock since it won't cause conflict.
+func (i *badgerIndex) sweepCandidates(timestampThreshold int64) ([]entities.Hash, error) {
+	entries, err := i.indexStore.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	var hashes []entities.Hash
+	for _, keyEntry := range entries {
+		if sweepable(keyEntry.IndexEntry, timestampThreshold) {
+			hashes = append(hashes, keyEntry.Key)
+		}
+	}
+	return hashes, nil
+}
+
+// sweepBlobs deletes hashes in batches. Each batch reads the entries again under the
+// eviction lock, so a blob put or kept alive after it was selected stays.
+func (i *badgerIndex) sweepBlobs(hashes []entities.Hash, timestampThreshold int64) (deletedCount int, err error) {
+	i.evictCh <- struct{}{}
+	defer func() { <-i.evictCh }()
+
+	t := time.Now()
 	i.printer.Println("Starting Sweep process...")
 	defer func() {
 		i.printer.Println("Sweep process took", time.Since(t))
 	}()
+	for start := 0; start < len(hashes); start += MaxEvictBatchSize {
+		if i.closed.Load() {
+			break
+		}
+		swept, err := i.sweepBatch(hashes[start:min(start+MaxEvictBatchSize, len(hashes))], timestampThreshold)
+		deletedCount += swept
+		if err != nil {
+			return deletedCount, err
+		}
+	}
+	return deletedCount, nil
+}
+
+func (i *badgerIndex) sweepBatch(hashes []entities.Hash, timestampThreshold int64) (int, error) {
+	// Backpressure put() calls during sweep.
+	i.evictRWLock.Lock()
+	defer i.evictRWLock.Unlock()
+
 	var toDeleteKeys []entities.Hash
 	var toDeleteEntries []*IndexKeyEntry
-	for _, keyEntry := range entries {
-		// We only sweep unreachable blobs
-		entry := keyEntry.IndexEntry
-		if entry.EntryType != EntryTypeBlob {
-			continue
-		}
-		if entry.Local && !entry.Remote && entry.LastAliveTime.Unix() < timestampThreshold {
-			toDeleteKeys = append(toDeleteKeys, keyEntry.Key)
-			toDeleteEntries = append(toDeleteEntries, keyEntry)
+	for _, hash := range hashes {
+		entry := i.indexStore.Get(hash)
+		if sweepable(entry, timestampThreshold) {
+			toDeleteKeys = append(toDeleteKeys, hash)
+			toDeleteEntries = append(toDeleteEntries, &IndexKeyEntry{Key: hash, IndexEntry: entry})
 		}
 	}
 
@@ -858,9 +904,7 @@ func (i *badgerIndex) Sweep(timestampThreshold int64) (deletedCount int, err err
 		return 0, nil
 	}
 	cnt := i.indexStore.IndexCount()
-	_, _, err = i.indexStore.DeleteMany(toDeleteKeys)
-
-	if err != nil {
+	if _, _, err := i.indexStore.DeleteMany(toDeleteKeys); err != nil {
 		return 0, err
 	}
 

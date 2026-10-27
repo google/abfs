@@ -280,6 +280,12 @@ func TestConfigApplyKeyValues(t *testing.T) {
 	require.NotNil(c.EagerPush)
 	require.False(*c.EagerPush)
 
+	// idle-local-gc via kebab-case
+	err = c.ApplyKeyValues([]string{"idle-local-gc=false"})
+	require.NoError(err)
+	require.NotNil(c.IdleLocalGC)
+	require.False(*c.IdleLocalGC)
+
 	// invalid key
 	err = c.ApplyKeyValues([]string{"invalid-key=val"})
 	require.Error(err)

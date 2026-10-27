@@ -205,6 +205,8 @@ type CacheMan struct {
 	newObjReqs           *NewObjectReqQueue
 	pendingAdd           *PendingAddTracker
 	notifyUseAgg         *NotifyUseAggregator
+	mounts               *mountTracker
+	lastIdleGC           time.Time
 	activeWorkers        sync.WaitGroup
 
 	relFetchObjectReqs chan RelativeFetchReq
@@ -253,6 +255,7 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 		config:             new(instance.Config),
 		newConfigC:         make(chan struct{}, 1),
 		healthCheckTrigger: make(chan struct{}, 1),
+		mounts:             newMountTracker(time.Now),
 		newARES:            newARES,
 		printer:            new(DefaultPrinter),
 		serverCtx:          serverCtx,
@@ -1357,6 +1360,7 @@ func (c *CacheMan) indexObjectsWorker(ctx context.Context) {
 // EnqueueNewObject pushes locally created object notifications to an asynchronous
 // queue for background indexing and eager-push without blocking the socket reader.
 func (c *CacheMan) EnqueueNewObject(hash entities.Hash, objType protocol.RequestObjectType) {
+	c.mounts.noteNewObject()
 	c.newObjReqs.Push(NewObjectReq{Hash: hash, ObjType: objType})
 }
 
@@ -2168,6 +2172,7 @@ func (c *CacheMan) Serve(ctx context.Context) error {
 			c.printer.Printf("Error while running maintenance: %v\n", err)
 		}
 	}()
+	go c.idleGC(ctx)
 
 	workers := runtime.NumCPU()
 	for range workers {
@@ -2325,6 +2330,7 @@ func (c *CacheMan) Stats() protocol.CacheManStats {
 		EvictEnd:      c.index.EvictEnd(),
 		EvictCount:    c.index.EvictCount(),
 		OldestObject:  c.index.OldestUsed(),
+		Mounts:        int64(c.mounts.kernelMounts()),
 		FetchBlobs:    c.fetchBlobsStat,
 		FetchTrees:    c.fetchTreesStat,
 		FetchObjects:  c.fetchObjectsStat,
