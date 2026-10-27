@@ -164,6 +164,46 @@ func TestBackgroundEvictionThresholdPutMany(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond)
 }
 
+func TestMarkObjectRemoteTriggersEviction(t *testing.T) {
+	cache, err := localcache.NewCache(t.TempDir(), localcache.CreateIfNotExistOpt(), localcache.BypassCompatCheckOpt())
+	require.NoError(t, err)
+	indexStore := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	const threshold = 1000
+	targetSize := int64(float64(threshold) * (1.0 - evictHeadroom))
+	idx, err := NewIndex(&IndexOptions{
+		IndexStore:     indexStore,
+		Cache:          cache,
+		EvictThreshold: threshold,
+	})
+	require.NoError(t, err)
+	defer idx.Close()
+
+	// Local-only entries above the threshold stay out of the LRU.
+	ctx := context.Background()
+	const itemSize = 100
+	var hashes []entities.Hash
+	for i := range 12 {
+		h := hashOf(fmt.Sprintf("upload-obj-%d", i))
+		require.NoError(t, cache.WriteBlob(ctx, h, bytes.NewReader(bytes.Repeat([]byte{byte(i)}, itemSize))))
+		_, _, _, _, err := idx.Put(h, &IndexEntry{
+			EntryType: EntryTypeBlob,
+			Local:     true,
+			Size:      itemSize,
+		})
+		require.NoError(t, err)
+		hashes = append(hashes, h)
+	}
+	require.Equal(t, int64(0), indexStore.LRUSize())
+
+	// Uploads move them into the LRU and start eviction without another index write.
+	for _, h := range hashes {
+		require.NoError(t, idx.markObjectRemote(h))
+	}
+	require.Eventually(t, func() bool {
+		return indexStore.LRUSize() <= targetSize && idx.EvictCount() > 0
+	}, 3*time.Second, 50*time.Millisecond)
+}
+
 func TestIndexReqQueue(t *testing.T) {
 	q := NewIndexReqQueue()
 

@@ -755,9 +755,15 @@ func (i *badgerIndex) removeCachedObject(entry *IndexKeyEntry) error {
 
 func (i *badgerIndex) markObjectRemote(key entities.Hash) error {
 	i.evictRWLock.RLock()
-	defer i.evictRWLock.RUnlock()
+	err := i.indexStore.MarkObjectRemote(key)
+	i.evictRWLock.RUnlock()
+	if err != nil {
+		return err
+	}
 
-	return i.indexStore.MarkObjectRemote(key)
+	// An upload moves the object into the LRU, which can take it over the threshold.
+	i.maybeTriggerEviction(i.indexStore.LRUSize())
+	return nil
 }
 
 func (i *badgerIndex) markObjectOffline(key entities.Hash) error {
