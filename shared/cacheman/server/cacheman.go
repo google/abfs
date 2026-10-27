@@ -2885,11 +2885,12 @@ func (c *CacheMan) reconcileDiskObject(hash entities.Hash, objType protocol.Requ
 		}
 	} else if !entry.Remote {
 		// 3. If object is on disk and in the index, but index says remote=false:
-		// This will add to the index, push to the remote,
-		// and receive the dagsync callbacks to update 'remote' tracking.
-		// The "add" to the index will be a NOP in the common case, but we want
-		// to go through this code path for the callbacks.
-		c.NewObject(hash, resolveObjType())
+		// Push to the remote and receive the dagsync callbacks that mark it remote.
+		// Without a push the re-add would only set its last alive time to now, and
+		// a cacheman that restarts often would never sweep its local-only blobs.
+		if sync := c.getSync(); sync != nil && c.config.EagerPush && !c.noRemotePush() {
+			c.NewObject(hash, resolveObjType())
+		}
 	} else if entry.Local && entry.Remote {
 		// 4. Object is fully synced but might be missing from LRU tracking.
 		if _, tracked := trackedInLRU[hash]; !tracked {

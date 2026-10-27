@@ -524,3 +524,30 @@ func TestEnqueueNewObjectPausesDeletes(t *testing.T) {
 	it.c.EnqueueNewObject(hashOf("announced"), protocol.TypeBlob)
 	require.False(t, it.c.mounts.deleteAllowed())
 }
+
+func TestMaintenanceKeepsLocalOnlyAliveTime(t *testing.T) {
+	it := newIdleGCTest(t, nil)
+	old := time.Now().Add(2 * localGCThreshold)
+	h := it.putBlob(t, "output of a failed step", false, old)
+
+	// A cacheman start runs maintenance; it must not make old local-only blobs look new.
+	require.NoError(t, it.c.maintenanceWork())
+	entry := it.c.index.Get(h)
+	require.NotNil(t, entry)
+	require.Equal(t, old.Unix(), entry.LastAliveTime.Unix())
+	require.Equal(t, int64(0), it.c.pushBlobsStat.Request.Load())
+
+	// With eager-push on but no dagsync yet (the first pass at startup), there is no push
+	// either, so the age stays.
+	it.c.config.EagerPush = true
+	sync := it.c.getSync()
+	it.c.sync.Store(nil)
+	require.NoError(t, it.c.maintenanceWork())
+	require.Equal(t, old.Unix(), it.c.index.Get(h).LastAliveTime.Unix())
+	require.Equal(t, int64(0), it.c.pushBlobsStat.Request.Load())
+
+	// With eager-push on, maintenance still pushes the blob.
+	it.c.sync.Store(sync)
+	require.NoError(t, it.c.maintenanceWork())
+	require.Equal(t, int64(1), it.c.pushBlobsStat.Request.Load())
+}
