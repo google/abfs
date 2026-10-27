@@ -223,6 +223,7 @@ abfs purge
 ## Documentation
 
 * [System Admin](doc/sysadmin/README.md)
+  * [Versions and Upgrades](doc/sysadmin/VERSIONS.md)
 * [ABFS Expert / Build Hygienist](doc/abfs-expert/README.md)
 * [Android Developer](doc/android-dev/README.md)
   * [Workspaces](doc/android-dev/WORKSPACES.md)
