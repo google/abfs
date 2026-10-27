@@ -325,3 +325,25 @@ curl -s localhost:9998/info | jq '{
 Then it's ready when `done == total`, `failed` is empty and every repo has a `LastSuccess`.
 
 Once your mount succeeds, you are ready to move to the [Android Developer docs](../android-dev/README.md) and try out a build before sharing with your other developers.
+
+## Client cache
+
+Each client keeps its objects in a local cache directory managed by cacheman. Two mechanisms keep it bounded.
+
+**Eviction.** Objects that the CAS server also holds are tracked in an LRU. When the LRU passes 90% of `evict-threshold` (default 1 TiB, `0` turns eviction off), cacheman removes the least recently used objects until it is at 80%, in batches of up to 10,000 objects. Eviction starts on index writes, after uploads and at the maintenance pass every 3 hours. An evicted object is fetched from the server again when it is read. Set the threshold below the size of the cache disk and leave room for local-only objects (below). Global flags go before the subcommand:
+
+```sh
+abfs --evict-threshold 500GB config -w
+```
+
+**Local-only objects.** Objects that never reached the server are not evicted, since the client could not get them back. Most build outputs are uploaded together with the cache entry of their step, but some stay local: outputs of failed steps, of steps that run without tapping, and files hashed outside ninja steps. When no mount has been connected to the cache directory for 15 seconds, cacheman removes local-only files that were not written or kept alive in the last hour, except files that a cache entry from the last 8 hours refers to. It waits until pending uploads are done and the server is reachable, and pauses while a mount is connected. After cacheman starts it first waits 60 seconds, and it runs once each time the last mount goes away, or once an hour while nothing is mounted. Reading a file does not count as keeping it alive. Set `idle-local-gc: false` to turn this off. Clients in `remote-read-only` mode clean up from the mount every 15 minutes instead, and `local-only` clients are not cleaned up.
+
+Limits:
+
+* Trees and other objects (two per ninjago step) are not removed.
+* A cache directory shared by builds that never leave a 15 second gap is not cleaned up.
+* A workspace snapshot that never reached the server loses its local-only files once it is unmounted. Mounting it again by hash still works, but reading those files fails with "No such file or directory".
+
+`abfs cacheman stats` shows the cache. Total Size is everything in the index and LRU Size is the evictable part, so the difference is roughly the local-only data. Mounts is the number of mounts connected. The command keeps updating until you stop it.
+
+To start over, stop cacheman, remove the whole cache directory and run `abfs init` again. `abfs cacheman clean` removes single parts of the cache.
