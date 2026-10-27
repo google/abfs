@@ -19,7 +19,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -31,6 +34,27 @@ func TestZeroExitCode_NoError(t *testing.T) {
 	err := ForkDaemon(cmd)
 
 	require.NoError(err, "should have no error after zero exit code")
+}
+
+func TestForkDaemon_SignalAfterReturn(t *testing.T) {
+	require := require.New(t)
+
+	// The process outlives ForkDaemon (the mount command still closes its providers), so a
+	// signal that arrives then must not reach the relay channel ForkDaemon has closed.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	require.NoError(ForkDaemon(exec.Command("true")))
+
+	require.NoError(syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	select {
+	case <-sigChan:
+	case <-time.After(5 * time.Second):
+		require.Fail("signal not delivered")
+	}
+	// Signal delivery to every registered channel happens in one pass; give it time to finish.
+	time.Sleep(100 * time.Millisecond)
 }
 
 func TestSetupDaemon_LogsPreservedOnClose(t *testing.T) {
