@@ -381,6 +381,7 @@ func TestFallbackToGit_ManifestResync(t *testing.T) {
 		refs   map[string]entities.Hash
 		pinned bool
 	}{
+		{name: "branch", branch: "main"},
 		{name: "tag", branch: "v1", refs: map[string]entities.Hash{"refs/tags/v1": entities.NewHash(tagged)}, pinned: true},
 		{name: "annotated tag", branch: "v1a", refs: map[string]entities.Hash{"refs/tags/v1a": tagObject}, pinned: true},
 		{name: "commit hash", branch: tagged, pinned: true},

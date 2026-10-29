@@ -316,10 +316,12 @@ func (r *Repo) updateManifest(ctx context.Context, fallbackToGit bool) error {
 }
 
 // manifestTarget returns what the manifest project is checked out at by casgit and by git.
-// repo init stores every manifest branch under refs/heads/, so the name is resolved again
+// abfs repo init stores every -b value under refs/heads/, so the name is resolved again
 // as the first clone resolves it, and a tag is checked out at its hash.
 func (r *Repo) manifestTarget(ctx context.Context, name string) (target, gitTarget string) {
-	if entities.IsHash(name) {
+	// A full ref, stored as typed by git-repo's repo init or after the git fallback clone,
+	// is checked out by git as given.
+	if entities.IsHash(name) || strings.HasPrefix(name, "refs/") {
 		return name, name
 	}
 	if u, err := url.Parse(r.manifestURL); err == nil {
@@ -331,7 +333,9 @@ func (r *Repo) manifestTarget(ctx context.Context, name string) (target, gitTarg
 			return hash.String(), hash.String()
 		}
 	}
-	return name, r.manifestBranch
+	// A git clone of the manifest has no local branch, and the fetch does not move one, so
+	// git checks out the remote branch.
+	return name, "refs/remotes/origin/" + name
 }
 
 func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision string, opts SyncOpts) error {

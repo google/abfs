@@ -255,7 +255,7 @@ func TestManifestTarget(t *testing.T) {
 			branch:        "main",
 			refs:          map[string]entities.Hash{"refs/heads/main": branchHash},
 			wantTarget:    "main",
-			wantGitTarget: "refs/heads/main",
+			wantGitTarget: "refs/remotes/origin/main",
 			wantLookup:    true,
 		},
 		{
@@ -271,7 +271,7 @@ func TestManifestTarget(t *testing.T) {
 			branch:        "v1",
 			refs:          map[string]entities.Hash{"refs/heads/v1": branchHash, "refs/tags/v1": tagHash},
 			wantTarget:    "v1",
-			wantGitTarget: "refs/heads/v1",
+			wantGitTarget: "refs/remotes/origin/v1",
 			wantLookup:    true,
 		},
 		{
@@ -281,10 +281,17 @@ func TestManifestTarget(t *testing.T) {
 			wantGitTarget: tagHash.String(),
 		},
 		{
+			name:          "full tag ref",
+			branch:        "refs/tags/v1",
+			refs:          map[string]entities.Hash{"refs/tags/v1": tagHash},
+			wantTarget:    "refs/tags/v1",
+			wantGitTarget: "refs/tags/v1",
+		},
+		{
 			name:          "not found",
 			branch:        "nope",
 			wantTarget:    "nope",
-			wantGitTarget: "refs/heads/nope",
+			wantGitTarget: "refs/remotes/origin/nope",
 			wantLookup:    true,
 		},
 		{
@@ -292,7 +299,7 @@ func TestManifestTarget(t *testing.T) {
 			branch:        "v1",
 			err:           errors.New("unavailable"),
 			wantTarget:    "v1",
-			wantGitTarget: "refs/heads/v1",
+			wantGitTarget: "refs/remotes/origin/v1",
 			wantLookup:    true,
 		},
 	}
@@ -301,9 +308,8 @@ func TestManifestTarget(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &manifestRefsStore{refs: tt.refs, err: tt.err}
 			r := &Repo{
-				RepoOpts:       RepoOpts{Git: casgit.New(store)},
-				manifestURL:    "https://gerrit.example.com/platform/manifest",
-				manifestBranch: "refs/heads/" + tt.branch,
+				RepoOpts:    RepoOpts{Git: casgit.New(store)},
+				manifestURL: "https://gerrit.example.com/platform/manifest",
 			}
 
 			target, gitTarget := r.manifestTarget(context.Background(), tt.branch)
