@@ -304,6 +304,10 @@ func (c *setupCmd) run() error {
 		return err
 	}
 
+	if err := c.wrapNSJail(); err != nil {
+		return err
+	}
+
 	if err := c.writeNinjaConfig(); err != nil {
 		return err
 	}
@@ -569,6 +573,14 @@ func topmostMissingDir(root, relDir string) string {
 		}
 	}
 	return missing
+}
+
+func (c *setupCmd) wrapNSJail() error {
+	cacheDir := c.Config.CacheDir
+	if c.OverrideCacheDir != "" {
+		cacheDir = c.OverrideCacheDir
+	}
+	return wrapNSJail(filepath.Join(c.mountPoint, c.Chroot), cacheDir)
 }
 
 func (c *setupCmd) writeNinjaConfig() error {

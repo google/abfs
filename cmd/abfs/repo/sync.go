@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/abfs/abfsrepo"
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/cmd/abfs/setup"
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/clierr"
 )
@@ -150,7 +151,9 @@ func (c *syncCmd) exec(ctx context.Context, projects []string) error {
 		return err
 	}
 
-	if err := repo.Sync(ctx, projects, c.SyncOpts); err != nil {
+	if err := setup.KeepNSJailWrapper(repo.Root(), func() error {
+		return repo.Sync(ctx, projects, c.SyncOpts)
+	}); err != nil {
 		return err
 	}
 
