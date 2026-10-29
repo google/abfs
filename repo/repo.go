@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -52,6 +53,7 @@ type remoteData struct {
 type CASGit interface {
 	GetCommit(ctx context.Context, key entities.Hash) (*object.Commit, error)
 	ResolveCommit(ctx context.Context, key entities.Hash) (*object.Commit, error)
+	GetSymRef(ctx context.Context, server, project, ref string) (string, error) //nolint:abfsstyle // matches casgit.CASGit.GetSymRef
 }
 
 type Repo struct {
@@ -71,6 +73,10 @@ type Repo struct {
 
 	manifestSet bool
 	rootHash    entities.Hash
+
+	// The manifest project commit that .repo/manifests is built from, resolved before the mount.
+	manifestRef    string
+	manifestCommit entities.Hash
 }
 
 func New(store entities.CASStore, git CASGit, manifestServer, manifestProjectName, manifestScheme, localManifestDir string, ignoreMissingProjects bool) *Repo {
@@ -191,29 +197,11 @@ func (r *Repo) ManifestFromBytes(content []byte) error {
 }
 
 func (r *Repo) ManifestFromBranch(ctx context.Context, branch, manifestProjectName, manifestBranchFile string) (returnErr error) {
-	searchPaths := []string{
-		"refs/heads/" + branch,
-		"refs/tags/" + branch,
-		branch,
-	}
-	var (
-		refHash []entities.ProjectRefHash
-		err     error
-	)
-	for _, ref := range searchPaths {
-		refHash, err = r.store.SearchRefs(r.manifestServer, manifestProjectName, ref, 0)
-		if err != nil {
-			return fmt.Errorf("failed to resolve manifest %s: %w", ref, err)
-		}
-		if len(refHash) != 0 {
-			break
-		}
-	}
-	if len(refHash) == 0 {
-		return fmt.Errorf("cannot find manifest for %s", branch)
+	if err := r.ResolveManifestBranch(manifestProjectName, branch); err != nil {
+		return err
 	}
 
-	h := refHash[0].Hash
+	h := r.manifestCommit
 	log.Printf("Using the manifest from commit %s for %s", h, branch)
 
 	commit, err := r.git.GetCommit(ctx, h)
@@ -226,6 +214,88 @@ func (r *Repo) ManifestFromBranch(ctx context.Context, branch, manifestProjectNa
 		return fmt.Errorf("cannot get file %q from %s: %s", manifestBranchFile, h, err)
 	}
 	return r.manifestFromBlobHash(ctx, manifestHash)
+}
+
+// ResolveManifestBranch looks up refs/heads/<branch> of the manifest project and nothing else.
+// A tag, a full ref, a commit or a ref below the name is not taken for the branch.
+func (r *Repo) ResolveManifestBranch(manifestProjectName, branch string) error {
+	ref := "refs/heads/" + branch
+	// Refs are stored as paths, so a name like "rel/" or "../tags/v1" would reach another ref.
+	if branch == "" || path.Clean(ref) != ref {
+		return fmt.Errorf("invalid manifest branch %q: --branch takes a branch name", branch)
+	}
+	hashes, err := r.store.GetRefs(r.manifestServer, manifestProjectName, []string{ref, "refs/tags/" + branch})
+	if entities.IsNotExist(err) {
+		return r.noManifestRefsError(err)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to resolve manifest branch %q: %w", branch, err)
+	}
+	if len(hashes) == 2 && !hashes[0].IsZero() {
+		r.manifestRef = ref
+		r.manifestCommit = hashes[0]
+		return nil
+	}
+
+	where := r.manifestServer + "/" + manifestProjectName
+	switch {
+	case len(hashes) == 2 && !hashes[1].IsZero():
+		return fmt.Errorf("manifest branch %q not found in %s, only a tag of that name: --branch takes a branch name", branch, where)
+	case strings.HasPrefix(branch, "refs/"):
+		return fmt.Errorf("manifest branch %q not found in %s: --branch takes a branch name, not a full ref", branch, where)
+	case plumbing.IsHash(branch):
+		return fmt.Errorf("manifest branch %q not found in %s: --branch takes a branch name, not a commit", branch, where)
+	default:
+		return fmt.Errorf("manifest branch %q not found in %s: --branch takes a branch name", branch, where)
+	}
+}
+
+// ResolveManifestHead takes the branch that HEAD of the manifest project points to, as git clone
+// does. Without a usable HEAD it takes the last branch in ref order.
+func (r *Repo) ResolveManifestHead(ctx context.Context, manifestProjectName string) error {
+	// GetSymRef reads a server without refs for the host as "no HEAD", so check the host first.
+	if _, err := r.store.GetRefs(r.manifestServer, manifestProjectName, []string{"HEAD"}); entities.IsNotExist(err) {
+		return r.noManifestRefsError(err)
+	}
+	head, err := r.git.GetSymRef(ctx, r.manifestServer, manifestProjectName, "HEAD")
+	if err != nil {
+		return fmt.Errorf("failed to read HEAD of manifest project %s: %w", manifestProjectName, err)
+	}
+	if strings.HasPrefix(head, "refs/heads/") {
+		hashes, err := r.store.GetRefs(r.manifestServer, manifestProjectName, []string{head})
+		if err != nil && !entities.IsNotExist(err) {
+			return fmt.Errorf("failed to resolve manifest %s: %w", head, err)
+		}
+		if len(hashes) == 1 && !hashes[0].IsZero() {
+			r.manifestRef = head
+			r.manifestCommit = hashes[0]
+			return nil
+		}
+	}
+
+	heads, err := r.store.SearchRefs(r.manifestServer, manifestProjectName, "refs/heads/", 0)
+	if err != nil && !entities.IsNotExist(err) {
+		return fmt.Errorf("failed to list branches of manifest project %s: %w", manifestProjectName, err)
+	}
+	if len(heads) == 0 {
+		return fmt.Errorf("manifest project %s/%s has no branches", r.manifestServer, manifestProjectName)
+	}
+	log.Printf("Warning: manifest project %s has no usable HEAD, using %s", manifestProjectName, heads[0].Ref)
+	r.manifestRef = heads[0].Ref
+	r.manifestCommit = heads[0].Hash
+	return nil
+}
+
+// noManifestRefsError reports a server that holds no refs for the manifest host, as before the
+// first push or with a wrong manifest server, so it is not mistaken for a wrong branch name.
+func (r *Repo) noManifestRefsError(err error) error {
+	return fmt.Errorf("the ABFS server holds no refs for manifest server %s: %w", r.manifestServer, err)
+}
+
+// ManifestCommit returns the manifest project ref and commit resolved by ResolveManifestBranch,
+// ResolveManifestHead or ManifestFromBranch, or a zero hash if none ran.
+func (r *Repo) ManifestCommit() (string, entities.Hash) {
+	return r.manifestRef, r.manifestCommit
 }
 
 func (r *Repo) manifestProjectFileBytes(ctx context.Context, name string) ([]byte, error) {

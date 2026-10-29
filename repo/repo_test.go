@@ -15,18 +15,31 @@
 package repo
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"io"
+	"maps"
+	"net"
 	"path"
 	"runtime"
+	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/cas/cas"
+	"github.com/google/abfs/casgit"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/remote/grpc/server"
+	"github.com/google/abfs/shared/remote/servers/filebased"
 )
 
 func NewTestRepo(manifestServer, manifestProjectName, manifestScheme string) *Repo {
@@ -287,6 +300,11 @@ func (t *testCASGit) ResolveCommit(ctx context.Context, key entities.Hash) (*obj
 	panic("unimplemented")
 }
 
+// GetSymRef implements CASGit.
+func (t *testCASGit) GetSymRef(ctx context.Context, server string, project string, ref string) (string, error) {
+	panic("unimplemented")
+}
+
 func TestNonHTTPSRemoteResolution(t *testing.T) {
 	require := require.New(t)
 
@@ -328,4 +346,128 @@ func TestNonHTTPSRemoteResolution(t *testing.T) {
 	require.NotNil(man)
 	require.Len(man.Project, 1)
 	require.Equal(mainHash.String(), man.Project[0].Revision)
+}
+
+const (
+	testRefServer  = "gerrit.example.com"
+	testRefProject = "platform/manifest"
+)
+
+func putTestObject(t *testing.T, s remote.RemoteProvider, objType string, content []byte) entities.Hash {
+	var buf bytes.Buffer
+	require.NoError(t, entities.WriteObject(objType, content, &buf))
+	key := entities.Hash(sha1.Sum(buf.Bytes()))
+	require.NoError(t, s.PutObject(context.Background(), key, remote.NewReaderFromBytes(buf.Bytes())))
+	return key
+}
+
+// putTestManifestCommit stores a manifest commit whose default.xml names one remote, so a test
+// can tell from the parsed manifest which commit was read.
+func putTestManifestCommit(t *testing.T, s remote.RemoteProvider, remoteName string) entities.Hash {
+	xml := fmt.Sprintf(`<manifest><remote name=%q fetch=".." /><default revision="main" remote=%q /></manifest>`, remoteName, remoteName)
+	blob := putTestObject(t, s, "blob", []byte(xml))
+	var tree bytes.Buffer
+	tree.WriteString("100644 default.xml\x00")
+	tree.Write(blob[:])
+	treeHash := putTestObject(t, s, "tree", tree.Bytes())
+	return putTestObject(t, s, "commit", fmt.Appendf(nil, "tree %s\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\n\n%s\n", treeHash, remoteName))
+}
+
+// newTestRefServer starts a file-based server over gRPC with one manifest commit per ref. The
+// map goes from ref to the remote name in that commit's manifest; the result goes from remote
+// name to commit.
+func newTestRefServer(t *testing.T, refs map[string]string) (*client.ABFSClient, map[string]entities.Hash) {
+	require := require.New(t)
+	fserver, err := filebased.New(t.TempDir())
+	require.NoError(err)
+	s, err := server.NewGRPCServer(&server.GRPCServerOpts{Server: fserver})
+	require.NoError(err)
+	lis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(err)
+	go func() { _ = s.Serve(lis) }()
+	c, err := client.NewABFSClient(&client.ABFSClientOpts{Servers: []string{lis.Addr().String()}, AuthInfo: instance.CreateAuthInfo(instance.AuthTypeNone, "", "", true)})
+	require.NoError(err)
+	t.Cleanup(func() {
+		_ = c.Close()
+		s.Stop()
+		_ = fserver.Close()
+	})
+
+	commits := map[string]entities.Hash{}
+	for _, ref := range slices.Sorted(maps.Keys(refs)) {
+		h := putTestManifestCommit(t, c, refs[ref])
+		commits[refs[ref]] = h
+		require.NoError(c.PutRefs(context.Background(), testRefServer, testRefProject, []entities.RefHash{{Ref: ref, Hash: h}}))
+	}
+	return c, commits
+}
+
+type countingStore struct {
+	entities.CASStore
+	gets atomic.Int64
+}
+
+func (s *countingStore) GetObject(ctx context.Context, key entities.Hash) ([]byte, error) {
+	s.gets.Add(1)
+	return s.CASStore.GetObject(ctx, key)
+}
+
+func TestManifestFromBranch_OnlyTheBranch(t *testing.T) {
+	c, commits := newTestRefServer(t, map[string]string{
+		"refs/heads/main":      "on-main",
+		"refs/heads/rel/a":     "on-rel-a",
+		"refs/heads/rel/b":     "on-rel-b",
+		"refs/heads/release-1": "on-release-1",
+		"refs/tags/v1":         "on-tag-v1",
+		"refs/tags/main":       "on-tag-main",
+	})
+	tests := []struct {
+		branch  string
+		want    string
+		wantErr string
+	}{
+		{branch: "main", want: "on-main"},
+		{branch: "rel/a", want: "on-rel-a"},
+		{branch: "release-1", want: "on-release-1"},
+		{branch: "rel", wantErr: `"rel"`},
+		{branch: "rel/", wantErr: `"rel/"`},
+		{branch: "release", wantErr: `"release"`},
+		{branch: "nope", wantErr: `"nope"`},
+		{branch: "v1", wantErr: "tag"},
+		{branch: "refs/heads/main", wantErr: `"refs/heads/main"`},
+		{branch: "refs/tags/v1", wantErr: `"refs/tags/v1"`},
+		{branch: "refs/heads", wantErr: `"refs/heads"`},
+		{branch: "refs", wantErr: `"refs"`},
+		{branch: "../tags/v1", wantErr: `"../tags/v1"`},
+		{branch: commits["on-main"].String(), wantErr: commits["on-main"].String()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.branch, func(t *testing.T) {
+			require := require.New(t)
+			s := &countingStore{CASStore: remote.NewRemoteStore(c)}
+			r := New(s, casgit.New(s), testRefServer, testRefProject, "https", "", false)
+			err := r.ManifestFromBranch(context.Background(), tt.branch, testRefProject, "default.xml")
+			if tt.wantErr != "" {
+				require.ErrorContains(err, tt.wantErr)
+				require.ErrorContains(err, "--branch takes a branch name")
+				require.Zero(s.gets.Load(), "no object may be read for a name that is not a branch")
+				return
+			}
+			require.NoError(err)
+			require.Equal(tt.want, r.Manifest().Remote[0].Name)
+		})
+	}
+}
+
+func TestResolveManifest_UnknownServer(t *testing.T) {
+	c, _ := newTestRefServer(t, map[string]string{"refs/heads/main": "on-main"})
+	s := remote.NewRemoteStore(c)
+	r := New(s, casgit.New(s), "other.example.com", testRefProject, "https", "", false)
+
+	err := r.ResolveManifestBranch(testRefProject, "main")
+	require.ErrorContains(t, err, "holds no refs for manifest server other.example.com")
+	require.True(t, entities.IsNotExist(err))
+
+	err = r.ResolveManifestHead(context.Background(), testRefProject)
+	require.ErrorContains(t, err, "holds no refs for manifest server other.example.com")
 }

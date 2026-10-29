@@ -805,9 +805,9 @@ func (a *ABFS) createProjects(ctx context.Context, root bindcas.Dir, man *manife
 func (a *ABFS) createManifestProject(ctx context.Context, root bindcas.Dir) error {
 	needRepoInit := a.GitRepoInit && !a.GitRepoSetupDone
 
-	refs, err := a.store.SearchRefs(a.ManifestServer, a.ManifestProjectName, fmt.Sprintf("refs/heads/%s", a.ManifestBranch), 0)
-	if err != nil {
-		return err
+	_, commit := a.repo.ManifestCommit()
+	if commit.IsZero() {
+		return errors.New("the manifest project commit has not been resolved")
 	}
 	dst := path.Join(casgit.RepoDirName, "manifests")
 
@@ -819,7 +819,7 @@ func (a *ABFS) createManifestProject(ctx context.Context, root bindcas.Dir) erro
 	mProject := manifest.Project{
 		Name:     a.ManifestProjectName,
 		Path:     dst,
-		Revision: refs[0].Hash.String(),
+		Revision: commit.String(),
 		Remote:   metaManifestRemote,
 	}
 	var mManifest manifest.Manifest
@@ -1506,7 +1506,15 @@ func (a *ABFS) setupRepo() error {
 		return errors.New("please provide a branch via --branch or a manifest file via --file")
 	}
 
-	return nil
+	// .repo/manifests needs a manifest project commit whatever the manifest came from. Resolve it
+	// here, before the mount, so a bad --branch fails early and chroots reuse the same commit.
+	if _, commit := a.repo.ManifestCommit(); !commit.IsZero() {
+		return nil
+	}
+	if a.ManifestBranch != "" {
+		return a.repo.ResolveManifestBranch(a.ManifestProjectName, a.ManifestBranch)
+	}
+	return a.repo.ResolveManifestHead(ctx, a.ManifestProjectName)
 }
 
 // cheap version of isTTY to not pull in extra dependencies.
