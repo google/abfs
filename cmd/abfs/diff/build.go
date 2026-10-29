@@ -40,7 +40,7 @@ type Hash = entities.Hash
 
 type buildCmd struct {
 	*root.RootCmd
-	store        entities.CASStore
+	*cmd.StoreProvider
 	ignMissing   bool
 	verbose      bool
 	quiet        bool
@@ -156,7 +156,7 @@ func (c buildCmd) decode(l string) (result []map[string]*ninjalog.LogEntry, retE
 			return nil, err
 		}
 
-		file, err = c.store.OpenBlob(context.Background(), hash)
+		file, err = c.Store.OpenBlob(context.Background(), hash)
 		if err != nil {
 			return nil, err
 		}
@@ -206,12 +206,12 @@ func (c *buildCmd) diffPatch(p1, p2 entities.Patch) *patchDiff {
 	return diffs
 }
 func (c *buildCmd) diffRequests(ctx context.Context, o *logDiffEntry) {
-	req1, err := binding.FetchObject[binding.EvalRequest](ctx, c.store, o.a.ReqHash)
+	req1, err := binding.FetchObject[binding.EvalRequest](ctx, c.Store, o.a.ReqHash)
 	if err != nil {
 		o.err = err
 		return
 	}
-	req2, err := binding.FetchObject[binding.EvalRequest](ctx, c.store, o.b.ReqHash)
+	req2, err := binding.FetchObject[binding.EvalRequest](ctx, c.Store, o.b.ReqHash)
 	if err != nil {
 		o.err = err
 		return
@@ -221,12 +221,12 @@ func (c *buildCmd) diffRequests(ctx context.Context, o *logDiffEntry) {
 	}
 }
 func (c *buildCmd) diffResponse(ctx context.Context, o *logDiffEntry) {
-	resp1, err := binding.FetchObject[binding.EvalResponse](ctx, c.store, o.a.RespHash)
+	resp1, err := binding.FetchObject[binding.EvalResponse](ctx, c.Store, o.a.RespHash)
 	if err != nil {
 		o.err = err
 		return
 	}
-	resp2, err := binding.FetchObject[binding.EvalResponse](ctx, c.store, o.b.RespHash)
+	resp2, err := binding.FetchObject[binding.EvalResponse](ctx, c.Store, o.b.RespHash)
 	if err != nil {
 		o.err = err
 		return
