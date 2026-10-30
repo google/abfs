@@ -90,6 +90,7 @@ type ABFSBackend struct {
 	hashFetchC      chan HashFetchReq
 	pendingJobs     sync.WaitGroup
 	matchFiles      *matchFiles
+	metadata        *binding.BuildMetadata
 }
 
 func NewABFSBackend() *ABFSBackend {
@@ -276,8 +277,32 @@ func (c *ABFSBackend) GraphLoaded(g *graph.Graph) error {
 		return true
 	})
 
+	// Targets holds a build once per output, and GoRange visits shards concurrently, so
+	// rewrite inputs once per node.
+	g.Nodes.GoRange(func(n *graph.Node) bool {
+		c.buildMetadataAsOrderOnly(n.Build)
+		return true
+	})
+
 	c.graph = g
 	return nil
+}
+
+// buildMetadataAsOrderOnly moves declared build metadata inputs to the order-only
+// inputs, so that their content stays out of the request key.
+func (c *ABFSBackend) buildMetadataAsOrderOnly(b *ninja.Build) {
+	if !slices.ContainsFunc(b.ImplicitInputs, c.isBuildMetadata) {
+		return
+	}
+	ins := make([]string, 0, len(b.ImplicitInputs))
+	for _, in := range b.ImplicitInputs {
+		if c.isBuildMetadata(in) {
+			b.OrderOnlyInputs = append(b.OrderOnlyInputs, in)
+		} else {
+			ins = append(ins, in)
+		}
+	}
+	b.ImplicitInputs = ins
 }
 
 func (c *ABFSBackend) addFileGlobs(glob string, g *graph.Graph, n *graph.Node) {
@@ -1190,6 +1215,14 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 		time.Since(c.startTime), failed, cached, done, hitRate,
 	)
 	c.log.Warnf("%s", msg)
+
+	c.metadata = c.buildMetadata()
+	if c.metadata != nil {
+		c.log.Infof("Build metadata: BUILD_USERNAME=%s BUILD_NUMBER=%s", c.metadata.Username, c.metadata.BuildNumber)
+		if !c.metadata.Pinned {
+			c.log.Warnf("BUILD_NUMBER is not set, so it follows the user name and builds by other users miss part of the cache; set BUILD_USERNAME and BUILD_NUMBER to the same value for every build")
+		}
+	}
 
 	return writeStats(c, err)
 }

@@ -27,33 +27,44 @@ import (
 )
 
 type matchFiles struct {
-	buildDate        string
-	soongBuildDate   string
-	soongTemp        string
-	soongMetricsAggr string
-	soongBuild       string
+	buildDate          string
+	soongBuildDate     string
+	soongBuildHostname string
+	soongTemp          string
+	soongMetricsAggr   string
+	soongBuild         string
 }
 
 func newMatchFiles(outDir string) *matchFiles {
 	return &matchFiles{
-		buildDate:        path.Join(outDir, "build_date.txt"),
-		soongBuildDate:   path.Join(outDir, "soong/build_date.txt"),
-		soongTemp:        path.Join(outDir, "soong/.temp") + "/",
-		soongMetricsAggr: path.Join(outDir, "soong/metrics_aggregation"),
-		soongBuild:       path.Join(outDir, "soong/build"),
+		buildDate:          path.Join(outDir, "build_date.txt"),
+		soongBuildDate:     path.Join(outDir, "soong/build_date.txt"),
+		soongBuildHostname: path.Join(outDir, "soong/build_hostname.txt"),
+		soongTemp:          path.Join(outDir, "soong/.temp") + "/",
+		soongMetricsAggr:   path.Join(outDir, "soong/metrics_aggregation"),
+		soongBuild:         path.Join(outDir, "soong/build"),
 	}
 }
 
-// isOrderOnlyForcedHonor indicates that if the specified order-only path should be honored as
-// order-only, regardless of the OrderOnlyAsRegularInput config.
-func (c *ABFSBackend) isOrderOnlyForcedHonor(p string) bool {
+// isBuildMetadata reports whether p is build metadata that soong_ui rewrites for every
+// build, so its content must not decide whether a cached result applies.
+func (c *ABFSBackend) isBuildMetadata(p string) bool {
 	if strings.HasPrefix(p, c.matchFiles.buildDate) {
 		return true
 	}
 	if strings.HasPrefix(p, c.matchFiles.soongBuildDate) {
 		return true
 	}
+	if strings.HasPrefix(p, c.matchFiles.soongBuildHostname) {
+		return true
+	}
 	return false
+}
+
+// isOrderOnlyForcedHonor indicates that if the specified order-only path should be honored as
+// order-only, regardless of the OrderOnlyAsRegularInput config.
+func (c *ABFSBackend) isOrderOnlyForcedHonor(p string) bool {
+	return c.isBuildMetadata(p)
 }
 
 func (c *ABFSBackend) orderOnlyAsRegularInput(p string) bool {
@@ -66,6 +77,12 @@ func (c *ABFSBackend) orderOnlyAsRegularInput(p string) bool {
 // we are matching the read patch against the filesystem (here), we can decide whether to ignore any
 // information.
 func (c *ABFSBackend) ignoreMatch(ent *entities.PatchEntry) bool {
+	// Build rules read the build metadata without declaring it, and stock ninja does not
+	// rerun them when it changes.
+	if c.isBuildMetadata(ent.Path) {
+		return true
+	}
+
 	// Ignore the order-only entries
 	if ent.State.IsOrderOnly() && !c.orderOnlyAsRegularInput(ent.Path) {
 		return true

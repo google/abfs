@@ -43,6 +43,7 @@ func stats(c *ABFSBackend, err error) binding.NinjaStats {
 		CacheMissCount:  uint32(states[build.StateDone]),
 		NinjaEntryFile:  c.ninjaEntryFile,
 		BuildFiles:      c.ninjaFiles,
+		BuildMetadata:   c.metadata,
 	}
 	if err != nil {
 		s.Error = err.Error()
