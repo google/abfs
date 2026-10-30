@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -127,11 +126,7 @@ func NewClient(rootDir, socketName string, cacheDir string, localOnly bool, fetc
 	}
 
 	cli := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", filepath.Join(root, socketName))
-			},
-		},
+		Transport: client.NewUnixTransport(filepath.Join(root, socketName)),
 	}
 
 	store, err := store.NewCASStore(cacheDir, localOnly, fetchTimeout)

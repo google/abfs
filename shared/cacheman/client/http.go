@@ -16,12 +16,10 @@ package client
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"path"
 	"time"
@@ -37,11 +35,7 @@ type HttpClient struct {
 
 func NewHTTPClient(cacheDir string) *HttpClient {
 	httpClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", path.Join(cacheDir, "http.socket"))
-			},
-		},
+		Transport: NewUnixTransport(path.Join(cacheDir, "http.socket")),
 	}
 	return &HttpClient{
 		http: httpClient,
