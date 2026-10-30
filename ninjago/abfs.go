@@ -514,7 +514,8 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 		eval.cacheEnd = time.Now()
 	}()
 
-	if c.config.EvalNoCache {
+	// A phony_output step runs on every build, so it is never looked up or recorded.
+	if c.config.EvalNoCache || eval.step.IsPhonyOutput() {
 		return false, nil
 	}
 
@@ -930,12 +931,21 @@ func (c *ABFSBackend) execTapLocal(ctx context.Context, eval *Eval) (*binding.Ev
 	}
 
 	if tapResult.ExitCode == 0 {
-		if err := c.abfs.Store().AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
-		}
+		c.addMapResult(ctx, eval, resp)
 	}
 
 	return resp, nil
+}
+
+// addMapResult records resp as a result of eval's request. A phony_output step runs on every
+// build, so its result is not recorded.
+func (c *ABFSBackend) addMapResult(ctx context.Context, eval *Eval, resp *binding.EvalResponse) {
+	if eval.step.IsPhonyOutput() {
+		return
+	}
+	if err := c.abfs.Store().AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
+	}
 }
 
 func (c *ABFSBackend) lookup(fname string) (*HashStat, error) {
@@ -978,13 +988,19 @@ func shouldIgnoreInput(fname string) bool {
 	return false
 }
 
-// addInput uses the inputSet to efficiently look recursively through phony rules to see if the input needs to be added.
+// isPhonyNode reports whether the outputs of n are not files: a phony build, or a build with
+// phony_output set on it or on its rule. Kati writes a .PHONY target with a recipe that way.
+func isPhonyNode(n *graph.Node) bool {
+	return n.Build.Rule.IsPhony() || n.Build.Scope.ExpandField("phony_output") != ""
+}
+
+// addInput uses the inputSet to efficiently look recursively through phony and phony_output builds to see if the input needs to be added.
 func (c *ABFSBackend) addInput(fname string, isOrderOnly bool, inputs *[]entities.PatchEntry, inputSet map[string]struct{}) error {
 	if shouldIgnoreInput(fname) {
 		return nil
 	}
-	if n := c.graph.Targets.Get(fname); n != nil && n.Build.Rule.IsPhony() {
-		// Traverse phony targets recursively to add to the input list
+	if n := c.graph.Targets.Get(fname); n != nil && isPhonyNode(n) {
+		// Traverse phony and phony_output targets recursively to add to the input list
 		for i, ins := range n.Build.AllInputs() {
 			for _, in := range ins {
 				if _, exists := inputSet[in]; !exists {
