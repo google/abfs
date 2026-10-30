@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/mod/semver"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -132,6 +133,8 @@ type GrpcDialOpts struct {
 	RetryPolicy      string
 	DisableTLS       bool
 	SkipHealthCheck  bool
+	// OutageClock, if set, makes calls to the ABFS service wait for an unreachable server.
+	OutageClock *OutageClock
 }
 
 type tokenSourceCreds struct {
@@ -168,6 +171,20 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	if o.RetryPolicy != "" {
 		opts = append(opts, grpc.WithDefaultServiceConfig(o.RetryPolicy))
 	}
+	// gRPC's default reconnect backoff grows to 120 s, so after a long outage a client could
+	// keep failing calls for minutes after the server is back.
+	opts = append(opts, grpc.WithConnectParams(grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay:  time.Second,
+			Multiplier: 1.6,
+			Jitter:     0.2,
+			MaxDelay:   5 * time.Second,
+		},
+		MinConnectTimeout: 20 * time.Second,
+	}))
+	if o.OutageClock != nil {
+		opts = append(opts, grpc.WithChainUnaryInterceptor(serverWaitInterceptor(o.ServiceName, o.OutageClock)))
+	}
 
 	var creds credentials.TransportCredentials
 	if o.DisableTLS {
@@ -203,6 +220,9 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(o.Address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial address %s: %v", o.Address, err)
+	}
+	if o.OutageClock != nil {
+		o.OutageClock.conn = conn
 	}
 
 	if !o.SkipHealthCheck {

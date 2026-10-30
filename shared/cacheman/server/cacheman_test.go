@@ -2134,3 +2134,65 @@ func TestMaintenanceAndEvictionRace(t *testing.T) {
 	require.NoError(t, c.maintenanceWork())
 	require.Nil(t, c.index.Get(keptHash), "cleaned hash must not be resurrected by subsequent maintenance")
 }
+
+// mockWaitingABFSClient fails like mockFailingABFSClient and reports whether calls still wait for the server.
+type mockWaitingABFSClient struct {
+	mockFailingABFSClient
+	waiting bool
+}
+
+func (m *mockWaitingABFSClient) WaitingForServer() bool {
+	return m.waiting
+}
+
+func TestCheckRemoteHealth_WaitsForServerBeforeENOTCONN(t *testing.T) {
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	logDir := filepath.Join(tempDir, "log")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+	require.NoError(t, os.MkdirAll(logDir, 0755))
+
+	falseVal := false
+	flagsConfig := &instance.ConfigOptional{
+		CacheDir:  &cacheDir,
+		LogDir:    &logDir,
+		LocalOnly: &falseVal,
+	}
+
+	inst := instance.NewInstance("default", tempDir, tempDir, "abfs", flagsConfig, instance.DefaultFlavor)
+	defer func() {
+		require.NoError(t, inst.Close())
+	}()
+
+	c, err := New(inst, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, c.Stop())
+	}()
+	c.setCheckCreds(func(ctx context.Context) error { return nil })
+	errFile := filepath.Join(cacheDir, StatusDirName, RemoteErrFileName)
+
+	// While calls wait for the server, the mount stays usable, but the check still fails and
+	// remote.err records the outage for the mount preflight and abfs doctor.
+	mock := &mockWaitingABFSClient{mockFailingABFSClient: mockFailingABFSClient{err: errors.New("connection refused")}, waiting: true}
+	c.abfsClient = mock
+	require.Error(t, c.checkRemoteHealth(context.Background()))
+	require.Equal(t, int32(0), c.HealthStatus())
+	_, err = os.Stat(errFile)
+	require.NoError(t, err)
+	require.Equal(t, remoteHealthRetryPeriod, c.remoteHealthPeriod())
+
+	// Once calls stop waiting, the outage is reported.
+	mock.waiting = false
+	require.Error(t, c.checkRemoteHealth(context.Background()))
+	require.Equal(t, int32(syscall.ENOTCONN), c.HealthStatus())
+
+	// The server answers again.
+	c.abfsClient = inmemory.New()
+	require.NoError(t, c.checkRemoteHealth(context.Background()))
+	require.Equal(t, int32(0), c.HealthStatus())
+	_, err = os.Stat(errFile)
+	require.True(t, os.IsNotExist(err))
+	require.Equal(t, remoteHealthCheckPeriod, c.remoteHealthPeriod())
+}

@@ -261,6 +261,21 @@ EOF
 
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
+### When the server is unavailable
+
+Clients wait for a server that is stopped or restarting, or whose address does not answer, so a server restart does not fail the builds, mounted workspaces and git-pushers that use it:
+
+* Calls to the server keep trying for up to `server-wait-timeout` (1 minute by default), counted from the first failed call to that server. After that, calls fail with `server unreachable for ...`, without trying while gRPC knows the server is down, until the server answers again. Set it with `--server-wait-timeout` or in the client configuration; `0` makes calls fail after gRPC's own retries, about 7 seconds.
+* `server-wait-timeout` is kept below `fetch-timeout` (2 minutes by default); a larger value is reduced to half of `fetch-timeout`. To wait longer, raise both.
+* A download that is cut continues where it stopped once the server is back. The server sends the object again from its start and the client skips what it already has, which takes time for very large objects.
+* An upload that cannot start waits like any other call. An upload that is cut while it runs starts over: cacheman sends it again with a pause that grows after each failure, up to 10 minutes, so `abfs cacheman wait` can take that long after the server is back; git-pusher sends it again on its next cycle, every minute by default; a command that uploads directly, such as `abfs --no-local-cache push`, fails and has to be run again.
+* In a mounted workspace, reads of files that are not cached yet wait for the server. After `server-wait-timeout` they fail with an I/O error until the server is back. Files already cached can still be read, and writes are not affected.
+* After the server is back, clients reconnect within about 5 seconds. When the server's address drops packets instead of refusing connections, for example while its machine restarts, each attempt to connect takes up to 20 seconds, and noticing the server's return takes up to about 25 seconds.
+* Clients notice a server that is gone when its connections are closed or refused, as when the server process stops or its machine restarts. If the machine disappears without closing them (it crashes or loses its network), a connection that was open stays open on the client until the operating system gives up on it, about 15 minutes on Linux, and calls on it wait that long.
+* `abfs mount` and other commands that check the server when they start fail while it is unreachable, also within `server-wait-timeout`. cacheman starts without the server and connects once it is back.
+* If cacheman itself restarts, the mount refuses writes until cacheman runs again, whether or not the server is reachable.
+* With several `--remote-servers`, objects are spread over the servers and an unreachable server affects only its share of them. All refs are kept on one of the servers, so ref calls wait for that one.
+
 ### Push repo
 
 This is run on the client you set up above.

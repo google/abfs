@@ -49,6 +49,9 @@ type recvStream struct {
 	encoding       string
 	stream         Stream
 	openStream     func() (Stream, error)
+	ctx            context.Context
+	clock          *OutageClock
+	reached        bool
 	newChunker     func() Chunker
 	releaseChunker func(Chunker)
 	currChunker    Chunker
@@ -64,24 +67,34 @@ type Chunker interface {
 var _ remote.ContentReadCloser = (*recvStream)(nil)
 
 func newSimpleRecvStream(stream Stream, newChunker func() Chunker, releaseChunker func(Chunker)) (*recvStream, error) {
-	return newRecvStream(stream, nil, newChunker, releaseChunker)
+	return newRecvStream(context.Background(), nil, stream, nil, newChunker, releaseChunker)
 }
 
-func newResumableRecvStream(openStream func() (Stream, error), newChunker func() Chunker, releaseChunker func(Chunker)) (*recvStream, error) {
-	return newRecvStream(nil, openStream, newChunker, releaseChunker)
+// newResumableRecvStream opens a stream that is reopened when it is cut. With an enabled clock, opening
+// and reopening wait for an unreachable server.
+func newResumableRecvStream(ctx context.Context, clock *OutageClock, openStream func() (Stream, error), newChunker func() Chunker, releaseChunker func(Chunker)) (*recvStream, error) {
+	return newRecvStream(ctx, clock, nil, openStream, newChunker, releaseChunker)
 }
 
-func newRecvStream(stream Stream, openStream func() (Stream, error), newChunker func() Chunker, releaseChunker func(Chunker)) (*recvStream, error) {
+func newRecvStream(ctx context.Context, clock *OutageClock, stream Stream, openStream func() (Stream, error), newChunker func() Chunker, releaseChunker func(Chunker)) (*recvStream, error) {
 	s := &recvStream{
 		stream:         stream,
 		openStream:     openStream,
+		ctx:            ctx,
+		clock:          clock,
 		newChunker:     newChunker,
 		releaseChunker: releaseChunker,
 	}
 
 	if s.stream == nil && s.openStream != nil {
+		if s.clock.gaveUp() {
+			return nil, s.clock.unreachable(ctx, errTransientFailure)
+		}
 		var err error
 		s.stream, err = s.openStream()
+		if err != nil && s.clock.enabled() && status.Code(err) == codes.Unavailable {
+			err = s.reopenWithWait(err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -154,6 +167,10 @@ func (s *recvStream) receive() error {
 		chunker := s.newChunker()
 		err := s.stream.RecvMsg(chunker)
 		if err == nil {
+			if !s.reached {
+				s.clock.Reached()
+				s.reached = true
+			}
 			chunk := chunker.GetChunk()
 			if len(chunk.Key) > 0 {
 				s.key = HashFromInputBytes(chunk.Key)
@@ -181,13 +198,43 @@ func (s *recvStream) receive() error {
 			return rewrapNotFound(err)
 		}
 
-		// Retry logic
-		time.Sleep(100 * time.Millisecond) // Simple backoff
-		if err := s.reopenAndSkip(); err != nil {
-			return err
+		if s.clock.enabled() {
+			if err := s.reopenWithWait(err); err != nil {
+				return err
+			}
+		} else {
+			// Retry logic
+			time.Sleep(100 * time.Millisecond) // Simple backoff
+			if err := s.reopenAndSkip(); err != nil {
+				return err
+			}
 		}
 		if len(s.buf) > 0 || s.last {
 			return nil
+		}
+	}
+}
+
+// reopenWithWait reopens a cut stream and skips what was read, trying again while the clock lets
+// calls wait for the server.
+func (s *recvStream) reopenWithWait(cause error) error {
+	time.Sleep(100 * time.Millisecond)
+	for {
+		if s.clock.gaveUp() {
+			return s.clock.unreachable(s.ctx, cause)
+		}
+		s.reached = false
+		err := s.reopenAndSkip()
+		if err == nil {
+			return nil
+		}
+		// Only an unreachable server is worth waiting for; other errors keep the single reopen.
+		if status.Code(err) != codes.Unavailable {
+			return err
+		}
+		cause = err
+		if !s.clock.waitForServer(s.ctx) {
+			return s.clock.unreachable(s.ctx, cause)
 		}
 	}
 }
@@ -218,12 +265,23 @@ func (s *recvStream) reopenAndSkip() error {
 			}
 			return fmt.Errorf("failed to skip bytes during stream resumption: %w", err)
 		}
+		if !s.reached {
+			s.clock.Reached()
+			s.reached = true
+		}
 		chunk := chunker.GetChunk()
 
 		if len(chunk.Key) > 0 {
 			s.key = HashFromInputBytes(chunk.Key)
 		}
 		if chunk.Encoding != "" {
+			if s.encoding != "" && chunk.Encoding != s.encoding {
+				if s.releaseChunker != nil {
+					s.releaseChunker(chunker)
+				}
+				// The bytes already read are in the old encoding, so the rest cannot follow them.
+				return fmt.Errorf("cannot resume stream: encoding changed from %q to %q", s.encoding, chunk.Encoding)
+			}
 			s.encoding = chunk.Encoding
 		}
 

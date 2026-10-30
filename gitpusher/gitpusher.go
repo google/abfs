@@ -47,6 +47,7 @@ type GitPusher struct {
 	projectStoragePath string
 	servers            []string
 	authInfo           instance.AuthInfo
+	serverWaitTimeout  time.Duration
 	shgit              *shellgit.ShellGit
 
 	startTime     time.Time
@@ -66,6 +67,8 @@ type NewGitPusherArgs struct {
 	StoragePath  string
 	Servers      []string
 	AuthInfo     instance.AuthInfo
+	// ServerWaitTimeout is how long calls wait for an unreachable server.
+	ServerWaitTimeout time.Duration
 }
 
 func NewGitPusher(args *NewGitPusherArgs) *GitPusher {
@@ -76,6 +79,7 @@ func NewGitPusher(args *NewGitPusherArgs) *GitPusher {
 		projectStoragePath: args.StoragePath,
 		servers:            args.Servers,
 		authInfo:           args.AuthInfo,
+		serverWaitTimeout:  args.ServerWaitTimeout,
 		shgit:              &shellgit.ShellGit{BinPath: args.GitBin},
 	}
 }
@@ -84,8 +88,9 @@ func (g *GitPusher) Run(ctx context.Context) error {
 	g.startTime = time.Now()
 
 	client, err := abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
-		Servers:  g.servers,
-		AuthInfo: g.authInfo,
+		Servers:           g.servers,
+		AuthInfo:          g.authInfo,
+		ServerWaitTimeout: g.serverWaitTimeout,
 	})
 	if err != nil {
 		return err
