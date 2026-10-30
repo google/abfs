@@ -118,7 +118,11 @@ func ForkDaemon(cmd *exec.Cmd) (retErr error) {
 	// Propagate signals to the daemon before the switch happens
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, os.Signal(syscall.SIGABRT), os.Signal(syscall.SIGTERM), os.Signal(syscall.SIGQUIT))
-	defer close(sigChan)
+	defer func() {
+		// A signal after this returns would otherwise be sent on the closed channel.
+		signal.Stop(sigChan)
+		close(sigChan)
+	}()
 	go func() {
 		for s := range sigChan {
 			if err := cmd.Process.Signal(s); err != nil {

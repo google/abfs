@@ -69,5 +69,8 @@ func (c *TailCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	cmd := exec.CommandContext(ctx, "tail", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
 }
