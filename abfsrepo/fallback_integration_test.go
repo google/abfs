@@ -330,3 +330,109 @@ func TestFallbackToGit_EndToEnd(t *testing.T) {
 		t.Errorf("expected feature-branch to retain 'Add new feature', got: %s", branchLogOut)
 	}
 }
+
+// refsCASStore answers ref lookups from a fixed map, for any server and project.
+type refsCASStore struct {
+	stubCASStore
+	refs map[string]entities.Hash
+}
+
+func (s *refsCASStore) GetRefs(server, project string, refs []string) ([]entities.Hash, error) {
+	hashes := make([]entities.Hash, len(refs))
+	for i, ref := range refs {
+		hashes[i] = s.refs[ref]
+	}
+	return hashes, nil
+}
+
+func TestFallbackToGit_ManifestResync(t *testing.T) {
+	testDir := t.TempDir()
+	manifestRemote := filepath.Join(testDir, "remotes", "manifest.git")
+	gitRepoRemote := filepath.Join(testDir, "remotes", "git-repo.git")
+	manifestXML := `<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="origin" fetch="/nonexistent" />
+  <default revision="main" remote="origin" />
+</manifest>
+`
+	setupRemoteRepo(t, manifestRemote, "main", map[string]string{"default.xml": manifestXML})
+	setupRemoteRepo(t, gitRepoRemote, "stable", map[string]string{"repo": "#!/bin/sh\n"})
+
+	work := t.TempDir()
+	runGit(t, work, "clone", "-q", manifestRemote, ".")
+	commitMain := func(msg string) string {
+		if err := os.WriteFile(filepath.Join(work, "default.xml"), []byte(manifestXML+"<!-- "+msg+" -->\n"), 0644); err != nil {
+			t.Fatalf("failed to write default.xml: %v", err)
+		}
+		runGit(t, work, "commit", "-q", "-am", msg)
+		runGit(t, work, "push", "-q", "origin", "main")
+		return strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+	}
+	tagged := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+	runGit(t, work, "tag", "v1")
+	runGit(t, work, "tag", "-a", "-m", "v1a", "v1a")
+	runGit(t, work, "push", "-q", "origin", "v1", "v1a")
+	tagObject := entities.NewHash(strings.TrimSpace(runGit(t, work, "rev-parse", "v1a")))
+	commitMain("after the tags")
+
+	tests := []struct {
+		name   string
+		branch string
+		refs   map[string]entities.Hash
+		pinned bool
+	}{
+		{name: "branch", branch: "main"},
+		{name: "tag", branch: "v1", refs: map[string]entities.Hash{"refs/tags/v1": entities.NewHash(tagged)}, pinned: true},
+		{name: "annotated tag", branch: "v1a", refs: map[string]entities.Hash{"refs/tags/v1a": tagObject}, pinned: true},
+		{name: "commit hash", branch: tagged, pinned: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			wsDir := t.TempDir()
+			store := &refsCASStore{refs: tt.refs}
+			casfs := &stubCASFS{}
+			opts := abfsrepo.RepoOpts{
+				Store: store,
+				CASFS: casfs,
+				Git:   casgit.NewWithCASFS(store, casfs),
+			}
+
+			if err := abfsrepo.NewRepoForceRoot(opts, wsDir).Init(ctx, abfsrepo.InitOpts{
+				ManifestURL:    manifestRemote,
+				ManifestBranch: tt.branch,
+				ManifestName:   "default.xml",
+				RepoURL:        gitRepoRemote,
+				RepoRev:        "stable",
+				FallbackToGit:  true,
+			}); err != nil {
+				t.Fatalf("repo.Init failed: %v", err)
+			}
+
+			mainHead := commitMain("after init of " + tt.name)
+
+			// Move the manifest off the commit the clone left it at, so the sync has to put it back.
+			manifests := filepath.Join(wsDir, ".repo", "manifests")
+			runGit(t, manifests, "fetch", "-q", "origin", "main")
+			runGit(t, manifests, "checkout", "-q", "--detach", "FETCH_HEAD")
+			// A new Repo, as `abfs repo sync` reads the manifest branch back from the config.
+			repo := abfsrepo.NewRepoForceRoot(opts, wsDir)
+			if err := repo.Load(ctx); err != nil {
+				t.Fatalf("repo.Load failed: %v", err)
+			}
+			if err := repo.Sync(ctx, nil, abfsrepo.SyncOpts{Jobs: 1, FallbackToGit: true}); err != nil {
+				t.Fatalf("repo.Sync failed: %v", err)
+			}
+
+			want := mainHead
+			if tt.pinned {
+				want = tagged
+			}
+			got := strings.TrimSpace(runGit(t, manifests, "rev-parse", "HEAD"))
+			if got != want {
+				t.Errorf("manifests at %s, expected %s", got, want)
+			}
+		})
+	}
+}

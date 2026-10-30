@@ -295,22 +295,47 @@ func determineFallbackBranch(upstream, defaultRevision, revision string) (string
 }
 
 func (r *Repo) updateManifest(ctx context.Context, fallbackToGit bool) error {
-	if strings.TrimPrefix(r.manifestBranch, "refs/heads/") == "" {
+	name := strings.TrimPrefix(r.manifestBranch, "refs/heads/")
+	if name == "" {
 		return nil
 	}
+	target, gitTarget := r.manifestTarget(ctx, name)
 	gitDir := path.Join(r.dotRepo, "manifests.git")
 	objDir := path.Join(gitDir, "objects")
 	// origin should be the remote name because manifest itself couldn't specify remote name
 	gitRepo := casgit.NewGitRepo(r.Git, r.manifestsDir, gitDir, objDir)
-	err := r.updateGitRepo(ctx, gitRepo, "manifests", r.manifestsDir, gitDir, objDir, "origin", r.manifestBranch, SyncOpts{})
+	err := r.updateGitRepo(ctx, gitRepo, "manifests", r.manifestsDir, gitDir, objDir, "origin", target, SyncOpts{})
 	if err != nil && fallbackToGit {
 		log.Printf("ABFS update for manifests failed (%v), falling back to git...", err)
 		if fetchErr := r.shellGit.Fetch(gitDir); fetchErr != nil {
 			log.Printf("Warning: git fetch fallback for manifests failed: %v", fetchErr)
 		}
-		return r.shellGit.Checkout(r.manifestsDir, r.manifestBranch)
+		return r.shellGit.Checkout(r.manifestsDir, gitTarget)
 	}
 	return err
+}
+
+// manifestTarget returns what the manifest project is checked out at by casgit and by git.
+// abfs repo init stores every -b value under refs/heads/, so the name is resolved again
+// as the first clone resolves it, and a tag is checked out at its hash.
+func (r *Repo) manifestTarget(ctx context.Context, name string) (target, gitTarget string) {
+	// A full ref, stored as typed by git-repo's repo init or after the git fallback clone,
+	// is checked out by git as given.
+	if entities.IsHash(name) || strings.HasPrefix(name, "refs/") {
+		return name, name
+	}
+	if u, err := url.Parse(r.manifestURL); err == nil {
+		hash, ref, err := r.Git.ResolveRef(ctx, u.Host, strings.Trim(u.Path, "/"), name)
+		if err != nil {
+			// The fetch reports an unreachable server; a git fallback may still work.
+			log.Printf("Warning: cannot resolve manifest revision %s, treating it as a branch: %v", name, err)
+		} else if strings.HasPrefix(ref, "refs/tags/") {
+			return hash.String(), hash.String()
+		}
+	}
+	// A git clone of the manifest has no local branch, and the fetch does not move one, so
+	// git checks out the remote branch.
+	return name, "refs/remotes/origin/" + name
 }
 
 func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision string, opts SyncOpts) error {
