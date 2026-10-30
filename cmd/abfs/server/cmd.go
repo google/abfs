@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -25,6 +26,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 
 	aresgrpc "github.com/google/abfs/ares/grpc"
 	arespb "github.com/google/abfs/ares/grpc/proto"
@@ -46,6 +49,7 @@ type serverCmd struct {
 	noHashValidation bool
 	noLogging        bool
 	maxConnectionAge time.Duration
+	shutdownTimeout  time.Duration
 	aresEnabled      bool
 	tlsCertFile      string
 	tlsKeyFile       string
@@ -62,7 +66,7 @@ func NewCmd(rootCmd *root.RootCmd) *serverCmd {
 func (c *serverCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:        "server",
-		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
+		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--shutdown-timeout <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
 		Aliases:     []string{},
 		Desc:        `Start ABFS server for blobs, objects and map results.`,
 		Subcommands: c.subcommands(),
@@ -76,6 +80,7 @@ func (c *serverCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.IntVarP(&c.port, "port", "p", 50051, "The server port")
 	fl.IntVar(&c.httpPort, "http-port", 0, "The http (v1) server port")
 	fl.DurationVar(&c.maxConnectionAge, "max-connection-age", 0, "A duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. Supports units like '1h', '30m', '1s'. Default is 0 (no limit).")
+	fl.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 25*time.Second, "How long to wait for pending RPCs on shutdown before closing their connections, so that a stalled or vanished client cannot keep the server from exiting. Keep it below the time your process manager waits before killing the server. 0 means no limit.")
 	// TODO: override hashpath or some other solution for local testing?
 	fl.BoolVar(&c.aresEnabled, "ares-enabled", false, fmt.Sprintf("Polls the hashpath %q for the list of ARES servers to proxy to", aresgrpc.ConfigARESServersHashPath))
 	fl.StringVar(&c.tlsCertFile, "tls-cert-file", "", "Path to the TLS certificate file")
@@ -169,6 +174,39 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		}
 	}()
 
-	log.Printf("server listening at %v serving", lis.Addr())
-	return s.Serve(lis)
+	return serveGRPC(ctx, s, lis, c.shutdownTimeout)
+}
+
+// serveGRPC serves s on lis until ctx is canceled or s fails, then stops s
+// gracefully, closing the remaining connections after timeout.
+func serveGRPC(ctx context.Context, s *grpc.Server, lis net.Listener, timeout time.Duration) error {
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		<-ctx.Done()
+		log.Printf("Shutting down gRPC server gracefully so pending RPCs can finish...")
+		// GracefulStop waits for every handler to return, also for clients
+		// that stopped reading or vanished. Stop cancels their contexts, so the
+		// timeout bounds the shutdown for handlers that honour them. Waiting
+		// for GracefulStop keeps the backend Close after every handler.
+		if timeout > 0 {
+			timer := time.AfterFunc(timeout, func() {
+				log.Printf("Pending RPCs did not finish within %s, closing their connections", timeout)
+				s.Stop()
+			})
+			defer timer.Stop()
+		}
+		s.GracefulStop()
+		return nil
+	})
+
+	g.Go(func() error {
+		log.Printf("server listening at %v serving", lis.Addr())
+		if err := s.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			return fmt.Errorf("failed to serve: %w", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
