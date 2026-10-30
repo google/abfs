@@ -84,6 +84,11 @@ mkdir $MOUNT
 abfs mount --ws dev --branch android-latest-release $MOUNT
 ```
 
+This example mounts at a path relative to the current directory, which is fine on
+one machine. Hosts that share a cache should mount the workspace at the same
+absolute path. See
+[Mount at the same path on every host](WORKSPACES.md#mount-at-the-same-path-on-every-host).
+
 ### Build
 
 Replace the below commands with your desired `lunch` target and build goal.
