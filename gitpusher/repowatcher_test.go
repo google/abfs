@@ -15,11 +15,16 @@
 package gitpusher
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/google/abfs/manifest"
 	"github.com/stretchr/testify/require"
+
+	shellgit "github.com/google/abfs/git"
+	"github.com/google/abfs/manifest"
 )
 
 func TestForAllManifests(t *testing.T) {
@@ -246,4 +251,41 @@ func TestForAllManifests_CycleInfiniteLoop(t *testing.T) {
 		return nil
 	})
 	require.NoError(err)
+}
+
+func TestRepoWatcher_StatDuringList(t *testing.T) {
+	repoPath := filepath.Join(t.TempDir(), "manifest.git")
+	require.NoError(t, ensureGitRepo(repoPath))
+	configContent := `[core]
+	repositoryformatversion = 0
+	bare = true
+[remote "origin"]
+	url = ` + filepath.Join(t.TempDir(), "missing.git") + `
+	fetch = +refs/heads/*:refs/remotes/origin/*
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "config"), []byte(configContent), 0644))
+
+	m := &RepoWatcher{
+		config:     &RepoConfig{Manifest: ManifestConfig{Server: "example.com", Project: "manifest"}},
+		dirPath:    repoPath,
+		remoteName: "origin",
+		shgit:      &shellgit.ShellGit{BinPath: "/usr/bin/git"},
+		state:      RepoWatcherInitialized,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			_ = m.Stat()
+		}
+	}()
+	for range 3 {
+		_, err := m.ListProjects(context.Background())
+		require.Error(t, err, "listing from a missing remote must fail")
+	}
+	cancel()
+	<-done
+	require.NotEmpty(t, m.Stat().LastError)
 }
