@@ -69,6 +69,10 @@ func TestFolder(t *testing.T) {
 		"server1/b/c/d":  hash2,
 		"server1/b/c/d2": hash4,
 	}, f.GetChildren("server1/b"))
+	assert.Equal(t, map[string]entities.Hash{
+		"server1/b/c/d":  hash2,
+		"server1/b/c/d2": hash4,
+	}, f.GetChildren("server1/b/"))
 	require.NoError(t, f.Add("server1/b/e", hash1))
 	assert.Equal(t, map[string]entities.Hash{
 		"server1/b/c/d":  hash2,
