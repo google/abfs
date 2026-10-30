@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/spf13/pflag"
 
@@ -60,5 +61,10 @@ func (c *fileBasedCmd) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS server using directory %s: %w", c.localDir, err)
 	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("WARNING: error closing ABFS server: %v", err)
+		}
+	}()
 	return c.Serve(ctx, server)
 }

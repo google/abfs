@@ -105,6 +105,19 @@ abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE file-based --local-d
 
 </details>
 
+#### Stopping the server
+
+The server stops gracefully on `SIGTERM` or `SIGINT` (Ctrl+C): it stops accepting connections, lets in-flight requests finish, closes its files and exits with status 0. Requests still running after `--shutdown-timeout` (25s by default) have their connections closed, and the server still exits with status 0, so a client that stopped reading or went away cannot keep the server from exiting. Size it from the time the largest transfer should be given to finish, and keep it below the time your service manager, container runtime or orchestrator waits before it kills the server. `--shutdown-timeout 0` waits for every request, however long it takes. It is a flag of `abfs server`, so it goes before the backend:
+
+```sh
+abfs server --port 50051 --shutdown-timeout 60s file-based --local-dir "$SERVER_DIR"
+```
+
+* The signal must reach the `abfs` process. If a wrapper script starts the server, start it with `exec` so that the server replaces the script.
+* A repeated `SIGTERM` is ignored while the server shuts down. A `SIGINT` after the first signal makes it exit at once, without waiting for in-flight requests. Every command of the `abfs` binary (including cacheman and git-pusher) handles signals this way.
+* With `--ares-enabled`, proxied ARES requests can run much longer than the default timeout; set `--shutdown-timeout` to match.
+* On the first signal the server's gRPC health service reports `NOT_SERVING` for every service. Behind a load balancer or a health checker that uses it, set `--drain-delay` to keep serving new requests for that long before the server stops accepting connections, so the balancer moves traffic away first. Size it from the health check interval times the unhealthy threshold, and count it in the time your process manager waits: the delay comes before `--shutdown-timeout`. The default, `0`, starts the drain at once. A client that watches health with the streaming `Watch` call keeps its stream open until `--shutdown-timeout` closes it, so with `--shutdown-timeout 0` such a client keeps the server from exiting.
+
 ### Configuration
 
 Some configuration of ABFS is still done through command-line flags, but we are trying to move everything to use configuration stored in the CAS itself for dynamic update purposes. We call this feature Hashpaths and you can read more in the [Hashpath code comments](../../shared/hashpath/README.md).
