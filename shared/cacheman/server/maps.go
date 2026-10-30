@@ -30,6 +30,9 @@ type MapsStore interface {
 	// Put adds a 'from'->'to' mapping.
 	Put(from, to entities.Hash) error
 
+	// ForEach calls fn for every mapping that has not expired.
+	ForEach(fn func(from, to entities.Hash) error) error
+
 	// Close closes the store.
 	Close() error
 }
@@ -56,6 +59,10 @@ func (m *Maps) Get(key entities.Hash) ([]entities.Hash, error) {
 
 func (m *Maps) Put(from, to entities.Hash) error {
 	return m.mapsStore.Put(from, to)
+}
+
+func (m *Maps) ForEach(fn func(from, to entities.Hash) error) error {
+	return m.mapsStore.ForEach(fn)
 }
 
 func (m *Maps) Close() error {

@@ -126,6 +126,7 @@ type CacheManStats struct {
 	EvictEnd     time.Time
 	EvictCount   int64
 	OldestObject time.Time
+	Mounts       int64
 	ClientStat
 	FetchBlobs    *QueueStat
 	FetchTrees    *QueueStat
