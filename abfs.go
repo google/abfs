@@ -1113,7 +1113,7 @@ func (a *ABFS) createProjectFromFSOperation(ctx context.Context, man *manifest.M
 	if err != nil {
 		return err
 	}
-	server = instance.MaybeRemoveScheme(server)
+	server = instance.Host(server)
 
 	status, err := a.projectStatus(ctx, server, project)
 	if err != nil {
@@ -1256,6 +1256,8 @@ func (a *ABFS) newCloneOptions(project *manifest.Project, projectURL string) cas
 
 	opts := casgit.CloneOptions{
 		RemoteRepo: projectURL,
+		RefServer:  instance.Host(projectURL),
+		RefProject: project.Name,
 		Directory:  fullPath,
 		Origin:     "origin",
 		GitDir:     filepath.Join(fullPath, ".git"),

@@ -41,6 +41,11 @@ type FetchOptions struct {
 	ObjectDir string
 	Quiet     bool
 	Verbose   bool
+
+	// RefServer and RefProject are the server and project the refs are stored
+	// under. When either is empty, they are the host and the path of the remote URL.
+	RefServer  string
+	RefProject string
 }
 
 type GitFetch struct {
@@ -257,5 +262,5 @@ func (f *GitFetch) setRemoteInfo() error {
 		return err
 	}
 
-	return f.setRemoteURL(remote.URL)
+	return f.setRemoteURL(remote.URL, f.RefServer, f.RefProject)
 }

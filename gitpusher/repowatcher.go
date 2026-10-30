@@ -408,7 +408,7 @@ func (p *projectMappings) updateProjectRemoteURLSet(set map[projectRemoteSchemeU
 
 		pru := projectRemoteSchemeURL{
 			name:   projectRemote.name,
-			server: u.Host,
+			server: instance.Host(resolvedSchemeURL),
 			remote: remote,
 			scheme: u.Scheme,
 			url:    instance.MaybeRemoveScheme(resolvedSchemeURL),

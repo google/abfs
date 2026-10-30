@@ -461,7 +461,7 @@ func resolutionOrder(rev string) []string {
 }
 
 func (r *Repo) updateRefs(url, ref string, refs projectMap) error {
-	results, err := r.store.SearchRefs(url, "", ref, 0)
+	results, err := r.store.SearchRefs(instance.Host(url), "", ref, 0)
 	if err != nil {
 		return fmt.Errorf("failed to SearchRefs for url: %q and ref: %q err: %w", url, ref, err)
 	}

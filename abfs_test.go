@@ -110,8 +110,10 @@ func TestTryOptimizedGitFallback(t *testing.T) {
 		Revision: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 	}
 	opts := casgit.CloneOptions{
-		Directory: "/tmp/test",
-		Origin:    "origin",
+		Directory:  "/tmp/test",
+		Origin:     "origin",
+		RefServer:  "gerrit.example.com",
+		RefProject: "test-project",
 	}
 
 	err := tryOptimizedGitFallbackImpl(mockGit, mockShGit, context.Background(), project, opts, nil, nil, "main")
@@ -120,6 +122,8 @@ func TestTryOptimizedGitFallback(t *testing.T) {
 	assert.Equal(t, "main", mockGit.lastOpts.Branch)
 	assert.True(t, mockGit.lastOpts.SingleBranch)
 	assert.True(t, mockGit.lastOpts.NoTags)
+	assert.Equal(t, "gerrit.example.com", mockGit.lastOpts.RefServer)
+	assert.Equal(t, "test-project", mockGit.lastOpts.RefProject)
 	assert.True(t, mockShGit.fetchCalled)
 	assert.True(t, mockShGit.checkoutCalled)
 	assert.Equal(t, project.Revision, mockShGit.lastRef)
@@ -148,4 +152,17 @@ func TestTryOptimizedGitFallback(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, mockGit.cloneCalled)
 	assert.Equal(t, "", mockGit.lastOpts.Branch)
+}
+
+func TestNewCloneOptions_RefKey(t *testing.T) {
+	a := &ABFS{}
+	project := &manifest.Project{
+		Name:     "platform/foo",
+		Revision: "main",
+	}
+
+	opts := a.newCloneOptions(project, "https://gerrit.example.com/a/platform/foo")
+	assert.Equal(t, "https://gerrit.example.com/a/platform/foo", opts.RemoteRepo)
+	assert.Equal(t, "gerrit.example.com", opts.RefServer)
+	assert.Equal(t, "platform/foo", opts.RefProject)
 }
