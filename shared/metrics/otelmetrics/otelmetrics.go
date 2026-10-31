@@ -61,7 +61,7 @@ func newProvider(enabled bool) metrics.Provider {
 	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
 	defer cancel()
 
-	res, err := telemetry.NewResource(ctx)
+	res, err := telemetry.Resource(ctx)
 	if err != nil {
 		log.Printf("Warning: metrics: failed to build the resource, falling back to Noop: %v", err)
 		return metrics.NewNoopProvider()
