@@ -35,6 +35,7 @@ import (
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
+	"github.com/google/abfs/shared/telemetry"
 	abfsversion "github.com/google/abfs/shared/version"
 
 	abfsclient "github.com/google/abfs/shared/remote/grpc/client"
@@ -567,8 +568,9 @@ func (d *Doctor) healthCheckServer() error {
 
 	servers := d.Instance.Config.EffectiveRemoteServers()
 	client, err := abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
-		Servers:  servers,
-		AuthInfo: d.Instance.Config.GetAuthInfo(),
+		Servers:      servers,
+		AuthInfo:     d.Instance.Config.GetAuthInfo(),
+		StatsHandler: telemetry.ClientHandler(),
 	})
 	if err != nil {
 		return err
