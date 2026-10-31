@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/metrics"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 type cliCommand struct {
@@ -299,7 +301,12 @@ func (c *CliExec) Run(fl *pflag.FlagSet) {
 		}
 	}()
 	exitErr = c.signalWrap(context.Background(), func(ctx context.Context) error {
-		err := c.loadProviders()
+		stopTracing, err := c.startTracing(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = c.loadProviders()
 		if err != nil {
 			return err
 		}
@@ -325,11 +332,21 @@ func (c *CliExec) Run(fl *pflag.FlagSet) {
 
 		defer func() {
 			// Up to 5 s of spacing from the last export, plus the export itself.
+			// Traces flush in parallel, so a slow metrics export leaves them time.
 			flushCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
+			var wg sync.WaitGroup
+			if stopTracing != nil {
+				wg.Go(func() {
+					if err := stopTracing(flushCtx); err != nil {
+						log.Printf("Failed to flush traces on exit: %v\n", err)
+					}
+				})
+			}
 			if err := lazyProvider.Close(flushCtx); err != nil {
 				log.Printf("Failed to flush metrics on exit: %v\n", err)
 			}
+			wg.Wait()
 		}()
 
 		for i := len(c.providers) - 1; i >= 0; i-- {
@@ -346,6 +363,28 @@ func (c *CliExec) Run(fl *pflag.FlagSet) {
 
 		return c.abfsCmd.Exec(ctx, fl)
 	})
+}
+
+// startTracing builds the tracer provider before the first dial and returns
+// its stop function, nil when traces are off. The resource needs the instance
+// name, so the config is resolved first, only when traces are on.
+func (c *CliExec) startTracing(ctx context.Context) (func(context.Context) error, error) {
+	if !telemetry.TracingEnabled() {
+		return nil, nil
+	}
+	configProvider, err := c.newConfigProvider()
+	if err != nil {
+		return nil, err
+	}
+	if configProvider.Instance != nil {
+		metrics.SetInstanceName(configProvider.Instance.Name)
+	}
+	stop, err := telemetry.StartTracing(ctx)
+	if err != nil {
+		log.Printf("Warning: traces: %v, continuing without traces", err)
+		return nil, nil
+	}
+	return stop, nil
 }
 
 func ABFSCmdToCli(cmd ABFSCmd) cli.Command {
