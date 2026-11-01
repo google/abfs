@@ -53,6 +53,7 @@ type MountRepoOpts struct {
 	Branch                 string
 	ManifestHash           entities.Hash
 	ManifestFile           string
+	BranchFile             string
 	Groups                 []string
 	Force                  bool
 	RefPrefix              string
@@ -89,7 +90,7 @@ func newMountRepoCmd(c *wsCmd) *mountRepoCmd {
 func (c *mountRepoCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:    "mount-repo",
-		Usage:   "[--ws <name> | --tmp-ws] [-b <branch> | -h <manifest-hash> | -f <manifest-file>] <mnt-point>",
+		Usage:   "[--ws <name> | --tmp-ws] [-b <branch> [--branch-file <file>] | -h <manifest-hash> | -f <manifest-file>] <mnt-point>",
 		Aliases: []string{},
 		Desc:    `Mount the new workspace at the given path`,
 		Hidden:  true,
@@ -103,6 +104,7 @@ func (c *mountRepoCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVarP(&c.Branch, "branch", "b", "", "Branch name")
 	fl.StringVarP(&c.manifestHexHash, "manifest-hash", "h", "", "A pinned manifest file hash (blob hash of a manifest xml)")
 	fl.StringVarP(&c.ManifestFile, "file", "f", "", "A pinned manifest file (like path to default.xml)")
+	fl.StringVar(&c.BranchFile, "branch-file", "default.xml", "Manifest file to use from the manifest branch")
 	fl.StringSliceVarP(&c.Groups, "groups", "g", nil, "Groups to filter. Same as repo init -g")
 	fl.BoolVar(&c.Force, "force", false, "Attempt to unmount an existing casfs mount or create the mountpoint")
 	fl.StringVarP(&c.RefPrefix, "ref-prefix", "r", "", "Prefix that will be used in the ABFS meta refs for builds and mounts (default is user/$USER)")
@@ -412,7 +414,7 @@ func (c *mountRepoCmd) mount(ctx context.Context) error {
 	}
 }
 
-func (c *mountRepoCmd) repoInit(ctx context.Context) error {
+func (c *mountRepoCmd) repoInitArgs() []string {
 	manURL := new(url.URL)
 	manURL.Scheme = c.Config.ManifestScheme
 	manURL.Host = c.Config.ManifestServer
@@ -430,13 +432,19 @@ func (c *mountRepoCmd) repoInit(ctx context.Context) error {
 
 	if !c.ManifestHash.IsZero() || c.ManifestFile != "" {
 		args = append(args, "-m", c.pinnedManPath())
+	} else if c.BranchFile != "" {
+		args = append(args, "-m", c.BranchFile)
 	}
 
 	if c.FallbackToGit {
 		args = append(args, "--fallback-to-git")
 	}
 
-	cmd := exec.CommandContext(ctx, os.Args[0], args...)
+	return args
+}
+
+func (c *mountRepoCmd) repoInit(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, os.Args[0], c.repoInitArgs()...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -238,14 +238,15 @@ func (c *mountCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return err
 }
 
-func (c *mountCmd) workspaceMount(ctx context.Context) error {
-	mountRepoCmd := ws.NewMountRepoCmd(c.RootCmd, ws.MountRepoOpts{
+func (c *mountCmd) mountRepoOpts() ws.MountRepoOpts {
+	return ws.MountRepoOpts{
 		WSName:                 c.ws,
 		TempWS:                 c.tmpWS,
 		MountPoint:             c.mountPoint,
 		Branch:                 c.manBranch,
 		ManifestHash:           entities.NewHash(c.manFileHash),
 		ManifestFile:           c.manFile,
+		BranchFile:             c.manBranchFile,
 		Groups:                 c.groups,
 		Force:                  c.force,
 		RefPrefix:              c.metaRefPrefix,
@@ -255,7 +256,11 @@ func (c *mountCmd) workspaceMount(ctx context.Context) error {
 		ManifestServerPassword: c.manifestServerPassword,
 		IsSnapshot:             c.isSnapshot,
 		FallbackToGit:          c.fallbackToGit,
-	})
+	}
+}
+
+func (c *mountCmd) workspaceMount(ctx context.Context) error {
+	mountRepoCmd := ws.NewMountRepoCmd(c.RootCmd, c.mountRepoOpts())
 	mountRepoCmd.ConfigProvider = c.ConfigProvider
 	mountRepoCmd.StoreProvider = c.StoreProvider
 	mountRepoCmd.CachemanProvider = c.CachemanProvider
