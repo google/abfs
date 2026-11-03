@@ -21,10 +21,20 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"google.golang.org/grpc"
 
 	aresgrpc "github.com/google/abfs/ares/grpc"
 	arespb "github.com/google/abfs/ares/grpc/proto"
@@ -90,6 +100,7 @@ func (c *serverCmd) subcommands() []cmd.ABFSCmd {
 	return []cmd.ABFSCmd{
 		&inMemoryCmd{serverCmd: c},
 		&fileBasedCmd{serverCmd: c},
+		&gcpCmd{serverCmd: c},
 	}
 }
 
@@ -98,6 +109,13 @@ func (c *serverCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) error {
+	exporter, err := prometheus.New()
+	if err != nil {
+		return fmt.Errorf("failed to initialize prometheus exporter: %w", err)
+	}
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	otel.SetMeterProvider(provider)
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
@@ -136,19 +154,53 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		CertFile:                 c.tlsCertFile,
 		KeyFile:                  c.tlsKeyFile,
 		AuthEnabled:              c.authEnabled,
+		ExtraServerOpts: []grpc.ServerOption{
+			grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create gprc server: %w", err)
+		return fmt.Errorf("failed to create grpc server: %w", err)
 	}
+
+	var wg sync.WaitGroup
+	serverCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-sigChan:
+			log.Printf("received interrupt signal")
+		case <-serverCtx.Done():
+		}
+		cancel()
+		s.GracefulStop()
+		if err := abfsServer.Close(); err != nil {
+			log.Printf("WARNING: error closing abfs server: %v", err)
+		}
+		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer metricsCancel()
+		if err := provider.Shutdown(metricsCtx); err != nil {
+			log.Printf("WARNING: error shutting down metrics provider: %v", err)
+		}
+		if aresProxy != nil {
+			if err := aresProxy.Close(); err != nil {
+				log.Printf("WARNING: error stopping ares proxy: %v", err)
+			}
+		}
+	}()
 
 	go func() {
 		// This goroutine will be terminated when the main process exits.
-		lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", c.httpPort))
+		httpLis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.httpPort))
 		if err != nil {
 			log.Fatalf("Could not bind to port %d: %v", c.httpPort, err)
 		}
-		port := lis.Addr().(*net.TCPAddr).Port
-		log.Printf("Starting a web-server on http://localhost:%d/", port)
+		port := httpLis.Addr().(*net.TCPAddr).Port
+		log.Printf("Starting a web-server on http://localhost:%d/ (but available off of localhost)", port)
 		router := mux.NewRouter()
 		router.PathPrefix("/debug").Handler(http.DefaultServeMux)
 		router.Path("/mark/{hash}/{key}/{value}").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,11 +216,19 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 			}
 			_, _ = fmt.Fprintln(w, count)
 		})
-		if err := http.Serve(lis, router); err != nil {
+		if r, ok := abfsServer.(interface{ RegisterHTTPRoutes(*mux.Router) }); ok {
+			r.RegisterHTTPRoutes(router)
+		}
+		router.PathPrefix("/metrics").Handler(promhttp.Handler())
+		if err := http.Serve(httpLis, router); err != nil {
 			log.Fatalf("Error when starting or running http server: %v", err)
 		}
 	}()
 
 	log.Printf("server listening at %v serving", lis.Addr())
-	return s.Serve(lis)
+	if err := s.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+		return fmt.Errorf("failed to serve: %w", err)
+	}
+	wg.Wait()
+	return nil
 }

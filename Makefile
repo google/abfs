@@ -18,14 +18,15 @@ include makefiles/checks.mk
 include makefiles/version.mk
 include makefiles/destdir.mk
 
-VERSION_LDFLAGS := -X github.com/google/abfs/shared/version.version=$(VERSION)
+VERSION_LDFLAGS := -X github.com/google/abfs/shared/version.version=$(VERSION) \
+  -X github.com/google/abfs/shared/remote/servers/gcp.version=$(VERSION)
 
 # Optional: set EXPIRATION_EPOCH_SEC to build abfs binaries that expire at that
 # time (see `abfs expiration`). Empty means no expiration.
 
-.PHONY: all all-non-abfs abfs build-abfs ninjago abfsbox abfs-wrap-no-cgo tap-no-cgo ninjago-no-cgo abfsbox-no-cgo casfs-mounter casfuse-mounter install install-client install-pusher install-server maybe-copy-license doc abfs-bazel-daemon abfs-bazel-daemon-no-cgo install-hooks abfs-resources rbetap rbetap-no-cgo abfs-rbe
+.PHONY: all all-non-abfs abfs build-abfs ninjago abfsbox abfs-wrap-no-cgo tap-no-cgo ninjago-no-cgo abfsbox-no-cgo casfs-mounter casfuse-mounter install install-client install-pusher install-server abfs-server maybe-copy-license doc abfs-bazel-daemon abfs-bazel-daemon-no-cgo install-hooks abfs-resources rbetap rbetap-no-cgo abfs-rbe
 
-all: install-hooks abfs all-non-abfs
+all: install-hooks abfs all-non-abfs abfs-server
 	$(info )
 	$(info Installed in $(DESTDIR)! Run 'abfs init' if this is your first time using abfs, otherwise run 'abfs cacheman restart'.)
 
@@ -69,6 +70,10 @@ abfs-pusher: maybe-copy-license
 	  -X github.com/google/abfs/shared/version.expiration=$(EXPIRATION_EPOCH_SEC) \
 	  -X github.com/google/abfs/shared/instance.forceFlavor=abfs.pusher" \
 	  cmd/abfs/abfs.go
+
+abfs-server: maybe-copy-license
+	go build -ldflags="$(VERSION_LDFLAGS) -X github.com/google/abfs/shared/instance.forceFlavor=abfs.server" \
+	  -o $(DESTDIR)/abfs-server cmd/abfs-server/abfs-server.go
 
 build-abfs: maybe-copy-license
 	go build -ldflags="$(VERSION_LDFLAGS)" cmd/abfs/abfs.go
@@ -179,11 +184,11 @@ install-client: abfs-client all-non-abfs
 # Pusher only uses abfs binary
 install-pusher: abfs-pusher
 
-# Server only uses abfs binary
-install-server: abfs
+# Server uses abfs and abfs-server binaries
+install-server: abfs abfs-server
 
 clean:
-	rm -f $(DESTDIR)/abfs \
+	rm -f $(DESTDIR)/abfs $(DESTDIR)/abfs-server \
 	$(DESTDIR)/casfs-mounter $(DESTDIR)/casfuse-mounter \
 	$(DESTDIR)/tap-no-cgo \
 	$(DESTDIR)/abfsbox $(DESTDIR)/abfsbox-no-cgo \
