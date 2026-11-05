@@ -84,11 +84,12 @@ repos:
           file: partial.xml
 ```
 
-The pusher mirrors every `<project>` element of every file, including projects that a
-`remove-project` drops later; such a project costs push time, and a push error if the
-project does not exist on your Gerrit. It does not follow an `extend-project` that changes a
-project's `remote`: add that project under its new host to the `projects:` list of the pool
-config.
+The pusher applies `remove-project` and `extend-project` as the mount does. It mirrors the
+projects that each listed file checks out, under the remote that an `extend-project` gives
+them, so a mount finds each project under the host it looks up. A project that one file
+removes is still mirrored when another listed file keeps it. A file that the mount rejects,
+for example one whose `extend-project` names a project that no file defines, fails the
+pusher's manifest read as well.
 
 ## Mount
 
