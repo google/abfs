@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/mux"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/mod/semver"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/google/abfs/shared/entities"
@@ -232,6 +233,9 @@ type NewServerOpts struct {
 	MaxCachedContents int
 	NoLinkValidation  bool
 	NoHashValidation  bool
+	// ClientMetrics exports the built-in metrics of the Spanner, Bigtable and
+	// Cloud Storage client libraries to Cloud Monitoring.
+	ClientMetrics bool
 	// LinksContent makes GetObject return signed Cloud Storage URLs instead of the
 	// content for objects larger than LinksContentThreshold bytes.
 	LinksContent          bool
@@ -265,7 +269,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if btConnPool <= 0 {
 		btConnPool = DefaultBtConnPool
 	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool)
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +286,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		casdb:                 cas,
 		addObject:             cas.AddObject,
 	}
-	if err := s.setMasterDepot(ctx, opts.BucketName); err != nil {
+	if err := s.setMasterDepot(ctx, opts.BucketName, opts.ClientMetrics); err != nil {
 		_ = cas.Close()
 		return nil, err
 	}
@@ -783,13 +787,21 @@ func (s *GCPServer) WhoAmI(ctx context.Context) (string, error) {
 
 // Close implements remote.RemoteCloser.
 func (s *GCPServer) Close() error {
-	return s.casdb.Close()
+	err := s.casdb.Close()
+	if s.storage != nil {
+		err = errors.Join(err, s.storage.Close())
+	}
+	return err
 }
 
-func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string) error {
+func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string, clientMetrics bool) error {
 	btCli := s.casdb.BTClient()
 
-	bucketCli, err := storage.NewGRPCClient(ctx)
+	var storageOpts []option.ClientOption
+	if !clientMetrics {
+		storageOpts = append(storageOpts, storage.WithDisabledClientMetrics())
+	}
+	bucketCli, err := storage.NewGRPCClient(ctx, storageOpts...)
 	if err != nil {
 		return err
 	}

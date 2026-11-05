@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"slices"
 	"strings"
 
@@ -48,6 +49,7 @@ type gcpCmd struct {
 	bucket                string
 	maxCachedHeaders      int
 	maxCachedContents     int
+	clientMetrics         bool
 	linksContent          bool
 	linksContentThreshold int64
 }
@@ -74,6 +76,7 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.bucket, "bucket", "", "The GCS Bucket Name (required)")
 	fl.IntVarP(&c.maxCachedHeaders, "headers-cache", "", defaultMaxCachedHeaders, "The maximum number of cached objects' headers")
 	fl.IntVarP(&c.maxCachedContents, "contents-cache", "", defaultMaxCachedContents, "The maximum number of cached objects' content")
+	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring")
 	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
 	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
 }
@@ -103,12 +106,18 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		MaxCachedContents:     c.maxCachedContents,
 		NoLinkValidation:      c.noLinkValidation,
 		NoHashValidation:      c.noHashValidation,
+		ClientMetrics:         c.clientMetrics,
 		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
 	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("WARNING: error closing ABFS server: %v", err)
+		}
+	}()
 	return c.Serve(ctx, gcp.NewFilterServer(server, nil))
 }
 

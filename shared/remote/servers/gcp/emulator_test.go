@@ -134,7 +134,7 @@ func newEmulatorCASDBServer(t *testing.T) *GCPServer {
 	dbID := newEmulatorDatabase(t)
 	newEmulatorBigtable(t)
 
-	db, err := casdb.New(context.Background(), fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID), emulatorProject, emulatorBigtable, "", 1)
+	db, err := casdb.New(context.Background(), fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID), emulatorProject, emulatorBigtable, "", 1, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

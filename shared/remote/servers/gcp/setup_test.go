@@ -24,6 +24,7 @@ import (
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/iterator"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/remote"
@@ -207,4 +208,20 @@ func createDatabase(t *testing.T, o *SetupOpts, ddl []string) {
 	require.NoError(t, err)
 	_, err = op.Wait(ctx)
 	require.NoError(t, err)
+}
+
+func TestClose_ClosesStorageClient(t *testing.T) {
+	ctx := context.Background()
+	newEmulatorBigtable(t)
+	o := setupOpts(t, newEmulatorDatabase(t))
+	s, err := New(ctx, &NewServerOpts{
+		ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID,
+		BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024,
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	// An open client lists the empty bucket and returns iterator.Done.
+	_, err = s.storage.Bucket(o.BucketName).Objects(ctx, nil).Next()
+	require.Error(t, err)
+	require.NotErrorIs(t, err, iterator.Done)
 }

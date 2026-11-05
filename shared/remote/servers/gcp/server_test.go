@@ -606,7 +606,7 @@ func createTestServerWithCASDB(t *testing.T) (*GCPServer, *fakeSpannerServer) {
 	t.Setenv("BIGTABLE_EMULATOR_HOST", btSrv.Addr)
 	t.Setenv("SPANNER_EMULATOR_HOST", spLis.Addr().String())
 
-	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", "", 1)
+	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", "", 1, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

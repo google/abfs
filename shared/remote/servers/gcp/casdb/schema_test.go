@@ -105,7 +105,7 @@ func newEmulatorCASDB(t *testing.T) (*CASDB, string) {
 	t.Cleanup(bt.Close)
 	t.Setenv("BIGTABLE_EMULATOR_HOST", bt.Addr)
 
-	c, err := New(context.Background(), dbPath, emulatorProject, "test-bt", "", 1)
+	c, err := New(context.Background(), dbPath, emulatorProject, "test-bt", "", 1, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	return c, dbPath

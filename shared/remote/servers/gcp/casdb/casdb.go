@@ -57,7 +57,10 @@ type CASDB struct {
 	headersSem   chan struct{}
 }
 
-func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int) (*CASDB, error) {
+// New connects to the Spanner database and the Bigtable instance. The client
+// libraries export their built-in metrics to Cloud Monitoring only when
+// clientMetrics is set.
+func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool) (*CASDB, error) {
 	sessionPoolConfig := spanner.SessionPoolConfig{
 		MinOpened:     400,
 		MaxOpened:     5000,
@@ -66,15 +69,18 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 
 	numChannels := option.WithGRPCConnectionPool(int(sessionPoolConfig.MaxOpened) / 100)
 	client, err := spanner.NewClientWithConfig(ctx, spannerDB, spanner.ClientConfig{
-		SessionPoolConfig: sessionPoolConfig,
+		SessionPoolConfig:    sessionPoolConfig,
+		DisableNativeMetrics: !clientMetrics,
 	}, numChannels)
 	if err != nil {
 		return nil, err
 	}
 
-	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, bigtable.ClientConfig{
-		AppProfile: btAppProfile,
-	}, bigtableClientOptions(btConnPoolSize)...)
+	btConfig := bigtable.ClientConfig{AppProfile: btAppProfile}
+	if !clientMetrics {
+		btConfig.MetricsProvider = bigtable.NoopMetricsProvider{}
+	}
+	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, btConfig, bigtableClientOptions(btConnPoolSize)...)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to create bigtable client: %w", err)
