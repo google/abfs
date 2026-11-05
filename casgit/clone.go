@@ -93,6 +93,23 @@ func (g *CASGit) Clone(ctx context.Context, opts CloneOptions) error {
 	return clone.clone(ctx)
 }
 
+// createObjectsDir creates the objects directory when it does not exist and reuses an existing
+// one: the paths of one repo project share .repo/project-objects/<name>.git, and casfs refuses
+// to create it twice.
+func (c *GitClone) createObjectsDir() error {
+	info, err := os.Stat(c.ObjectsDir)
+	if entities.IsNotExist(err) {
+		return c.casgit.casfs.CreateGitObjects(path.Dir(c.ObjectsDir), path.Base(c.ObjectsDir))
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("objects directory %s is not a directory", c.ObjectsDir)
+	}
+	return nil
+}
+
 func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 	if _, err := FindGitDir(c.Directory); err != nil && !entities.IsNotExist(err) {
 		return err
@@ -131,7 +148,7 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 	if err := c.casgit.casfs.SetExcluded(c.Directory, true); err != nil {
 		return err
 	}
-	if err := c.casgit.casfs.CreateGitObjects(path.Dir(c.ObjectsDir), path.Base(c.ObjectsDir)); err != nil {
+	if err := c.createObjectsDir(); err != nil {
 		return err
 	}
 	if err := c.casgit.casfs.SetExcluded(c.gitDir, true); err != nil {
