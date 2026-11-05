@@ -162,3 +162,52 @@ func TestLoadManifest_ExtendOfUnknownProjectFails(t *testing.T) {
 
 	require.EqualError(t, r.loadManifest(context.Background()), "extend-project element specifies non-existent project: p/none")
 }
+
+func TestLoadManifest_LocalManifests(t *testing.T) {
+	r := newTestRepo(t, map[string]string{
+		"default.xml": `<manifest>
+  <remote name="origin" fetch="https://example.com" />
+  <default revision="main" remote="origin" />
+  <project name="p/one" path="one" />
+  <project name="p/two" path="two" />
+  <project name="p/three" path="three" />
+</manifest>
+`,
+	})
+	local := filepath.Join(r.dotRepo, "local_manifests")
+	require.NoError(t, os.MkdirAll(local, 0755))
+	for name, content := range map[string]string{
+		"a-remove.xml": `<manifest>
+  <remove-project name="p/two" />
+</manifest>
+`,
+		"b-add.xml": `<manifest>
+  <default revision="main" remote="origin" />
+  <project name="p/local" path="local" revision="dev" />
+  <include name="local_manifests/added.inc" />
+</manifest>
+`,
+		"c-extend.xml": `<manifest>
+  <extend-project name="p/three" revision="v2" groups="mine" />
+  <extend-project name="p/added" dest-path="added-moved" />
+</manifest>
+`,
+		"added.inc": `<manifest>
+  <project name="p/added" path="added" />
+</manifest>
+`,
+		"notes.txt": "not a manifest",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(local, name), []byte(content), 0644))
+	}
+
+	require.NoError(t, r.loadManifest(context.Background()))
+	require.Equal(t, []string{"added-moved", "local", "one", "three"}, selectedPaths(r))
+	revision, err := r.projectRevision(r.projectsByPath["three"])
+	require.NoError(t, err)
+	require.Equal(t, "v2", revision)
+	revision, err = r.projectRevision(r.projectsByPath["local"])
+	require.NoError(t, err)
+	require.Equal(t, "dev", revision)
+	require.Equal(t, []string{"three"}, selectedPaths(r, "mine"))
+}
