@@ -219,3 +219,79 @@ func elementString(ele any) string {
 	}
 	return s
 }
+
+// modelledAttrs lists, for the elements that decide the project list, the attributes the
+// manifest types read. repo knows more; those are reported by Warnings.
+var modelledAttrs = map[string][]string{
+	"remote":         {"name", "alias", "fetch", "pushurl", "review", "revision"},
+	"default":        {"remote", "revision", "dest-branch", "upstream", "sync-j", "sync-c", "sync-s", "sync-tags"},
+	"project":        {"name", "path", "remote", "revision", "dest-branch", "groups", "sync-c", "sync-s", "sync-tags", "upstream", "clone-depth", "force-path"},
+	"extend-project": {"name", "path", "dest-path", "groups", "revision", "remote", "dest-branch", "upstream", "base-rev"},
+	"remove-project": {"name", "path", "optional", "base-rev"},
+	"include":        {"name", "groups", "revision"},
+}
+
+// Warnings returns the elements and attributes of the manifest and its includes that were
+// read but are not applied, each naming the included file it came from.
+func (m *Manifest) Warnings() []string {
+	return m.warnings
+}
+
+// unmodelled collects the attributes of one manifest file that ABFS does not read, one entry
+// per element kind and attribute, so a tool attribute on every project is one warning.
+type unmodelled struct {
+	attrs []*unmodelledAttr
+	index map[[2]string]*unmodelledAttr
+}
+
+type unmodelledAttr struct {
+	element, attr, name string
+	count               int
+}
+
+func (u *unmodelled) add(se xml.StartElement) {
+	known, ok := modelledAttrs[se.Name.Local]
+	if !ok {
+		return
+	}
+	for _, a := range se.Attr {
+		if a.Name.Space != "" || slices.Contains(known, a.Name.Local) {
+			continue
+		}
+		key := [2]string{se.Name.Local, a.Name.Local}
+		ua, ok := u.index[key]
+		if !ok {
+			if u.index == nil {
+				u.index = make(map[[2]string]*unmodelledAttr)
+			}
+			ua = &unmodelledAttr{element: se.Name.Local, attr: a.Name.Local, name: attr(se, "name")}
+			u.index[key] = ua
+			u.attrs = append(u.attrs, ua)
+		}
+		ua.count++
+	}
+}
+
+func (u *unmodelled) warnings() []string {
+	var warnings []string
+	for _, ua := range u.attrs {
+		switch {
+		case ua.count > 1:
+			warnings = append(warnings, fmt.Sprintf("<%s>: attribute %q on %d elements is not applied", ua.element, ua.attr, ua.count))
+		case ua.name != "":
+			warnings = append(warnings, fmt.Sprintf("<%s name=%q>: attribute %q is not applied", ua.element, ua.name, ua.attr))
+		default:
+			warnings = append(warnings, fmt.Sprintf("<%s>: attribute %q is not applied", ua.element, ua.attr))
+		}
+	}
+	return warnings
+}
+
+func attr(se xml.StartElement, name string) string {
+	for _, a := range se.Attr {
+		if a.Name.Local == name {
+			return a.Value
+		}
+	}
+	return ""
+}

@@ -32,42 +32,6 @@ func TestXMLMarshal(t *testing.T) {
 	require.Equal(t, strings.TrimSpace(expected), string(buf))
 }
 
-func TestRemoveProjects(t *testing.T) {
-	in := `<manifest>
- <remote name="aosp" fetch=".." review="https://android-review.googlesource.com/"></remote>
- <project name="platform/build/blueprint" path="build/blueprint1"></project>
- <project name="platform/build/soong" path="build/soong"></project>
- <project name="platform/build/blueprint" path="build/blueprint2"></project>
- <remove-project name="platform/build/blueprint"></remove-project>
- <project name="platform/build/blueprint" path="build/blueprint3"></project>
- <project name="platform/art" path="art"></project>
-</manifest>`
-
-	want := []*Project{
-		{
-			XMLName: xml.Name{Local: "project"},
-			Name:    "platform/build/soong",
-			Path:    "build/soong",
-		},
-		{
-			XMLName: xml.Name{Local: "project"},
-			Name:    "platform/build/blueprint",
-			Path:    "build/blueprint3",
-		},
-		{
-			XMLName: xml.Name{Local: "project"},
-			Name:    "platform/art",
-			Path:    "art",
-		},
-	}
-	m, err := Parse([]byte(in))
-	require.NoError(t, err)
-	projects, err := m.ApplyRemoves()
-	require.NoError(t, err)
-	require.Equal(t, want, projects)
-	require.NoError(t, m.Validate())
-}
-
 // A parsed manifest marshals back with every attribute and child it was read with.
 func TestRawManifestRoundTrip(t *testing.T) {
 	in := `<manifest>

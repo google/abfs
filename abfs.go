@@ -714,10 +714,7 @@ func (a *ABFS) fetchABFSRefs() error {
 }
 
 func (a *ABFS) createProjects(ctx context.Context, root bindcas.Dir, man *manifest.Manifest, groups []string) (createProjectsResult, error) {
-	projects, err := man.ApplyRemoves()
-	if err != nil {
-		return createProjectsResult{}, err
-	}
+	projects := man.Project
 	var errs []error
 	debugChan := make(chan string)
 	go func() {
@@ -1477,6 +1474,11 @@ func (a *ABFS) initWorktreeWithDotGit(ctx context.Context, root bindcas.Dir, pro
 
 func (a *ABFS) setupRepo() error {
 	ctx := context.Background()
+	for _, g := range a.MountGroups {
+		if strings.HasPrefix(strings.TrimPrefix(g, "-"), "local:") {
+			log.Printf("Warning: group %q is not applied: projects from local manifests have no local: groups", g)
+		}
+	}
 	a.repo = repo.New(a.store, a.git, a.ManifestServer, a.ManifestProjectName, a.ManifestScheme, a.LocalManifestDir, a.IgnoreMissingProjects)
 	if err := a.repo.AddChanges(a.ChangeIDs); err != nil {
 		return fmt.Errorf("AddChanges failed: %v", err)

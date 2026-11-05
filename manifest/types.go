@@ -211,4 +211,7 @@ type Manifest struct {
 
 	// Name to Remote cache.
 	remotes map[string]*Remote
+
+	// Elements and attributes read but not applied, see Warnings.
+	warnings []string
 }

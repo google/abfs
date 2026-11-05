@@ -101,3 +101,64 @@ func TestLoadManifest_IncludeGroups(t *testing.T) {
 	require.Equal(t, []string{"one", "two"}, selectedPaths(r))
 	require.Equal(t, []string{"two"}, selectedPaths(r, "extra"))
 }
+
+func TestLoadManifest_RemovesAndExtends(t *testing.T) {
+	r := newTestRepo(t, map[string]string{
+		"default.xml": `<manifest>
+  <remote name="origin" fetch="https://example.com" />
+  <default revision="main" remote="origin" />
+  <include name="base.xml" />
+  <remove-project name="p/uuid" path="ws/b-uuid" optional="true" />
+  <remove-project path="ws/gone" />
+  <extend-project name="p/cmp" path="ws/cmp" dest-path="ws/moved-cmp" revision="v0.6.0" groups="extra" />
+</manifest>
+`,
+		"base.xml": `<manifest>
+  <project name="p/uuid" path="ws/a-uuid" />
+  <project name="p/uuid" path="ws/b-uuid" />
+  <project name="p/gone" path="ws/gone" />
+  <project name="p/cmp" path="ws/cmp" revision="v0.5.9" />
+</manifest>
+`,
+	})
+
+	require.NoError(t, r.loadManifest(context.Background()))
+	require.Equal(t, []string{"ws/a-uuid", "ws/moved-cmp"}, selectedPaths(r))
+	require.Equal(t, []string{"ws/moved-cmp"}, selectedPaths(r, "extra"))
+	require.NoError(t, r.flatMan.Validate())
+	require.Empty(t, r.flatMan.RemoveProject)
+	require.Empty(t, r.flatMan.ExtendProject)
+	revision, err := r.projectRevision(r.projectsByPath["ws/moved-cmp"])
+	require.NoError(t, err)
+	require.Equal(t, "v0.6.0", revision)
+}
+
+func TestLoadManifest_SmartSyncOverrideIsProjected(t *testing.T) {
+	r := newTestRepo(t, map[string]string{
+		"default.xml": `<manifest />`,
+		"smart_sync_override.xml": `<manifest>
+  <remote name="origin" fetch="https://example.com" />
+  <default revision="main" remote="origin" />
+  <project name="p/one" path="one" groups="g1" />
+  <project name="p/two" path="two" />
+  <remove-project name="p/two" />
+</manifest>
+`,
+	})
+
+	require.NoError(t, r.loadManifest(context.Background()))
+	require.Equal(t, map[string][]string{"one": {"g1"}}, projectGroups(r))
+}
+
+func TestLoadManifest_ExtendOfUnknownProjectFails(t *testing.T) {
+	r := newTestRepo(t, map[string]string{
+		"default.xml": `<manifest>
+  <remote name="origin" fetch="https://example.com" />
+  <default revision="main" remote="origin" />
+  <extend-project name="p/none" revision="v1" />
+</manifest>
+`,
+	})
+
+	require.EqualError(t, r.loadManifest(context.Background()), "extend-project element specifies non-existent project: p/none")
+}

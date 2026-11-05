@@ -21,6 +21,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -184,6 +185,13 @@ func (r *Repo) loadManifest(ctx context.Context) error {
 		return os.ReadFile(name)
 	}); err != nil {
 		return err
+	}
+
+	if err := m.Effective(); err != nil {
+		return err
+	}
+	for _, w := range m.Warnings() {
+		log.Printf("Warning: manifest %s", w)
 	}
 
 	if err := m.Validate(); err != nil {

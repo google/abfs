@@ -502,3 +502,60 @@ func TestEffective_StandardManifestUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, string(want), string(got))
 }
+
+func TestWarnings(t *testing.T) {
+	files := map[string]string{
+		"default.xml": `<manifest>
+ <remote name="aosp" fetch=".." revision="main" annotation-free="x"></remote>
+ <default remote="aosp" sync-j-max="8"></default>
+ <submanifest name="sub" project="platform/sub"></submanifest>
+ <project name="platform/a" path="a" rebase="false">
+  <project name="nested" path="n"></project>
+ </project>
+ <include name="other.xml" future="1"></include>
+</manifest>`,
+		"other.xml": `<manifest>
+ <project name="platform/b" sync-strategy="stateless" x-tool="1"></project>
+ <project name="platform/c" x-tool="2"></project>
+ <extend-project name="platform/b" unknown="1"></extend-project>
+ <remove-project name="platform/a" when="always"></remove-project>
+</manifest>`,
+	}
+	bytes := func(ctx context.Context, name string) ([]byte, error) {
+		return []byte(files[name]), nil
+	}
+
+	m, err := Parse([]byte(files["default.xml"]))
+	require.NoError(t, err)
+	require.NoError(t, m.FlattenIncludes(context.Background(), bytes))
+	require.NoError(t, m.Effective())
+	require.Equal(t, []string{
+		`<submanifest name="sub"> is not applied`,
+		`<project name="platform/a">: nested project elements are not applied`,
+		`<remote name="aosp">: attribute "annotation-free" is not applied`,
+		`<default>: attribute "sync-j-max" is not applied`,
+		`<project name="platform/a">: attribute "rebase" is not applied`,
+		`<include name="other.xml">: attribute "future" is not applied`,
+		`other.xml: <project name="platform/b">: attribute "sync-strategy" is not applied`,
+		`other.xml: <project>: attribute "x-tool" on 2 elements is not applied`,
+		`other.xml: <extend-project name="platform/b">: attribute "unknown" is not applied`,
+		`other.xml: <remove-project name="platform/a">: attribute "when" is not applied`,
+	}, m.Warnings())
+	require.Len(t, m.Project, 2)
+}
+
+func TestWarnings_StandardManifestHasNone(t *testing.T) {
+	in := `<manifest>
+  <remote name="aosp" fetch=".." review="https://android-review.googlesource.com/" />
+  <default revision="main" remote="aosp" sync-j="4" />
+  <superproject name="platform/superproject" remote="aosp" revision="main"/>
+  <contactinfo bugurl="go/repo-bug" />
+  <project path="build/make" name="platform/build" groups="pdk" >
+    <linkfile src="core" dest="build/core" />
+  </project>
+  <project path="prebuilts/clang" name="platform/prebuilts/clang" groups="pdk" clone-depth="1" />
+</manifest>`
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	require.Empty(t, m.Warnings())
+}
