@@ -171,13 +171,24 @@ func detectTops(root string) ([]string, []rejectedTop, error) {
 }
 
 // findTops returns the tops to set up, relative to the mount point, and where they came from.
-// The --chroot directory replaces detection. Detection looks at the mount
+// Named tops (--top, --chroot, setup.tops) replace detection. Detection looks at the mount
 // root and at a repo checkout below it that contains start, and falls back to the mount root
 // when it finds no top, as setup did before it knew about tops.
 func (c *setupCmd) findTops(start string) ([]string, string, error) {
-	if c.Chroot != "" {
+	switch {
+	case len(c.Tops) > 0:
+		tops, err := c.namedTops(c.Tops, false)
+		return tops, "--top", err
+	case c.Chroot != "":
 		top, err := chrootTop(c.Chroot)
 		return []string{top}, "--chroot", err
+	case len(c.Config.SetupTops) > 0:
+		// One client config serves every mount of the instance, so an entry may be missing on
+		// this one; detection takes over when none is here.
+		tops, err := c.namedTops(c.Config.SetupTops, true)
+		if err != nil || len(tops) > 0 {
+			return tops, "setup.tops", err
+		}
 	}
 
 	tops, rejected, err := detectTops(c.mountPoint)
@@ -224,6 +235,44 @@ func chrootTop(chroot string) (string, error) {
 		return "", fmt.Errorf("--chroot %q is outside the mount point", chroot)
 	}
 	return rel, nil
+}
+
+// namedTops converts tops given by the user to clean paths relative to the mount point.
+// Relative paths are relative to the mount point. With skipMissing, a name that is not a
+// directory on this mount is left out with a warning instead of failing.
+func (c *setupCmd) namedTops(names []string, skipMissing bool) ([]string, error) {
+	tops := make([]string, 0, len(names))
+	var skipped []string
+	for _, name := range names {
+		rel := filepath.Clean(name)
+		if filepath.IsAbs(rel) {
+			var err error
+			if rel, err = filepath.Rel(c.mountPoint, rel); err != nil {
+				return nil, err
+			}
+		}
+		if rel == "." {
+			rel = ""
+		} else if !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("top %q is outside the mount point %s", name, c.mountPoint)
+		}
+		dir := filepath.Join(c.mountPoint, rel)
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			if skipMissing {
+				skipped = append(skipped, name)
+				continue
+			}
+			return nil, fmt.Errorf("top %q is not a directory under the mount point %s", name, c.mountPoint)
+		}
+		if problem := soongTopProblem(dir); problem != "" {
+			c.warnf("Warning: %s is not a Soong top (%s), so Soong will not use ABFS there\n", dir, problem)
+		}
+		tops = append(tops, rel)
+	}
+	if len(skipped) > 0 {
+		c.warnf("Warning: setup.tops names directories that are not on the mount %s: %s\n", c.mountPoint, strings.Join(skipped, ", "))
+	}
+	return uniqueSorted(tops), nil
 }
 
 func (c *setupCmd) warnf(format string, a ...any) {

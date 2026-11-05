@@ -204,28 +204,48 @@ func excludeNSJailReal(buildToolsDir string) (retErr error) {
 	return nil
 }
 
-// KeepNSJailWrapper runs sync with the original nsjail in place, because a checkout that
-// changes nsjail fails while the wrapper replaces it, and installs the wrapper again after a
-// successful sync if the tree still needs it.
+// KeepNSJailWrapper runs sync with the original nsjail in place in the repo workspace at root
+// and in every Soong top below it, because a checkout that changes nsjail fails while the
+// wrapper replaces it, and installs the wrapper again after a successful sync where the tree
+// still needs it.
 func KeepNSJailWrapper(root string, sync func() error) error {
-	wrapper, err := unwrapNSJail(root)
+	tops, err := DetectTops(root)
 	if err != nil {
-		return err
+		// The sync itself does not need the tops; it may also repair the project list.
+		log.Printf("Warning: cannot find the Soong tops below %s, so nsjail stays wrapped there during the sync: %v", root, err)
+		tops = nil
+	}
+	dirs := []string{root}
+	for _, top := range tops {
+		if top != "" {
+			dirs = append(dirs, filepath.Join(root, top))
+		}
+	}
+	wrappers := make([][]byte, len(dirs))
+	for i, dir := range dirs {
+		if wrappers[i], err = unwrapNSJail(dir); err != nil {
+			return err
+		}
 	}
 	// After a failed sync the patched repo falls back to its own sync, which would stop at the
 	// wrapper; abfs setup wraps nsjail again.
 	if err := sync(); err != nil {
 		return err
 	}
-	if wrapper == nil {
-		return nil
-	}
-	needed, err := soongPassesABFSDir(root)
-	if err != nil || !needed {
-		return err
-	}
-	if err := installNSJailWrapper(root, wrapper); err != nil {
-		return fmt.Errorf("failed to wrap nsjail again: %w", err)
+	for i, dir := range dirs {
+		if wrappers[i] == nil {
+			continue
+		}
+		needed, err := soongPassesABFSDir(dir)
+		if err != nil {
+			return err
+		}
+		if !needed {
+			continue
+		}
+		if err := installNSJailWrapper(dir, wrappers[i]); err != nil {
+			return fmt.Errorf("failed to wrap nsjail again: %w", err)
+		}
 	}
 	return nil
 }

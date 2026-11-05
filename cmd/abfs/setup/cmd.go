@@ -32,6 +32,7 @@ import (
 
 	"github.com/google/abfs"
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/casgit"
 	"github.com/google/abfs/ninjago"
 	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/cmd"
@@ -96,6 +97,7 @@ type setupCmd struct {
 	abfsSourceDir    string
 	mountPoint       string
 	Chroot           string
+	Tops             []string
 	listTopsOnly     bool
 	errOut           io.Writer
 	quiet            bool
@@ -104,7 +106,8 @@ type setupCmd struct {
 	DisableCGO       bool
 	OverrideCacheDir string
 	CompiledDir      string
-	abfs             *binding.Client
+	abfs             chrootClient
+	top              string
 	buildToolsDir    string
 	abfsDir          string
 	BuildFromSource  bool
@@ -122,6 +125,11 @@ type setupCmd struct {
 	ConcurrencyMultiplier *float64
 }
 
+// chrootClient is the part of the ABFS daemon client that setup uses.
+type chrootClient interface {
+	Chroot(chroot string, overlays, views []string) error
+}
+
 func NewCmd(rootCmd *root.RootCmd) *setupCmd {
 	return &setupCmd{RootCmd: rootCmd}
 }
@@ -129,9 +137,14 @@ func NewCmd(rootCmd *root.RootCmd) *setupCmd {
 func (c *setupCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:    "setup",
-		Usage:   "[-l] [-q] [-s <source-dir>] [-c <chroot>] [-o <overlays>] [--list] [--salt <salt>] <casfs root or descendant>",
+		Usage:   "[-l] [-q] [-s <source-dir>] [-c <chroot> | --top <dir>...] [-o <overlays>] [--list] [--salt <salt>] <casfs root or descendant>",
 		Aliases: []string{},
 		Desc: `Setup an already mounted abfs environment for an abfs build.
+
+Setup installs the ABFS build hooks in every Soong top of the mount: each
+directory that holds build/soong/root.bp and the prebuilt tools directory.
+It finds the tops from the projects of the mount, the mount root included.
+The client config key setup.tops or the --top flag name the tops instead.
 
 If $ABFS_NSJAIL_CONFIG is set, it names the NSJail build config XML (relative
 to the mount point) that selects the overlays and views for --target.`,
@@ -141,6 +154,7 @@ to the mount point) that selects the overlays and views for --target.`,
 func (c *setupCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVarP(&c.abfsSourceDir, "source-dir", "s", ".", "The ABFS source directory to compile the patches from")
 	fl.StringVarP(&c.Chroot, "chroot", "c", "", "The root to apply applicable overlays on top, relative to mount point")
+	fl.StringSliceVar(&c.Tops, "top", nil, "A Soong top to set up, relative to the mount point; repeat for several (default: found from the projects of the mount)")
 	fl.BoolVar(&c.listTopsOnly, "list", false, "List the Soong tops of the mount and what is in place in each, without changing anything")
 	fl.BoolVarP(&c.quiet, "quiet", "q", false, "Do not print any logs")
 	fl.BoolVarP(&c.verbose, "verbose", "v", false, "Print the logs of steps")
@@ -200,6 +214,10 @@ func (c *setupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return c.printOverlays()
 	}
 
+	if c.Chroot != "" && len(c.Tops) > 0 {
+		return clierr.CLIErr("--chroot and --top cannot be used together")
+	}
+
 	if c.BuildFromSource && c.CompiledDir != "" {
 		return clierr.CLIErr("--source and --compiled cannot be used together")
 	}
@@ -220,17 +238,18 @@ func (c *setupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return c.listTops(os.Stdout, tops, source)
 	}
 
-	c.abfs, err = binding.NewClient(c.mountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
+	client, err := binding.NewClient(c.mountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := c.abfs.Close(); err != nil {
+		if err := client.Close(); err != nil {
 			fmt.Printf("Error closing abfs client: %v\n", err)
 		}
 	}()
+	c.abfs = client
 
-	return c.run()
+	return c.run(start)
 }
 
 func (c *setupCmd) goBuild(args ...string) error {
@@ -284,36 +303,56 @@ func (c *setupCmd) createPrebuilts() error {
 	return c.installTap()
 }
 
-func (c *setupCmd) run() error {
+func (c *setupCmd) run(start string) error {
 	if c.BuildFromSource {
 		if _, err := os.Stat("./cmd/abfs/abfs.go"); entities.IsNotExist(err) {
 			return clierr.CLIErr("'setup' must be ran from abfs module root with --source")
 		}
 	}
 
-	if c.Chroot != "" {
-		chrootPath := filepath.Join(c.mountPoint, c.Chroot)
-		socketPath := filepath.Join(chrootPath, entities.ABFSSocketFileName)
-		if stat, err := os.Stat(socketPath); err == nil && stat.IsDir() { // NO errors means exists
-			log.Println("Chroot already setup, ignoring the rest of setup")
-			return nil
+	tops, source, err := c.findTops(start)
+	if err != nil {
+		return err
+	}
+	names := make([]string, len(tops))
+	for i, top := range tops {
+		names[i] = displayTop(top)
+	}
+	c.log("Set up the Soong tops in %s (%s): %s", c.mountPoint, source, strings.Join(names, " "))
+	for _, top := range tops {
+		if err := c.setupTop(top); err != nil {
+			return fmt.Errorf("failed to set up %s: %w", filepath.Join(c.mountPoint, top), err)
 		}
-		if err := c.setupChroot(chrootPath); err != nil {
+	}
+	return nil
+}
+
+// setupTop installs the ABFS build hooks in one Soong top, given relative to the mount point.
+// It runs on every mount, remount and sync, so it rewrites what an earlier run wrote.
+func (c *setupCmd) setupTop(top string) error {
+	c.top = top
+	topDir := filepath.Join(c.mountPoint, top)
+	if top != "" {
+		if err := c.setupChroot(topDir); err != nil {
 			return err
 		}
 	}
 
-	c.buildToolsDir = filepath.Join(c.mountPoint, c.Chroot, buildToolsRelativeDir)
+	c.buildToolsDir = filepath.Join(topDir, buildToolsRelativeDir)
 	binDirPath, err := binDir()
 	if err != nil {
 		return err
 	}
-	c.abfsDir = filepath.Join(c.mountPoint, c.Chroot, binDirPath)
+	c.abfsDir = filepath.Join(topDir, binDirPath)
 	if err := os.MkdirAll(c.abfsDir, 0700); err != nil {
 		return err
 	}
 
-	if err := c.createPrebuilts(); err != nil {
+	// Replacing a binary that a running build executes fails with ETXTBSY.
+	if buildRunning(topDir) {
+		c.warnf("Warning: a build is running in %s (%s exists without %s), so setup does not replace its ABFS binaries; run abfs setup again after the build, or delete %s if no build is running\n",
+			topDir, buildStartFile(topDir), buildInfoFile(topDir), buildStartFile(topDir))
+	} else if err := c.createPrebuilts(); err != nil {
 		return err
 	}
 
@@ -380,13 +419,59 @@ func (c *setupCmd) printOverlays() error {
 	return nil
 }
 
+// buildRunning reports whether a build is running in the top at dir: abfsbox writes
+// .build_start when a build starts and .build_info when it ends.
+func buildRunning(dir string) bool {
+	if _, err := os.Stat(buildStartFile(dir)); err != nil {
+		return false
+	}
+	_, err := os.Stat(buildInfoFile(dir))
+	return entities.IsNotExist(err)
+}
+
+func buildStartFile(dir string) string {
+	return filepath.Join(outDirOf(dir), ".build_start")
+}
+
+func buildInfoFile(dir string) string {
+	return filepath.Join(outDirOf(dir), ".build_info")
+}
+
+func outDirOf(dir string) string {
+	if filepath.IsAbs(entities.OutDir) {
+		return entities.OutDir
+	}
+	return filepath.Join(dir, entities.OutDir)
+}
+
+// setupChroot gives a top below the mount root its own daemon socket and the mount details
+// that soong_ui and abfsbox read there.
 func (c *setupCmd) setupChroot(p string) error {
+	if c.Chroot == "" {
+		c.log("Create chroot for %s", c.top)
+		if err := c.abfs.Chroot(c.top, nil, nil); err != nil {
+			return err
+		}
+		if err := bindcas.SetExcluded(p, true); err != nil {
+			return err
+		}
+		// Setup used to copy the mount details into the top, and abfsbox prefers such a
+		// copy over the link.
+		if err := os.Remove(filepath.Join(p, abfs.MountDetailsFileName)); err != nil && !entities.IsNotExist(err) {
+			return err
+		}
+		return linkMountDetails(p, c.top)
+	}
+
+	// A --chroot is a scratch checkout of its own, which abfs nsjail runs a build in with
+	// nothing of the mount around it, so it keeps its own copy of the mount details.
+	overlays, views := c.getEffectiveOverlays(), c.getEffectiveViews()
 	c.log("Create chroot for %s, mount %s overlays on top, and exclude from parent hash. Including projects that that contain these views: %s",
 		c.Chroot,
-		strings.Join(c.getEffectiveOverlays(), ","),
-		strings.Join(c.getEffectiveViews(), "\n"),
+		strings.Join(overlays, ","),
+		strings.Join(views, "\n"),
 	)
-	if err := c.abfs.Chroot(c.Chroot, c.getEffectiveOverlays(), c.getEffectiveViews()); err != nil {
+	if err := c.abfs.Chroot(c.Chroot, overlays, views); err != nil {
 		return err
 	}
 
@@ -417,13 +502,38 @@ func (c *setupCmd) setupChroot(p string) error {
 		return fmt.Errorf("error creating .repo directory in chroot: %w", err)
 	}
 	chrootMountDetailsSym := filepath.Join(chrootRepoDir, "mount-details")
-	if _, err := os.Lstat(chrootMountDetailsSym); errors.Is(err, os.ErrNotExist) {
-		// Create relative symlink: .repo/mount-details -> ../.abfs.mount-details
-		if err := os.Symlink(filepath.Join("..", abfs.MountDetailsFileName), chrootMountDetailsSym); err != nil {
-			return fmt.Errorf("error creating mount-details symlink in chroot: %w", err)
-		}
-	}
+	// Relative symlink .repo/mount-details -> ../.abfs.mount-details; a top set up before
+	// may have one that points out of the chroot.
+	return replaceLink(chrootMountDetailsSym, filepath.Join("..", abfs.MountDetailsFileName))
+}
 
+// linkMountDetails points <top>/.repo/mount-details at the mount details in the mount root,
+// with a relative link that also resolves in another mount of the same workspace.
+func linkMountDetails(topDir, top string) error {
+	target := strings.Repeat("../", strings.Count(filepath.ToSlash(top), "/")+2) + abfs.MountDetailsFileName
+	repoDir := filepath.Join(topDir, casgit.RepoDirName)
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", repoDir, err)
+	}
+	return replaceLink(filepath.Join(repoDir, "mount-details"), target)
+}
+
+// replaceLink makes link a symlink to target, replacing a symlink to anything else.
+func replaceLink(link, target string) error {
+	current, err := os.Readlink(link)
+	switch {
+	case err == nil && current == target:
+		return nil
+	case err == nil:
+		if err := os.Remove(link); err != nil {
+			return fmt.Errorf("failed to replace %s: %w", link, err)
+		}
+	case !entities.IsNotExist(err):
+		return fmt.Errorf("failed to read %s: %w", link, err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		return fmt.Errorf("failed to link %s to %s: %w", link, target, err)
+	}
 	return nil
 }
 
@@ -448,14 +558,16 @@ func (c *setupCmd) installBinary(binary string, buildOpts []string) error {
 		}
 		return copyFile(destPath, 0755, binaryPath)
 	} else if !c.BuildFromSource && c.DisableCGO {
-		if path := getExecutablePath(noCGoBinary); path != "" {
-			if c.verbose {
-				c.log("Copy compiled %s command-line from %q to %q", noCGoBinary, path, destPath)
-			}
-			return copyFile(destPath, 0755, path)
+		path := getExecutablePath(noCGoBinary)
+		if path == "" {
+			// Setup runs on every mount, so it never compiles here.
+			return fmt.Errorf("cannot find %s on PATH (%s): install the client binaries with `make install-client` and put their directory on the PATH of the process that runs abfs mount, or pass --compiled or --source to abfs setup", noCGoBinary, os.Getenv("PATH"))
 		}
+		if c.verbose {
+			c.log("Copy compiled %s command-line from %q to %q", noCGoBinary, path, destPath)
+		}
+		return copyFile(destPath, 0755, path)
 	}
-	// fall back to building even though we might not be in the right directory
 	if c.verbose {
 		c.log("Compile %s and write it to %s", binary, destPath)
 	}
@@ -552,7 +664,7 @@ func (c *setupCmd) patchCKati() error {
 }
 
 func (c *setupCmd) writeVendorSetup() error {
-	root := filepath.Join(c.mountPoint, c.Chroot)
+	root := filepath.Join(c.mountPoint, c.top)
 	p := filepath.Join(root, vendorSetupRelativePath)
 	c.log("Write %s", p)
 
@@ -593,11 +705,11 @@ func (c *setupCmd) wrapNSJail() error {
 	if c.OverrideCacheDir != "" {
 		cacheDir = c.OverrideCacheDir
 	}
-	return wrapNSJail(filepath.Join(c.mountPoint, c.Chroot), cacheDir)
+	return wrapNSJail(filepath.Join(c.mountPoint, c.top), cacheDir)
 }
 
 func (c *setupCmd) writeNinjaConfig() error {
-	confPath := filepath.Join(c.mountPoint, c.Chroot, ninjago.ConfigFile)
+	confPath := filepath.Join(c.mountPoint, c.top, ninjago.ConfigFile)
 	c.log("Write ninjago config to %s", confPath)
 
 	cacheDir := c.Config.CacheDir
@@ -645,7 +757,7 @@ func (c *setupCmd) writeNinjaConfig() error {
 	}
 
 	conf := ninjago.Configuration{
-		Chroot:                  c.Chroot,
+		Chroot:                  filepath.ToSlash(c.top),
 		CacheDir:                cacheDir,
 		LocalOnly:               c.Config.LocalOnly,
 		LogMismatches:           logMismatches,
@@ -671,11 +783,19 @@ func (c *setupCmd) writeNinjaConfig() error {
 		PrefetchInputs:          prefetchInputs,
 		ConcurrencyMultiplier:   concurrencyMultiplier,
 	}
-	return conf.Write(confPath)
+	if err := conf.Write(confPath); err != nil {
+		return err
+	}
+	// The cache directory and settings belong to this client, so a workspace snapshot does
+	// not keep the file; setup writes it again on every mount.
+	if err := bindcas.SetExcluded(confPath, true); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to exclude %s from the workspace snapshot: %v\n", confPath, err)
+	}
+	return nil
 }
 
 func (c *setupCmd) patchBlueprint() error {
-	return c.gitApply(filepath.Join(c.mountPoint, c.Chroot, "build/blueprint"), blueprintDiff)
+	return c.gitApply(filepath.Join(c.mountPoint, c.top, "build/blueprint"), blueprintDiff)
 }
 
 func (c *setupCmd) gitApply(gitRepo string, patch []byte) error {

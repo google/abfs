@@ -243,6 +243,67 @@ func TestFindTops(t *testing.T) {
 			"a2 (build/soong/root.bp missing), android (prebuilts/build-tools/linux-x86/bin/ missing)\n", warnings.String())
 	})
 
+	t.Run("setup.tops replaces detection", func(t *testing.T) {
+		root := t.TempDir()
+		writeProjectsList(t, root, "android/build/soong")
+		makeSoongTop(t, root, "android")
+		makeSoongTop(t, root, "other")
+		tops, source, err := newTopsCmd(root, &instance.Config{SetupTops: []string{"other/"}}).findTops(root)
+		require.NoError(t, err)
+		require.Equal(t, []string{"other"}, tops)
+		require.Equal(t, "setup.tops", source)
+	})
+
+	t.Run("setup.tops entries missing on this mount are skipped", func(t *testing.T) {
+		root := t.TempDir()
+		makeSoongTop(t, root, "android")
+		var warnings bytes.Buffer
+		c := newTopsCmd(root, &instance.Config{SetupTops: []string{"android", "other"}})
+		c.errOut = &warnings
+		tops, source, err := c.findTops(root)
+		require.NoError(t, err)
+		require.Equal(t, []string{"android"}, tops)
+		require.Equal(t, "setup.tops", source)
+		require.Contains(t, warnings.String(), "not on the mount "+root+": other")
+	})
+
+	t.Run("detection when no setup.tops entry is on this mount", func(t *testing.T) {
+		root := t.TempDir()
+		writeProjectsList(t, root, "build/soong")
+		makeSoongTop(t, root, "")
+		var warnings bytes.Buffer
+		c := newTopsCmd(root, &instance.Config{SetupTops: []string{"android"}})
+		c.errOut = &warnings
+		tops, source, err := c.findTops(root)
+		require.NoError(t, err)
+		require.Equal(t, []string{""}, tops)
+		require.Equal(t, "detection", source)
+		require.Contains(t, warnings.String(), ": android")
+	})
+
+	t.Run("--top replaces setup.tops", func(t *testing.T) {
+		root := t.TempDir()
+		makeSoongTop(t, root, "a")
+		makeSoongTop(t, root, "b")
+		c := newTopsCmd(root, &instance.Config{SetupTops: []string{"a"}})
+		c.Tops = []string{filepath.Join(root, "b"), "."}
+		tops, source, err := c.findTops(root)
+		require.NoError(t, err)
+		require.Equal(t, []string{"", "b"}, tops)
+		require.Equal(t, "--top", source)
+	})
+
+	t.Run("named tops must be directories under the mount", func(t *testing.T) {
+		root := t.TempDir()
+		c := newTopsCmd(root, nil)
+		c.Tops = []string{"../x"}
+		_, _, err := c.findTops(root)
+		require.ErrorContains(t, err, "outside the mount point")
+		c.Tops = []string{"missing"}
+		_, _, err = c.findTops(root)
+		require.ErrorContains(t, err, "not a directory")
+	})
+
 	t.Run("--chroot need not exist yet", func(t *testing.T) {
 		root := t.TempDir()
 		c := newTopsCmd(root, nil)
