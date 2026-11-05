@@ -836,3 +836,13 @@ func TestSearchRefs_ConcurrentWithProjectCacheWrites(t *testing.T) {
 	close(stop)
 	<-done
 }
+
+func TestNew_AddsEmptyObjects(t *testing.T) {
+	require := require.New(t)
+	s := newEmulatorServer(t, nil)
+
+	hdrs, err := s.Headers(context.Background(), []entities.Hash{entities.EmptyFileHash, entities.EmptyDirHash})
+	require.NoError(err)
+	require.Equal(entities.ObjectTypeBlob, hdrs[0].Type)
+	require.Equal(gitobjects.ObjectTypeDir, hdrs[1].Type)
+}

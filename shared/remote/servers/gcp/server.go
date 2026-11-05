@@ -279,8 +279,18 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		}
 	}
 	if err := s.setMasterDepot(ctx, opts.BucketName); err != nil {
-		// Clean close on error
+		_ = cas.Close()
 		return nil, err
+	}
+	// As file-based, so that trees and refs that link the empty file or
+	// directory pass link validation on a new database.
+	if err := s.PutObject(ctx, entities.EmptyFileHash, remote.NewZStdContentReader(entities.EmptyFileContent)); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to put empty file: %w", err)
+	}
+	if err := s.PutObject(ctx, entities.EmptyDirHash, remote.NewZStdContentReader(entities.EmptyDirContent)); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to put empty directory: %w", err)
 	}
 	return s, nil
 }

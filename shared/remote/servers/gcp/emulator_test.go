@@ -28,6 +28,7 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
+	"cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -137,5 +138,50 @@ func newEmulatorCASDBServer(t *testing.T) *GCPServer {
 	s.addObject = db.AddObject
 	s.projectsByName = make(map[[2]string]int64)
 	s.projectsByID = make(map[int64][2]string)
+	return s
+}
+
+// newEmulatorBucket creates a bucket on the Cloud Storage emulator named by
+// STORAGE_EMULATOR_HOST_GRPC and returns its name.
+func newEmulatorBucket(t *testing.T) string {
+	t.Helper()
+	if os.Getenv("STORAGE_EMULATOR_HOST_GRPC") == "" {
+		t.Skip("STORAGE_EMULATOR_HOST_GRPC is not set")
+	}
+	ctx := context.Background()
+	client, err := storage.NewGRPCClient(ctx)
+	require.NoError(t, err)
+	defer client.Close()
+	name := randomID(t, "b")
+	require.NoError(t, client.Bucket(name).Create(ctx, emulatorProject, nil))
+	return name
+}
+
+// newEmulatorServer returns a server created by New on the emulators.
+func newEmulatorServer(t *testing.T, opts *NewServerOpts) *GCPServer {
+	t.Helper()
+	requireSpannerEmulator(t)
+	bucket := newEmulatorBucket(t)
+	dbID := newEmulatorDatabase(t)
+	newEmulatorBigtable(t)
+
+	o := NewServerOpts{}
+	if opts != nil {
+		o = *opts
+	}
+	o.ProjectID = emulatorProject
+	o.InstanceID = emulatorInstance
+	o.DatabaseID = dbID
+	o.BtInstance = emulatorBigtable
+	o.BucketName = bucket
+	if o.MaxCachedHeaders == 0 {
+		o.MaxCachedHeaders = 1024
+	}
+	if o.MaxCachedContents == 0 {
+		o.MaxCachedContents = 1024
+	}
+	s, err := New(context.Background(), &o)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
