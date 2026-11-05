@@ -17,6 +17,7 @@ package gcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -93,11 +94,12 @@ func (f *fakeURLDepot) LinkedContent(ctx context.Context, s depot.Chunk) (remote
 
 func createTestServer(t *testing.T, master *depot.MasterDepot) *GCPServer {
 	s := &GCPServer{
-		headers:      make([]*lru.Cache[entities.Hash, CachedHeader], 256),
-		content:      make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
-		depot:        master,
-		storeLinks:   false,
-		validateHash: true,
+		headers:       make([]*lru.Cache[entities.Hash, CachedHeader], 256),
+		content:       make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
+		depot:         master,
+		storeLinks:    false,
+		validateHash:  true,
+		validateLinks: true,
 	}
 	for i := range s.headers {
 		var err error
@@ -845,4 +847,55 @@ func TestNew_AddsEmptyObjects(t *testing.T) {
 	require.NoError(err)
 	require.Equal(entities.ObjectTypeBlob, hdrs[0].Type)
 	require.Equal(gitobjects.ObjectTypeDir, hdrs[1].Type)
+}
+
+func TestNew_CacheSizesBelowShardCount(t *testing.T) {
+	s := newEmulatorServer(t, &NewServerOpts{MaxCachedHeaders: 100, MaxCachedContents: 1})
+	require.Len(t, s.headers, 256)
+	// Each shard holds at least one entry.
+	s.headers[0].Add(entities.Hash{0, 1}, CachedHeader{Valid: true})
+	s.headers[0].Add(entities.Hash{0, 2}, CachedHeader{Valid: true})
+	require.Equal(t, 1, s.headers[0].Len())
+}
+
+// treeWithMissingBlob returns a tree object that links a blob nobody stored.
+func treeWithMissingBlob() (entities.Hash, []byte) {
+	missing := objects.HashBlobBytes([]byte("never stored"))
+	entry := append([]byte("100644 file\x00"), missing[:]...)
+	data := append(fmt.Appendf(nil, "tree %d\x00", len(entry)), entry...)
+	return entities.Hash(sha1.Sum(data)), data
+}
+
+func TestNew_ValidationOptions(t *testing.T) {
+	ctx := context.Background()
+	treeKey, treeData := treeWithMissingBlob()
+	put := func(s *GCPServer, key entities.Hash, data []byte) error {
+		return s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(data)), remote.EncodingRaw))
+	}
+	missing := objects.HashBlobBytes([]byte("never stored"))
+	wrongKey := objects.HashBlobBytes([]byte("other content"))
+	blob := []byte("blob 5\x00hello")
+
+	strict := newEmulatorServer(t, nil)
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(t, put(strict, treeKey, treeData), &linkErr)
+	require.ErrorAs(t, strict.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: missing}}), &linkErr)
+	require.ErrorContains(t, put(strict, wrongKey, blob), "expected hash")
+
+	lax := newEmulatorServer(t, &NewServerOpts{NoLinkValidation: true, NoHashValidation: true})
+	require.NoError(t, put(lax, treeKey, treeData))
+	require.NoError(t, lax.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: missing}}))
+	require.NoError(t, lax.AddMapResult(ctx, missing, treeKey))
+	require.NoError(t, put(lax, wrongKey, blob))
+}
+
+func TestAddMapResult_RejectsZeroHashes(t *testing.T) {
+	ctx := context.Background()
+	s := newEmulatorCASDBServer(t)
+	h := putTestBlob(t, s, "map result target")
+
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(t, s.AddMapResult(ctx, entities.ZeroHash, h), &linkErr)
+	require.ErrorAs(t, s.AddMapResult(ctx, h, entities.ZeroHash), &linkErr)
+	require.NoError(t, s.AddMapResult(ctx, h, h))
 }

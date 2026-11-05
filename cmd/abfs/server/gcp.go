@@ -110,6 +110,8 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		BucketName:            c.bucket,
 		MaxCachedHeaders:      c.maxCachedHeaders,
 		MaxCachedContents:     c.maxCachedContents,
+		NoLinkValidation:      c.noLinkValidation,
+		NoHashValidation:      c.noHashValidation,
 		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
 	})

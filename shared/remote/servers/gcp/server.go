@@ -183,6 +183,8 @@ const (
 	// DefaultBtConnPool is the default Bigtable client gRPC connection pool size.
 	DefaultBtConnPool = 50
 	cleanupTimeout    = 10 * time.Second
+	// The caches are sharded by the first byte of the hash.
+	cacheShards = 256
 )
 
 // This is the gcpserver layer version
@@ -198,6 +200,7 @@ type GCPServer struct {
 	depot                 *depot.MasterDepot
 	storeLinks            bool
 	validateHash          bool
+	validateLinks         bool
 	linksContent          bool
 	linksContentThreshold int64
 
@@ -226,6 +229,8 @@ type NewServerOpts struct {
 	BucketName        string
 	MaxCachedHeaders  int
 	MaxCachedContents int
+	NoLinkValidation  bool
+	NoHashValidation  bool
 	// LinksContent makes GetObject return signed Cloud Storage URLs instead of the
 	// content for objects larger than LinksContentThreshold bytes.
 	LinksContent          bool
@@ -235,14 +240,6 @@ type NewServerOpts struct {
 func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	spannerDB := fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID)
 
-	btConnPool := opts.BtConnPool
-	if btConnPool <= 0 {
-		btConnPool = DefaultBtConnPool
-	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool)
-	if err != nil {
-		return nil, err
-	}
 	maxCachedHeaders := opts.MaxCachedHeaders
 	if maxCachedHeaders == 0 {
 		maxCachedHeaders = DefaultMaxCachedHeaders
@@ -251,32 +248,38 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if maxCachedContents == 0 {
 		maxCachedContents = DefaultMaxCachedContents
 	}
+	headers, err := newShardedCache[CachedHeader](maxCachedHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("invalid headers cache size: %w", err)
+	}
+	content, err := newShardedCache[*ObjectContent](maxCachedContents)
+	if err != nil {
+		return nil, fmt.Errorf("invalid contents cache size: %w", err)
+	}
 	if opts.LinksContentThreshold < 0 {
 		return nil, fmt.Errorf("invalid links content threshold %d", opts.LinksContentThreshold)
 	}
+
+	btConnPool := opts.BtConnPool
+	if btConnPool <= 0 {
+		btConnPool = DefaultBtConnPool
+	}
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool)
+	if err != nil {
+		return nil, err
+	}
 	s := &GCPServer{
-		headers:               make([]*lru.Cache[entities.Hash, CachedHeader], 256),
-		content:               make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
+		headers:               headers,
+		content:               content,
 		projectsByName:        make(map[[2]string]int64),
 		projectsByID:          make(map[int64][2]string),
 		storeLinks:            false,
-		validateHash:          true,
+		validateHash:          !opts.NoHashValidation,
+		validateLinks:         !opts.NoLinkValidation,
 		linksContent:          opts.LinksContent,
 		linksContentThreshold: opts.LinksContentThreshold,
 		casdb:                 cas,
 		addObject:             cas.AddObject,
-	}
-	for i := range s.headers {
-		s.headers[i], err = lru.New[entities.Hash, CachedHeader](maxCachedHeaders / 256)
-		if err != nil {
-			return nil, err
-		}
-	}
-	for i := range s.content {
-		s.content[i], err = lru.New[entities.Hash, *ObjectContent](maxCachedContents / 256)
-		if err != nil {
-			return nil, err
-		}
 	}
 	if err := s.setMasterDepot(ctx, opts.BucketName); err != nil {
 		_ = cas.Close()
@@ -293,6 +296,23 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		return nil, fmt.Errorf("failed to put empty directory: %w", err)
 	}
 	return s, nil
+}
+
+// newShardedCache returns cacheShards LRU caches that hold size entries
+// together, at least one per shard.
+func newShardedCache[V any](size int) ([]*lru.Cache[entities.Hash, V], error) {
+	if size < 0 {
+		return nil, fmt.Errorf("negative size %d", size)
+	}
+	perShard := max(1, (size+cacheShards-1)/cacheShards)
+	caches := make([]*lru.Cache[entities.Hash, V], cacheShards)
+	for i := range caches {
+		var err error
+		if caches[i], err = lru.New[entities.Hash, V](perShard); err != nil {
+			return nil, err
+		}
+	}
+	return caches, nil
 }
 
 func (s *GCPServer) SetLinksContentThreshold(threshold int64) {
@@ -539,6 +559,10 @@ func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.
 
 // AddMapResult implements remote.RemoteProvider.
 func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
+	if !s.validateLinks {
+		return s.casdb.AddMapResult(ctx, from, to)
+	}
+	// Unlike object links, a zero hash is not allowed here, as in file-based.
 	hdrs, err := s.getHeaders(ctx, []entities.Hash{from, to})
 	if err != nil {
 		return err
@@ -841,6 +865,9 @@ func (s *GCPServer) getHeaders(ctx context.Context, hashes []entities.Hash) ([]C
 }
 
 func (s *GCPServer) validateObjectLinks(ctx context.Context, links []entities.Hash) error {
+	if !s.validateLinks {
+		return nil
+	}
 	nonZeroLinks := links[:0]
 	for _, p := range links {
 		if !p.IsZero() {
