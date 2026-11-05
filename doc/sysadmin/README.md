@@ -312,6 +312,8 @@ abfs --kv metrics-provider=otel --kv record-client-metrics=true config -w
 * `console` writes JSON to standard output, which is useful to check the setup.
 * `none` exports nothing.
 
+A comma-separated list combines them, for example `OTEL_METRICS_EXPORTER=otlp,prometheus` to push to a collector and serve `/metrics` at once. In a list, `OTEL_METRICS_PRODUCERS` does not apply, and a name listed twice or a name other than these four turns export off with a warning.
+
 The other standard `OTEL_*` variables apply as well, for example `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds, 60000 by default), `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`:
 
 ```sh

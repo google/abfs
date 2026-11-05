@@ -16,7 +16,8 @@
 //
 // Select it with the metrics-provider config key set to "otel". Exporters are
 // configured with the standard OTEL_* environment variables, for example
-// OTEL_METRICS_EXPORTER=otlp|prometheus|console|none.
+// OTEL_METRICS_EXPORTER=otlp|prometheus|console|none, or a comma-separated list
+// of them.
 //
 // The otlp exporter spaces the final export at exit at least 5 s from the
 // previous one, as some backends require, ignores Push, and does not support
@@ -32,7 +33,6 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -45,6 +45,9 @@ const (
 	ProviderName = "otel"
 	meterName    = "github.com/google/abfs"
 	setupTimeout = 10 * time.Second
+	// The provider of a failed start does a final export at shutdown, which a
+	// slow endpoint must not turn into a slow start.
+	failedStartTimeout = time.Second
 )
 
 func init() {
@@ -63,27 +66,27 @@ func newProvider(enabled bool) metrics.Provider {
 		log.Printf("Warning: metrics: failed to build the resource, falling back to Noop: %v", err)
 		return metrics.NewNoopProvider()
 	}
-	var (
-		reader sdkmetric.Reader
-		spaced *spacedExporter
-	)
-	// The otlp exporter is built here rather than by autoexport, so that Close
-	// can space the final export. autoexport keeps its producer registry
-	// unexported, so OTEL_METRICS_PRODUCERS does not apply to it.
-	switch os.Getenv("OTEL_METRICS_EXPORTER") {
-	case "", "otlp":
-		reader, spaced, err = newOTLPReader(ctx)
-	default:
-		reader, err = autoexport.NewMetricReader(ctx)
-	}
+	r, err := newReaders(ctx, os.Getenv("OTEL_METRICS_EXPORTER"))
 	if err != nil {
 		log.Printf("Warning: metrics: failed to create the metric exporter, falling back to Noop: %v", err)
 		return metrics.NewNoopProvider()
 	}
-	return metrics.WrapBackend(newBackend(sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(reader),
-	), spaced))
+	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
+	for _, reader := range r.readers {
+		opts = append(opts, sdkmetric.WithReader(reader))
+	}
+	provider := sdkmetric.NewMeterProvider(opts...)
+	// Listeners start only once every reader exists, so a failure leaves none open.
+	if err := r.start(); err != nil {
+		log.Printf("Warning: metrics: failed to start the metric exporter, falling back to Noop: %v", err)
+		sctx, scancel := context.WithTimeout(ctx, failedStartTimeout)
+		defer scancel()
+		if err := provider.Shutdown(sctx); err != nil {
+			log.Printf("Warning: metrics: failed to shut down the metric exporters: %v", err)
+		}
+		return metrics.NewNoopProvider()
+	}
+	return metrics.WrapBackend(newBackend(provider, r.spaced))
 }
 
 // backend implements metrics.Backend on an OpenTelemetry MeterProvider.
