@@ -801,3 +801,38 @@ func TestSupportsLinksContent_OffUnlessEnabled(t *testing.T) {
 	s.SetLinksContentThreshold(0)
 	assert.True(t, s.supportsLinksContent(ctx))
 }
+
+func TestSearchRefs_ConcurrentWithProjectCacheWrites(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s := newEmulatorCASDBServer(t)
+
+	target := entities.NewHash("1111111111111111111111111111111111111111")
+	s.headers[target[0]].Add(target, newCachedHeader(&ObjectHeader{Id: target, Size: 10, Type: string(entities.ObjectTypeBlob)}))
+	require.NoError(s.PutRefs(ctx, "race.example", "seed", []remote.RefHash{{Ref: "refs/heads/r", Hash: target}}))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := int64(1); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// What projectForRefs does when another request creates a project.
+			s.projectIDsLock.Lock()
+			s.projectsByID[-i] = [2]string{"race.example", fmt.Sprintf("p%d", i)}
+			s.projectsByName[[2]string{"race.example", fmt.Sprintf("p%d", i)}] = -i
+			s.projectIDsLock.Unlock()
+		}
+	}()
+	for range 50 {
+		refs, err := s.SearchRefs(ctx, "race.example", "", "refs/heads/r", 0)
+		require.NoError(err)
+		require.Len(refs, 1)
+	}
+	close(stop)
+	<-done
+}

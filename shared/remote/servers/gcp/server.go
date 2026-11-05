@@ -642,6 +642,8 @@ func (s *GCPServer) SearchRefs(ctx context.Context, server string, project strin
 	}
 
 	refs := make([]remote.ProjectRefHash, 0, len(refIDs))
+	s.projectIDsLock.RLock()
+	defer s.projectIDsLock.RUnlock()
 	for _, refID := range refIDs {
 		sp := s.projectsByID[refID.ProjectID]
 		if sp[0] != server {
