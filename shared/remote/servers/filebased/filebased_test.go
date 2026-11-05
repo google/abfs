@@ -15,12 +15,15 @@
 package filebased
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/google/abfs/shared/objects"
 	_ "github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/zstd"
 )
 
 // TODO Make these tests more generic so that we run them against all server implementations.
@@ -156,4 +160,30 @@ func TestPutObject_DuplicateBig(t *testing.T) {
 	got, err := io.ReadAll(reader)
 	require.NoError(err, "error reading content")
 	require.Equal(got, content)
+}
+
+func TestPutObject_CorruptContentFails(t *testing.T) {
+	s, cleanup := Setup(t)
+	defer cleanup()
+
+	content := make([]byte, 4<<20)
+	_, err := rand.Read(content)
+	require.NoError(t, err)
+	obj := append(fmt.Appendf(nil, "blob %d\x00", len(content)), content...)
+	compressed, err := zstd.Compress(obj)
+	require.NoError(t, err)
+	for i := len(compressed) / 2; i < len(compressed); i++ {
+		compressed[i] ^= 0xff
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.PutObject(context.Background(), objects.HashBytes(obj), remote.NewContentReader(io.NopCloser(bytes.NewReader(compressed)), remote.EncodingZStd))
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("PutObject of corrupt content did not return")
+	}
 }

@@ -16,12 +16,16 @@ package remote
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects"
 	_ "github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/zstd"
 )
@@ -344,4 +348,41 @@ func TestValidatorZstdDirLinksExistHash(t *testing.T) {
 	require.Equal(t, "tree", validator.Type())
 	require.Equal(t, int64(46), validator.Size())
 	require.Equal(t, []Hash{blobHash}, validator.Links())
+}
+
+// corruptZStdBlob returns a blob compressed with zstd whose compressed stream
+// is damaged from the middle on, so that the decoder fails, and the key of the
+// intact blob.
+func corruptZStdBlob(t *testing.T) (entities.Hash, []byte) {
+	t.Helper()
+	content := make([]byte, 4<<20)
+	_, err := rand.Read(content)
+	require.NoError(t, err)
+	obj := append(fmt.Appendf(nil, "blob %d\x00", len(content)), content...)
+	compressed, err := zstd.Compress(obj)
+	require.NoError(t, err)
+	for i := len(compressed) / 2; i < len(compressed); i++ {
+		compressed[i] ^= 0xff
+	}
+	return objects.HashBytes(obj), compressed
+}
+
+func TestValidatorCorruptContentFailsWrites(t *testing.T) {
+	key, data := corruptZStdBlob(t)
+	validator, err := NewValidator(key, EncodingZStd)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(validator, bytes.NewReader(data))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		// The writer sees why the content was rejected.
+		require.Equal(t, err, validator.Close())
+	case <-time.After(10 * time.Second):
+		t.Fatal("Write blocked after the content could not be decoded")
+	}
 }
