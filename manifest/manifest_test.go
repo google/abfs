@@ -155,6 +155,100 @@ func TestFlattenIncludes(t *testing.T) {
 	require.Equal(t, want, string(got))
 }
 
+func TestFlattenIncludes_GroupsAndRevision(t *testing.T) {
+	files := map[string]string{
+		"top.xml": `<manifest>
+ <remote name="origin" fetch=".." revision="remote-rev"></remote>
+ <default remote="origin" revision="main"></default>
+ <project name="p/top"></project>
+ <include name="a.xml" groups="g1"></include>
+ <include name="r.xml" revision="include-rev"></include>
+</manifest>`,
+		"a.xml": `<manifest>
+ <project name="p/a"></project>
+ <include name="b.xml" groups="g2" revision="r2"></include>
+</manifest>`,
+		"b.xml": `<manifest>
+ <project name="p/b" groups="own"></project>
+ <extend-project name="p/a" groups="x"></extend-project>
+ <include name="c.xml"></include>
+</manifest>`,
+		"c.xml": `<manifest>
+ <project name="p/c"></project>
+ <project name="p/d" revision="mine"></project>
+</manifest>`,
+		"r.xml": `<manifest>
+ <project name="p/r"></project>
+</manifest>`,
+	}
+	bytes := func(ctx context.Context, name string) ([]byte, error) {
+		return []byte(files[name]), nil
+	}
+
+	m, err := Parse([]byte(files["top.xml"]))
+	require.NoError(t, err)
+	require.NoError(t, m.FlattenIncludes(context.Background(), bytes))
+	require.NoError(t, m.Validate())
+
+	type got struct {
+		Groups       []string
+		GroupsString string
+		Revision     string
+	}
+	projects := make(map[string]got)
+	for _, p := range m.Project {
+		projects[p.Name] = got{p.Groups, p.GroupsString, p.Revision}
+	}
+	require.Equal(t, map[string]got{
+		"p/top": {},
+		"p/a":   {[]string{"g1"}, "g1", ""},
+		"p/b":   {[]string{"g1", "g2", "own"}, "g1,g2,own", "r2"},
+		"p/c":   {[]string{"g1", "g2"}, "g1,g2", "r2"},
+		"p/d":   {[]string{"g1", "g2"}, "g1,g2", "mine"},
+		"p/r":   {nil, "", "include-rev"},
+	}, projects)
+	require.Equal(t, []string{"g1", "g2", "x"}, m.ExtendProject[0].Groups)
+	require.Equal(t, "g1,g2,x", m.ExtendProject[0].GroupsString)
+}
+
+// Included files may repeat the default and the remotes, as in repo, but not change them.
+func TestFlattenIncludes_RepeatedDefaultAndRemote(t *testing.T) {
+	top := `<manifest>
+ <remote name="aosp" fetch=".." review="https://review.example.com"></remote>
+ <default remote="aosp" revision="main"></default>
+ <include name="inc.xml"></include>
+</manifest>`
+	tests := []struct {
+		name    string
+		inc     string
+		wantErr string
+	}{
+		{name: "equal default", inc: `<default remote="aosp" revision="main"></default>`},
+		{name: "empty default", inc: `<default></default>`},
+		{name: "different default", inc: `<default remote="aosp" revision="other"></default>`, wantErr: "default element already exists"},
+		{name: "equal remote", inc: `<remote name="aosp" fetch=".." review="https://review.example.com"></remote>`},
+		{name: "different remote", inc: `<remote name="aosp" fetch=".." review="https://other.example.com"></remote>`, wantErr: "remote aosp already exists with different attributes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bytes := func(ctx context.Context, name string) ([]byte, error) {
+				return []byte("<manifest>\n " + tt.inc + "\n <project name=\"p/one\"></project>\n</manifest>"), nil
+			}
+			m, err := Parse([]byte(top))
+			require.NoError(t, err)
+			err = m.FlattenIncludes(context.Background(), bytes)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, m.Validate())
+			require.Equal(t, "main", m.Default.Revision)
+			require.Len(t, m.Project, 1)
+		})
+	}
+}
+
 func TestFilter(t *testing.T) {
 	in := `<manifest>
  <notice>Hello Notice</notice>

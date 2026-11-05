@@ -16,8 +16,10 @@ package abfsrepo
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -72,4 +74,30 @@ func TestLoadManifest_SmartSyncOverrideGroups(t *testing.T) {
 		"one": {"g1", "g2"},
 		"two": nil,
 	}, projectGroups(r))
+}
+
+func selectedPaths(r *Repo, groups ...string) []string {
+	r.groupsInclude, r.groupsExclude = FilterGroups(groups)
+	r.filterProjectsByGroups()
+	return slices.Sorted(maps.Keys(r.projectsByPath))
+}
+
+func TestLoadManifest_IncludeGroups(t *testing.T) {
+	r := newTestRepo(t, map[string]string{
+		"default.xml": `<manifest>
+  <remote name="origin" fetch="https://example.com" />
+  <default revision="main" remote="origin" />
+  <project name="p/one" path="one" />
+  <include name="extra.xml" groups="extra" />
+</manifest>
+`,
+		"extra.xml": `<manifest>
+  <project name="p/two" path="two" />
+</manifest>
+`,
+	})
+
+	require.NoError(t, r.loadManifest(context.Background()))
+	require.Equal(t, []string{"one", "two"}, selectedPaths(r))
+	require.Equal(t, []string{"two"}, selectedPaths(r, "extra"))
 }

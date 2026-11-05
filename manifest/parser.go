@@ -30,6 +30,21 @@ func (e *ExtendProject) parse() {
 	e.Groups = parseGroups(e.GroupsString)
 }
 
+// addGroups returns the union of both group lists, sorted as repo writes them.
+func addGroups(groups, extra []string) []string {
+	if len(extra) == 0 {
+		return groups
+	}
+	union := slices.Clone(groups)
+	for _, g := range extra {
+		if !slices.Contains(union, g) {
+			union = append(union, g)
+		}
+	}
+	slices.Sort(union)
+	return union
+}
+
 // parseGroups splits a groups attribute as repo does: on commas and white space,
 // dropping empty and repeated names.
 func parseGroups(s string) []string {
