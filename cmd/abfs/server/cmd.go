@@ -52,6 +52,9 @@ type serverCmd struct {
 	maxConnectionAge time.Duration
 	shutdownTimeout  time.Duration
 	drainDelay       time.Duration
+	probeInterval    time.Duration
+	probeTimeout     time.Duration
+	probeFailures    int
 	aresEnabled      bool
 	tlsCertFile      string
 	tlsKeyFile       string
@@ -68,7 +71,7 @@ func NewCmd(rootCmd *root.RootCmd) *serverCmd {
 func (c *serverCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:        "server",
-		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--drain-delay <duration>] [--shutdown-timeout <duration>] [--tls-cert-file <path>] [--tls-key-file <path>]",
+		Usage:       "[-p <port>] [--http-port <port>] [--no-link-validation] [--no-hash-validation] [--ares-enabled] [--max-connection-age <duration>] [--drain-delay <duration>] [--shutdown-timeout <duration>] [--health-probe-interval <duration>] [--health-probe-timeout <duration>] [--health-probe-failures <n>] [--tls-cert-file <path>] [--tls-key-file <path>]",
 		Aliases:     []string{},
 		Desc:        `Start ABFS server for blobs, objects and map results.`,
 		Subcommands: c.subcommands(),
@@ -84,6 +87,9 @@ func (c *serverCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.DurationVar(&c.maxConnectionAge, "max-connection-age", 0, "A duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. Supports units like '1h', '30m', '1s'. Default is 0 (no limit).")
 	fl.DurationVar(&c.drainDelay, "drain-delay", 0, "How long to keep serving after a shutdown signal, while health checks already report NOT_SERVING, so that load balancers and health checkers stop sending new requests before the server stops accepting them. Size it from the health check interval times the unhealthy threshold. 0 means the drain starts at once.")
 	fl.DurationVar(&c.shutdownTimeout, "shutdown-timeout", 25*time.Second, "How long to wait for pending RPCs on shutdown before closing their connections, so that a stalled or vanished client cannot keep the server from exiting. Keep it below the time your process manager waits before killing the server. 0 means no limit.")
+	fl.DurationVar(&c.probeInterval, "health-probe-interval", 0, "How often to probe the storage backend while serving. When probes fail, health checks report NOT_SERVING for the overall status and the ABFS service, so that load balancers, Kubernetes readiness probes and other health checkers stop sending requests to this server. A backend outage shared by several servers marks all of them NOT_SERVING, and a load balancer with no healthy backend then fails every request unless it fails open. The file-based server's probe writes and reads. Another server type is probed only if it provides backend checks. A load balancer for ARES traffic should check the ARES service name, not the overall status. 0 means no probe.")
+	fl.DurationVar(&c.probeTimeout, "health-probe-timeout", 5*time.Second, "How long one backend health probe may take before it counts as failed. Must be above 0 and not above --health-probe-interval.")
+	fl.IntVar(&c.probeFailures, "health-probe-failures", 3, "Report NOT_SERVING when this many of the last 2N-1 backend health probes failed, and SERVING again after this many passed in a row.")
 	// TODO: override hashpath or some other solution for local testing?
 	fl.BoolVar(&c.aresEnabled, "ares-enabled", false, fmt.Sprintf("Polls the hashpath %q for the list of ARES servers to proxy to", aresgrpc.ConfigARESServersHashPath))
 	fl.StringVar(&c.tlsCertFile, "tls-cert-file", "", "Path to the TLS certificate file")
@@ -105,10 +111,30 @@ func (c *serverCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	return clierr.NoSubcommandErr(fl)
 }
 
+func (c *serverCmd) checkHealthProbeFlags() error {
+	if c.probeInterval < 0 {
+		return fmt.Errorf("invalid --health-probe-interval %s: must not be negative", c.probeInterval)
+	}
+	if c.probeInterval == 0 {
+		return nil
+	}
+	if c.probeTimeout <= 0 || c.probeTimeout > c.probeInterval {
+		return fmt.Errorf("invalid --health-probe-timeout %s: must be above 0 and not above --health-probe-interval %s", c.probeTimeout, c.probeInterval)
+	}
+	if c.probeFailures < 1 {
+		return fmt.Errorf("invalid --health-probe-failures %d: must be 1 or more", c.probeFailures)
+	}
+	return nil
+}
+
 func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
+	}
+	if err := c.checkHealthProbeFlags(); err != nil {
+		_ = lis.Close()
+		return err
 	}
 
 	var aresProxy *aresgrpc.RandomConnMgr
@@ -149,6 +175,28 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create gprc server: %w", err)
+	}
+	if c.probeInterval > 0 {
+		var probes map[string]func(context.Context) error
+		if p, ok := abfsServer.(interface {
+			HealthProbes() map[string]func(context.Context) error
+		}); ok {
+			probes = p.HealthProbes()
+		}
+		// Stops with the shutdown signal, when serveGRPC reports NOT_SERVING.
+		probeCtx, cancelProbe := context.WithCancel(ctx)
+		defer cancelProbe()
+		go func() {
+			if err := server.RunHealthProbe(probeCtx, &server.HealthProbeOpts{
+				Health:   hs,
+				Probes:   probes,
+				Interval: c.probeInterval,
+				Timeout:  c.probeTimeout,
+				Failures: c.probeFailures,
+			}); err != nil {
+				log.Printf("WARNING: backend health probe not started: %v", err)
+			}
+		}()
 	}
 
 	go func() {

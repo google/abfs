@@ -105,6 +105,24 @@ abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE file-based --local-d
 
 </details>
 
+#### Health checks while serving
+
+By default the server's gRPC health service reports `SERVING` for as long as the server runs, whatever the state of its storage. With `--health-probe-interval` the server probes its storage backend at that interval and reports `NOT_SERVING` for the overall status (service name `""`) and for the `abfs.ABFS` service while the backend fails, so that load balancers, Kubernetes readiness probes and other health checkers stop sending requests to it. Set it on every server behind a load balancer or watched by a health checker, together with `--drain-delay` (see below). It is a flag of `abfs server`, so it goes before the backend:
+
+```sh
+abfs server --port 50051 --health-probe-interval 10s --drain-delay 15s file-based --local-dir "$SERVER_DIR"
+```
+
+* A probe round runs the checks of the backend in parallel. It fails when a check returns an error or does not return within `--health-probe-timeout` (5s by default, not above the interval). A round still running when the next one is due counts as one more failure each interval, and its result is ignored when it comes. The server reports `NOT_SERVING` when `--health-probe-failures` (N, 3 by default) of the last 2N-1 rounds failed, and `SERVING` again after N rounds in a row passed. With the defaults and a 10s interval, the server reports `NOT_SERVING` 20 to 30 seconds after a backend failure starts when the checks fail at once, and up to 40 seconds after it when a check is slow or hangs; it reports `SERVING` again 20 to 30 seconds after the failure ends. A load balancer or readiness probe adds its own interval and thresholds on top.
+* The file-based server checks that `--local-dir` is still the directory it started with, writes, syncs and removes a small file named `.abfs-health-probe` in it, and reads one stored object from disk. A full disk, a read-only remount, a permission change and a moved or unmounted directory fail the probe. The probe does not wait for the server's I/O limit, so a disk saturated by requests can fail it too.
+* Other server types are probed only when they provide backend checks.
+* The in-memory server has no backend to probe. With the flag set it logs that once and keeps reporting `SERVING`.
+* Servers that share a backend fail their probes together, so a backend outage marks all of them `NOT_SERVING` at once. A load balancer then has no healthy server left: depending on the product it fails every request or fails open and sends requests to every server again, and a Kubernetes Service whose pods are all not ready has no ready endpoints, so connections to it fail. Running clients retry such calls under their retry policy; new client processes fail their connect check within 10 seconds with "error during health check". A failure of one backend takes the server out even when requests that do not use that backend would still work.
+* With a single server and no load balancer, every new client process that does the connect check (the CLI, the `abfs mount` preflight, a git-pusher start) fails at connect with "not healthy, status was NOT_SERVING" while the backend is down. Cacheman and running mounts are not affected.
+* The probe sets only the overall status and `abfs.ABFS`. A load balancer for proxied ARES traffic (`--ares-enabled`) should check the ARES service name, not the overall status.
+* When a metrics provider is configured, two gauges follow the probe: `abfs_server_serving` is 1 while the server reports `SERVING` and 0 after the failure rule and from the shutdown signal on; `abfs_server_backend_up{backend}` is 1 for each backend whose check passed in the last round and 0 for one that failed or did not return in time. Every failed round logs its elapsed time and the error of each failed backend.
+* On a shutdown signal the health service reports `NOT_SERVING` for good; the probe never sets it back to `SERVING`.
+
 #### Stopping the server
 
 The server stops gracefully on `SIGTERM` or `SIGINT` (Ctrl+C): it stops accepting connections, lets in-flight requests finish, closes its files and exits with status 0. Requests still running after `--shutdown-timeout` (25s by default) have their connections closed, and the server still exits with status 0, so a client that stopped reading or went away cannot keep the server from exiting. Size it from the time the largest transfer should be given to finish, and keep it below the time your service manager, container runtime or orchestrator waits before it kills the server. `--shutdown-timeout 0` waits for every request, however long it takes. It is a flag of `abfs server`, so it goes before the backend:

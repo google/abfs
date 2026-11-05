@@ -16,7 +16,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +35,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/google/abfs/shared/cmd/root"
+	"github.com/google/abfs/shared/remote/grpc/server"
+	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
 const waitMethod = "/test.Slow/Wait"
@@ -224,4 +229,112 @@ func TestServerCmd_ShutdownTimeoutDefault(t *testing.T) {
 	require.NoError(t, fl.Parse(nil))
 	require.Equal(t, 25*time.Second, c.shutdownTimeout)
 	require.Zero(t, c.drainDelay)
+}
+
+func TestServeGRPC_HealthProbeKeepsDrain(t *testing.T) {
+	require := require.New(t)
+
+	s := grpc.NewServer()
+	hs := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(s, hs)
+	lis := bufconn.Listen(1024)
+	// The marker shows when the drain has shut the health service down.
+	const marker = "test.Marker"
+	hs.SetServingStatus(marker, grpc_health_v1.HealthCheckResponse_SERVING)
+	healthOf := func(service string) grpc_health_v1.HealthCheckResponse_ServingStatus {
+		// Eventually calls this on another goroutine, so it cannot fail the test.
+		resp, _ := hs.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{Service: service})
+		return resp.GetStatus()
+	}
+
+	// The probe keeps running through the drain, which is the worst case: in
+	// Serve it stops with the same signal.
+	var pass atomic.Bool
+	var calls atomic.Int32
+	probeCtx, cancelProbe := context.WithCancel(context.Background())
+	defer cancelProbe()
+	go func() {
+		if err := server.RunHealthProbe(probeCtx, &server.HealthProbeOpts{
+			Health: hs,
+			Probes: map[string]func(context.Context) error{
+				"store": func(context.Context) error {
+					calls.Add(1)
+					if pass.Load() {
+						return nil
+					}
+					return errors.New("backend down")
+				},
+			},
+			Interval: 10 * time.Millisecond,
+			Timeout:  10 * time.Millisecond,
+			Failures: 1,
+		}); err != nil {
+			t.Error(err)
+		}
+	}()
+	require.Eventually(func() bool { return healthOf("") == grpc_health_v1.HealthCheckResponse_NOT_SERVING }, 10*time.Second, time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		served <- serveGRPC(ctx, s, hs, lis, 10*time.Second, time.Minute)
+	}()
+	cancel()
+	require.Eventually(func() bool { return healthOf(marker) == grpc_health_v1.HealthCheckResponse_NOT_SERVING }, 10*time.Second, time.Millisecond)
+
+	// Passing probes during the drain must not report SERVING again.
+	pass.Store(true)
+	n := calls.Load()
+	require.Eventually(func() bool { return calls.Load() >= n+3 }, 10*time.Second, time.Millisecond)
+	require.Equal(grpc_health_v1.HealthCheckResponse_NOT_SERVING, healthOf(""))
+	require.Equal(grpc_health_v1.HealthCheckResponse_NOT_SERVING, healthOf("abfs.ABFS"))
+	select {
+	case err := <-served:
+		t.Fatalf("serveGRPC returned during the drain: %v", err)
+	default:
+	}
+	s.Stop()
+}
+
+func TestServerCmd_HealthProbeDefaults(t *testing.T) {
+	c := NewCmd(root.NewRootCommand())
+	fl := pflag.NewFlagSet("server", pflag.ContinueOnError)
+	c.RegisterFlags(fl)
+	require.NoError(t, fl.Parse(nil))
+	require.Zero(t, c.probeInterval)
+	require.Equal(t, 5*time.Second, c.probeTimeout)
+	require.Equal(t, 3, c.probeFailures)
+}
+
+func TestServerCmd_ServeRejectsHealthProbeFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "negative interval", args: []string{"--health-probe-interval=-1s"}, wantErr: "--health-probe-interval"},
+		{name: "timeout above interval", args: []string{"--health-probe-interval=1s", "--health-probe-timeout=2s"}, wantErr: "--health-probe-timeout"},
+		{name: "zero timeout", args: []string{"--health-probe-interval=1s", "--health-probe-timeout=0"}, wantErr: "--health-probe-timeout"},
+		{name: "no failures", args: []string{"--health-probe-interval=10s", "--health-probe-failures=0"}, wantErr: "--health-probe-failures"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			// Serve must release the port when it rejects the flags.
+			lis, err := net.Listen("tcp", ":0")
+			require.NoError(err)
+			port := strconv.Itoa(lis.Addr().(*net.TCPAddr).Port)
+			require.NoError(lis.Close())
+
+			c := NewCmd(root.NewRootCommand())
+			fl := pflag.NewFlagSet("server", pflag.ContinueOnError)
+			c.RegisterFlags(fl)
+			require.NoError(fl.Parse(append([]string{"--port=" + port}, tt.args...)))
+			require.ErrorContains(c.Serve(context.Background(), inmemory.New()), tt.wantErr)
+
+			lis, err = net.Listen("tcp", ":"+port)
+			require.NoError(err, "the port is still bound")
+			require.NoError(lis.Close())
+		})
+	}
 }
