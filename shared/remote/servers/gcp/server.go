@@ -194,6 +194,7 @@ var _ remote.RemoteCloser = (*GCPServer)(nil)
 
 type GCPServer struct {
 	casdb                 *casdb.CASDB
+	addObject             func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error
 	depot                 *depot.MasterDepot
 	storeLinks            bool
 	validateHash          bool
@@ -259,6 +260,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		validateHash:          true,
 		linksContentThreshold: linksThreshold,
 		casdb:                 cas,
+		addObject:             cas.AddObject,
 	}
 	for i := range s.headers {
 		s.headers[i], err = lru.New[entities.Hash, CachedHeader](maxCachedHeaders / 256)
@@ -459,22 +461,19 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	if err != nil {
 		return err
 	}
+	addAttempted := false
 	defer func() {
-		if retErr != nil {
-			// Note: there is a tiny window where AddObject could commit on the
-			// server while returning a client-side context error, causing this
-			// cleanup to remove the committed chunk.
-			go func() {
-				start := time.Now()
-				cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-				defer cancel()
-				if err := s.depot.Remove(cleanupCtx, content); err != nil {
-					log.Printf("Failed to remove content of failed PutObject (%s): %v", key, err)
-				} else {
-					log.Printf("Removed content of failed PutObject (%s) in %s", key, time.Since(start))
-				}
-			}()
+		if retErr == nil {
+			return
 		}
+		if addAttempted {
+			// A failed AddObject call may still have written the object row, for
+			// example when the response was lost, and other replicas may have
+			// read it, so the content stays for a later orphan sweep.
+			log.Printf("Kept content of failed PutObject (%s): the object row may reference it", key)
+			return
+		}
+		go s.removeFailedContent(key, content)
 	}()
 
 	if err := validator.Close(); err != nil {
@@ -496,13 +495,27 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		Content:  content,
 	}
 
-	err = s.casdb.AddObject(ctx, header, objContent)
+	addAttempted = true
+	err = s.addObject(ctx, header, objContent)
 	if err == nil {
 		s.headers[key[0]].PeekOrAdd(key, newCachedHeader(header))
 		s.content[key[0]].PeekOrAdd(key, objContent)
 	}
 
 	return err
+}
+
+// removeFailedContent removes the content stored by a PutObject that failed
+// before it tried to write the object row.
+func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	if err := s.depot.Remove(ctx, content); err != nil {
+		log.Printf("Failed to remove content of failed PutObject (%s): %v", key, err)
+	} else {
+		log.Printf("Removed content of failed PutObject (%s) in %s", key, time.Since(start))
+	}
 }
 
 // MapResults implements remote.RemoteProvider.

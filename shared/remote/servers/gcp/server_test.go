@@ -15,6 +15,7 @@
 package gcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"cloud.google.com/go/bigtable"
@@ -608,6 +610,7 @@ func createTestServerWithCASDB(t *testing.T) (*GCPServer, *fakeSpannerServer) {
 	master := depot.NewMasterDepot([]depot.Depot{mem})
 	s := createTestServer(t, master)
 	s.casdb = db
+	s.addObject = db.AddObject
 	s.projectsByName = make(map[[2]string]int64)
 	s.projectsByID = make(map[int64][2]string)
 	return s, fakeSpanner
@@ -696,4 +699,88 @@ func TestFilterServerXchgRefAndXchgRefs(t *testing.T) {
 	require.NoError(t, filterServer.XchgRefs(allowedCtx, "srv", "proj", []remote.RefXchg{
 		{Ref: "refs/heads/main", Current: hash1, Desired: entities.ZeroHash},
 	}))
+}
+
+func TestPutObject_FailedAddObjectKeepsCommittedContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, _ := createTestServerWithCASDB(t)
+
+	// The mutation is applied but the call still fails, as when the response is lost.
+	s.addObject = func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error {
+		require.NoError(s.casdb.AddObject(ctx, hdr, content))
+		return errors.New("response lost")
+	}
+	content := []byte("blob 11\x00hello world")
+	key := objects.HashBlobBytes([]byte("hello world"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.Error(err)
+
+	readable := func() bool {
+		r, err := s.GetObject(ctx, key)
+		if err != nil {
+			return false
+		}
+		defer r.Close()
+		_, err = io.ReadAll(r)
+		return err == nil
+	}
+	require.Never(func() bool { return !readable() }, 500*time.Millisecond, 10*time.Millisecond)
+}
+
+// recordingDepot records the chunks it removes.
+type recordingDepot struct {
+	depot.Depot
+	mu      sync.Mutex
+	removed []string
+}
+
+func (d *recordingDepot) Remove(ctx context.Context, c depot.Chunk) error {
+	d.mu.Lock()
+	d.removed = append(d.removed, c.ID)
+	d.mu.Unlock()
+	return d.Depot.Remove(ctx, c)
+}
+
+func (d *recordingDepot) removedCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.removed)
+}
+
+func newRecordingServer(t *testing.T) (*GCPServer, *recordingDepot) {
+	t.Helper()
+	s, _ := createTestServerWithCASDB(t)
+	rec := &recordingDepot{Depot: depot.NewMemoryDepot("mem", 1000000)}
+	s.depot = depot.NewMasterDepot([]depot.Depot{rec})
+	return s, rec
+}
+
+func TestPutObject_AttemptedAddObjectKeepsContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, rec := newRecordingServer(t)
+
+	// Whether the row was written is unknown, so the content must stay.
+	s.addObject = func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error {
+		return errors.New("write failed")
+	}
+	content := []byte("blob 11\x00hello again")
+	key := objects.HashBlobBytes([]byte("hello again"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.Error(err)
+	require.Never(func() bool { return rec.removedCount() > 0 }, 500*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestPutObject_FailureBeforeAddObjectRemovesContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, rec := newRecordingServer(t)
+
+	// The content does not hash to the key, so PutObject fails before AddObject.
+	content := []byte("blob 11\x00hello again")
+	key := objects.HashBlobBytes([]byte("other content"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.ErrorContains(err, "expected hash")
+	require.Eventually(func() bool { return rec.removedCount() == 1 }, 2*time.Second, 10*time.Millisecond)
 }
