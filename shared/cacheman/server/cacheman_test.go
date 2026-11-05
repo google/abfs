@@ -210,6 +210,81 @@ func TestCachemanPutRefsRace(t *testing.T) {
 	require.GreaterOrEqual(t, elapsed, 200*time.Millisecond)
 }
 
+func TestCachemanConfigRefReadAfterWrite(t *testing.T) {
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	logDir := filepath.Join(tempDir, "log")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+	require.NoError(t, os.MkdirAll(logDir, 0755))
+
+	trueVal := true
+	falseVal := false
+	flagsConfig := &instance.ConfigOptional{
+		CacheDir:    &cacheDir,
+		LogDir:      &logDir,
+		LocalOnly:   &trueVal, // Start as LocalOnly to bypass remote setup
+		EnableIndex: &falseVal,
+	}
+
+	inst := instance.NewInstance("default", tempDir, tempDir, "abfs", flagsConfig, instance.DefaultFlavor)
+	defer func() {
+		require.NoError(t, inst.Close())
+	}()
+
+	mockRemote := inmemory.New()
+	c, err := New(inst, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, c.Stop())
+	}()
+
+	c.config.LocalOnly = false
+	c.abfsClient = mockRemote
+	c.setupDAGSync(context.Background(), c.config, true)
+	// Widen the time the ref spends in dagsync, as a busy cacheman would.
+	c.getSync().MailboxDelay = 200 * time.Millisecond
+
+	// abfs edit writes the new config tree to the local cache only; cacheman pushes it.
+	ctx := context.Background()
+	configYAML := []byte("- config:\n    manifest-server: manifest.example.com\n")
+	blobHash := objects.HashBlobBytes(configYAML)
+	require.NoError(t, c.store.WriteBlob(ctx, blobHash, bytes.NewReader(configYAML)))
+	clientsTree, err := gitobjects.EncodeTree([]entities.FileEntry{
+		{Name: "configs", Mode: entities.FileModeRegular, Hash: blobHash},
+	})
+	require.NoError(t, err)
+	clientsHash := entities.Hash(sha1.Sum(clientsTree))
+	require.NoError(t, c.store.PutTree(ctx, clientsHash, clientsTree, entities.TreeMeta{Sizes: []int64{int64(len(configYAML))}}))
+	rootTree, err := gitobjects.EncodeTree([]entities.FileEntry{
+		{Name: "clients", Mode: entities.FileModeDir, Hash: clientsHash},
+	})
+	require.NoError(t, err)
+	rootHash := entities.Hash(sha1.Sum(rootTree))
+	require.NoError(t, c.store.PutTree(ctx, rootHash, rootTree, entities.TreeMeta{Sizes: []int64{0}}))
+
+	// The store of the CLI sends every ref update as non-blocking.
+	ref := entities.RefHash{Ref: "config", Hash: rootHash}
+	require.NoError(t, c.putRefs(entities.ABFSMetaServer, entities.ABFSMetaProject, []entities.RefHash{ref}, false))
+
+	// The next command reads the ref through cacheman and the client config from the instance.
+	hashes, err := c.abfsClient.GetRefs(ctx, entities.ABFSMetaServer, entities.ABFSMetaProject, []string{"config"})
+	require.NoError(t, err)
+	require.Equal(t, rootHash, hashes[0])
+	require.NotNil(t, inst.RemoteConfig)
+	require.NotNil(t, inst.RemoteConfig.ManifestServer)
+	require.Equal(t, "manifest.example.com", *inst.RemoteConfig.ManifestServer)
+
+	// A config ref to an object that is in no store fails at once instead of at the timeout.
+	c.config.RefUpdateTimeout = 3 * time.Second
+	lost := entities.RefHash{Ref: "config", Hash: entities.Hash(sha1.Sum([]byte("never written")))}
+	start := time.Now()
+	err = c.putRefs(entities.ABFSMetaServer, entities.ABFSMetaProject, []entities.RefHash{lost}, false)
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(t, err, &linkErr)
+	require.Less(t, time.Since(start), c.config.RefUpdateTimeout)
+}
+
 type mockARIBlobClient struct {
 	blobs map[string][]byte
 }

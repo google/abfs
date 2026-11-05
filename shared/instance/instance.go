@@ -202,6 +202,8 @@ func (i *Instance) readLocalConfigFile() {
 func (i *Instance) readRemoteConfigFile() {
 	config := i.readFileConfig(i.RemoteConfigFile)
 	checksum := config.Checksum()
+	i.lock.Lock()
+	defer i.lock.Unlock()
 	if i.RemoteConfigChecksum == checksum {
 		return
 	}
@@ -210,8 +212,11 @@ func (i *Instance) readRemoteConfigFile() {
 	i.RemoteConfigChecksum = checksum
 }
 
+// SetNewRemoteConfig is safe to call while the config file watcher runs.
 func (i *Instance) SetNewRemoteConfig(remoteConfig *ConfigOptional) {
 	checksum := remoteConfig.Checksum()
+	i.lock.Lock()
+	defer i.lock.Unlock()
 	if i.RemoteConfigChecksum == checksum {
 		return
 	}

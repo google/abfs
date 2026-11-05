@@ -1143,6 +1143,23 @@ func (c *CacheMan) watchClientsOverrides(ctx context.Context) error {
 	return nil
 }
 
+// readClientsOverrides reads the clients overrides from the server now, without waiting for the next watch round.
+func (c *CacheMan) readClientsOverrides(ctx context.Context) error {
+	hp, err := hashpath.Parse(instance.ClientsConfigsHashPath)
+	if err != nil {
+		return err
+	}
+	overrides, err := remoteconfig.ReadConfigFromHP[*instance.ConfigRemoteOverrides](ctx, hp, remote.NewRemoteStore(c.abfsClient))
+	if err != nil {
+		return err
+	}
+	if err := overrides.Validate(); err != nil {
+		return err
+	}
+	c.instance.SetNewRemoteConfig(c.resolveRemoteConfig(overrides))
+	return nil
+}
+
 func (c *CacheMan) resolveRemoteConfig(overrides *instance.ConfigRemoteOverrides) *instance.ConfigOptional {
 	clientInfo := instance.ClientInfo{
 		User:    c.instance.User,
@@ -2792,13 +2809,21 @@ func (c *CacheMan) putRefs(server, project string, refHashes []entities.RefHash,
 		c.printer.Printf("PutRefs(server=%q, project=%q, refs=%v)\n", server, project, refHashes)
 	}
 
-	if !blocking {
+	// Clients and pushers read a config right after it is written, so an update of the config ref
+	// returns only once the server has it and the clients overrides are read again.
+	updatesConfig := isConfigRefUpdate(server, project, refHashes)
+	if !blocking && !updatesConfig {
 		sync.PutRefs(server, project, refHashes)
 		return nil
 	}
 
 	done := make(chan error, 1)
 	sync.PutRefs(server, project, refHashes, func(err error) {
+		// dagsync pushes the missing objects it has locally and then puts the refs again.
+		var linkErr *remote.ErrObjectLinkValidation
+		if errors.As(err, &linkErr) && c.hasLocally(context.Background(), linkErr.MissingLinks) {
+			return
+		}
 		select {
 		case done <- err:
 		default:
@@ -2824,6 +2849,13 @@ func (c *CacheMan) putRefs(server, project string, refHashes []entities.RefHash,
 				project, server, err,
 			)
 		}
+		if updatesConfig {
+			ctx, cancel := context.WithTimeout(context.Background(), c.config.RefUpdateTimeout)
+			defer cancel()
+			if err := c.readClientsOverrides(ctx); err != nil {
+				c.printer.Printf("Cannot read the clients overrides after the config update: %v\n", err)
+			}
+		}
 		return nil
 	case <-time.After(c.config.RefUpdateTimeout):
 		return fmt.Errorf(
@@ -2831,6 +2863,35 @@ func (c *CacheMan) putRefs(server, project string, refHashes []entities.RefHash,
 			project, server, c.config.RefUpdateTimeout,
 		)
 	}
+}
+
+// hasLocally reports whether every hash is in the local cache as an object or a blob.
+func (c *CacheMan) hasLocally(ctx context.Context, hashes []entities.Hash) bool {
+	for _, h := range hashes {
+		if has, err := c.store.HasObject(ctx, h); err == nil && has {
+			continue
+		}
+		if has, err := c.store.HasBlob(ctx, h); err == nil && has {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// configRef is the ref of the hash-path "config:<path>" that abfs edit writes.
+const configRef = "config"
+
+func isConfigRefUpdate(server, project string, refHashes []entities.RefHash) bool {
+	if server != entities.ABFSMetaServer || project != entities.ABFSMetaProject {
+		return false
+	}
+	for _, r := range refHashes {
+		if r.Ref == configRef {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *CacheMan) reconcileDiskObject(hash entities.Hash, objType protocol.RequestObjectType, trackedInLRU map[entities.Hash]struct{}) {
