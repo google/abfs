@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/google/abfs/shared/telemetry"
 )
 
 func newTestBackend(t *testing.T) (*backend, *sdkmetric.ManualReader) {
@@ -131,4 +133,17 @@ func TestBackend_MissingLabelValues(t *testing.T) {
 	sum := collect(t, reader, "requests_total").(metricdata.Sum[float64])
 	require.Len(t, sum.DataPoints, 1)
 	require.Equal(t, attrs("method", "Headers", "result", ""), sum.DataPoints[0].Attributes)
+}
+
+func TestNewProvider_SetsMeterProvider(t *testing.T) {
+	require := require.New(t)
+	t.Setenv("OTEL_METRICS_EXPORTER", "none")
+	t.Cleanup(func() { telemetry.SetMeterProvider(nil) })
+
+	newProvider(false)
+	require.Nil(telemetry.MeterProvider(), "a disabled provider sets no meter provider")
+
+	p := newProvider(true)
+	t.Cleanup(func() { require.NoError(p.Close(context.Background())) })
+	require.NotNil(telemetry.MeterProvider())
 }

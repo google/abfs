@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/google/abfs/shared/telemetry"
 )
 
 // freePort returns a local TCP port that was free a moment ago.
@@ -113,9 +115,11 @@ func TestNewProvider_ListenerFailure(t *testing.T) {
 	t.Cleanup(func() { _ = busy.Close() })
 	t.Setenv("OTEL_EXPORTER_PROMETHEUS_PORT", strconv.Itoa(busy.Addr().(*net.TCPAddr).Port))
 	t.Setenv("OTEL_METRICS_EXPORTER", "otlp,prometheus")
+	t.Cleanup(func() { telemetry.SetMeterProvider(nil) })
 
 	p := newProvider(true)
 	require.NoError(p.Close(context.Background()))
+	require.Nil(telemetry.MeterProvider(), "a provider that failed to start is not recorded")
 }
 
 func TestNewProvider_ListenerFailureSlowEndpoint(t *testing.T) {
@@ -145,11 +149,13 @@ func TestNewProvider_ListenerFailureSlowEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://"+silent.Addr().String())
 	t.Setenv("OTEL_EXPORTER_PROMETHEUS_PORT", strconv.Itoa(busy.Addr().(*net.TCPAddr).Port))
 	t.Setenv("OTEL_METRICS_EXPORTER", "otlp,prometheus")
+	t.Cleanup(func() { telemetry.SetMeterProvider(nil) })
 
 	start := time.Now()
 	p := newProvider(true)
 	require.Less(time.Since(start), 5*time.Second, "a failed start does not wait for the final export")
 	require.NoError(p.Close(context.Background()))
+	require.Nil(telemetry.MeterProvider())
 }
 
 func TestNewProvider_List(t *testing.T) {
@@ -157,6 +163,7 @@ func TestNewProvider_List(t *testing.T) {
 	port := freePort(t)
 	t.Setenv("OTEL_EXPORTER_PROMETHEUS_PORT", port)
 	t.Setenv("OTEL_METRICS_EXPORTER", "prometheus,console")
+	t.Cleanup(func() { telemetry.SetMeterProvider(nil) })
 
 	p := newProvider(true)
 	p.NewCounter("abfs_test_total", "Count of tests", nil).Inc()
@@ -166,6 +173,7 @@ func TestNewProvider_List(t *testing.T) {
 	require.NoError(err)
 	require.NoError(resp.Body.Close())
 	require.Contains(string(body), "abfs_test_total")
+	require.NotNil(telemetry.MeterProvider())
 
 	require.NoError(p.Close(context.Background()))
 	require.False(listening(port), "Close stops the listener")

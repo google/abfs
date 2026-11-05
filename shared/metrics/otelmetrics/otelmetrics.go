@@ -86,6 +86,7 @@ func newProvider(enabled bool) metrics.Provider {
 		}
 		return metrics.NewNoopProvider()
 	}
+	telemetry.SetMeterProvider(provider)
 	return metrics.WrapBackend(newBackend(provider, r.spaced))
 }
 
