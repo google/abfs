@@ -15,6 +15,7 @@
 package casdb
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -316,22 +317,38 @@ func (c *CASDB) AddMapResult(ctx context.Context, from, to entities.Hash) error 
 	return c.mapsTable.Apply(ctx, rowKey, mut)
 }
 
+// MapResults returns the results added for from, oldest first, as file-based
+// does. Rows are keyed by result, so the order comes from the cell timestamps;
+// results added in the same millisecond keep the row key order. Each server
+// sets the timestamps from its own clock, so with several servers the order of
+// results added close together follows their clock skew.
 func (c *CASDB) MapResults(ctx context.Context, from entities.Hash) ([]entities.Hash, error) {
 	prefix := from.String() + "#"
-	var results []entities.Hash
+	type mapResult struct {
+		hash  entities.Hash
+		added bigtable.Timestamp
+	}
+	var results []mapResult
 
 	filter := bigtable.ChainFilters(bigtable.CellsPerRowLimitFilter(1), bigtable.StripValueFilter())
 	err := c.mapsTable.ReadRows(ctx, bigtable.PrefixRange(prefix), func(row bigtable.Row) bool {
 		toStr := strings.TrimPrefix(row.Key(), prefix)
-		if toStr != "" {
-			results = append(results, entities.NewHash(toStr))
+		if toStr != "" && len(row["cf"]) > 0 {
+			results = append(results, mapResult{hash: entities.NewHash(toStr), added: row["cf"][0].Timestamp})
 		}
 		return true
 	}, bigtable.RowFilter(filter))
 	if err != nil {
 		return nil, err
 	}
-	return results, nil
+	slices.SortStableFunc(results, func(a, b mapResult) int {
+		return cmp.Compare(a.added, b.added)
+	})
+	hashes := make([]entities.Hash, len(results))
+	for i, r := range results {
+		hashes[i] = r.hash
+	}
+	return hashes, nil
 }
 
 func (c *CASDB) GetOrCreateProject(ctx context.Context, host, project string) (int64, error) {
