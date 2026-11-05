@@ -158,6 +158,15 @@ func GetProvider() Provider {
 	return *globalProvider.Load()
 }
 
+// Init builds the provider set with SetProvider now if it is a LazyProvider,
+// rather than at its first metric. A daemon calls it when code outside this
+// package needs the backend before the first metric is created.
+func Init() {
+	if l, ok := GetProvider().(*LazyProvider); ok {
+		l.init()
+	}
+}
+
 type providerWrapper struct {
 	Backend // Promote Backend's methods
 }

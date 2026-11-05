@@ -33,6 +33,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote"
 	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/server"
@@ -131,6 +132,8 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	// The gRPC handler records into the metrics backend, so build it first.
+	metrics.Init()
 	var extraOpts []grpc.ServerOption
 	if h := telemetry.ServerHandler(); h != nil {
 		extraOpts = append(extraOpts, grpc.StatsHandler(h))

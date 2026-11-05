@@ -19,11 +19,15 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/stats"
 )
 
 func resetTracing(t *testing.T) {
@@ -162,4 +166,43 @@ func TestPushRatio(t *testing.T) {
 			require.Equal(t, tt.want, pushRatio())
 		})
 	}
+}
+
+// serverRPC drives h through one server call of method.
+func serverRPC(h stats.Handler, method string) {
+	start := time.Now()
+	ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: method})
+	h.HandleRPC(ctx, &stats.Begin{BeginTime: start})
+	h.HandleRPC(ctx, &stats.End{BeginTime: start, EndTime: start.Add(time.Millisecond)})
+}
+
+func TestServerHandler_Metrics(t *testing.T) {
+	require := require.New(t)
+	resetTracing(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "")
+	reader := sdkmetric.NewManualReader()
+	SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { SetMeterProvider(nil) })
+
+	h := ServerHandler()
+	require.NotNil(h, "metrics alone install the server handler")
+	require.Nil(ClientHandler(), "clients record no metrics")
+	serverRPC(h, "/abfs.ABFS/Headers")
+	serverRPC(h, "/grpc.health.v1.Health/Check")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(reader.Collect(context.Background(), &rm))
+	var methods []string
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "rpc.server.call.duration" {
+				continue
+			}
+			for _, dp := range m.Data.(metricdata.Histogram[float64]).DataPoints {
+				v, _ := dp.Attributes.Value("rpc.method")
+				methods = append(methods, v.AsString())
+			}
+		}
+	}
+	require.Equal([]string{"abfs.ABFS/Headers"}, methods, "health checks are not recorded")
 }

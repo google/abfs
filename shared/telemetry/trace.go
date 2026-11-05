@@ -29,6 +29,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -126,29 +127,38 @@ func Tracer(name string) trace.Tracer {
 	return tracerProvider.Tracer(name)
 }
 
-// ServerHandler returns the gRPC server stats handler for traces, or nil when
-// tracing is off.
+// ServerHandler returns the gRPC server stats handler, or nil when both
+// tracing and metrics are off. It records spans when tracing is on and the
+// rpc.server.call.duration metric when the metrics backend set a meter
+// provider.
 func ServerHandler() stats.Handler {
-	if tracerProvider == nil {
+	mp := MeterProvider()
+	if tracerProvider == nil && mp == nil {
 		return nil
 	}
-	return otelgrpc.NewServerHandler(grpcOptions(tracerProvider)...)
+	var tp trace.TracerProvider = tracenoop.NewTracerProvider()
+	if tracerProvider != nil {
+		tp = tracerProvider
+	}
+	if mp == nil {
+		mp = metricnoop.NewMeterProvider()
+	}
+	return otelgrpc.NewServerHandler(grpcOptions(tp, mp)...)
 }
 
 // ClientHandler returns the gRPC client stats handler for traces, or nil when
-// tracing is off.
+// tracing is off. It records no metrics.
 func ClientHandler() stats.Handler {
 	if tracerProvider == nil {
 		return nil
 	}
-	return otelgrpc.NewClientHandler(grpcOptions(tracerProvider)...)
+	return otelgrpc.NewClientHandler(grpcOptions(tracerProvider, metricnoop.NewMeterProvider())...)
 }
 
-func grpcOptions(tp trace.TracerProvider) []otelgrpc.Option {
+func grpcOptions(tp trace.TracerProvider, mp metric.MeterProvider) []otelgrpc.Option {
 	return []otelgrpc.Option{
 		otelgrpc.WithTracerProvider(tp),
-		// The server has its own RPC metrics.
-		otelgrpc.WithMeterProvider(metricnoop.NewMeterProvider()),
+		otelgrpc.WithMeterProvider(mp),
 		otelgrpc.WithPropagators(propagation.TraceContext{}),
 		otelgrpc.WithFilter(filters.None(filters.HealthCheck(), filters.ServicePrefix("grpc.reflection."))),
 	}

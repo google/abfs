@@ -327,6 +327,7 @@ Things to know:
 
 * Each command waits up to 15 seconds at exit for its final export. With `otlp`, that export comes at least 5 seconds after the previous export, since some backends reject a point less than 5 seconds after the previous point of the same series. A command can take up to 5 seconds longer to exit. If an export still in flight leaves too little time, the final export is skipped with a warning.
 * `OTEL_METRICS_PRODUCERS` does not apply to `otlp`.
+* The server records `rpc.server.call.duration` for each gRPC method and status code, in the gRPC handler that also traces its calls. Its buckets run from 50 microseconds to 1 hour. gRPC health checks and reflection are not recorded.
 * A backend that identifies a series by `service.name`, `service.instance.id` and the metric labels keeps one series per ABFS instance on a host, and an instance keeps its series across restarts. Two commands of one instance that run at the same time and write the same metric with the same labels share a series; `abfs.runID` is not part of that key. To report under another identity, set `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES`.
 
 The cacheman service that `abfs init` or `cacheman init` sets up runs under `systemd` and does not see `OTEL_*` variables set in a shell. Without them it exports with the defaults: OTLP over HTTP with TLS to `https://localhost:4318`. Set them for the service in a drop-in, then restart it (replace `default` with the instance name). The drop-in survives a later `abfs init`, which rewrites only the unit file:

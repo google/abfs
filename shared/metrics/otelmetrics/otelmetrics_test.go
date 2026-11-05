@@ -17,11 +17,14 @@ package otelmetrics
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"google.golang.org/grpc/stats"
 
 	"github.com/google/abfs/shared/telemetry"
 )
@@ -146,4 +149,22 @@ func TestNewProvider_SetsMeterProvider(t *testing.T) {
 	p := newProvider(true)
 	t.Cleanup(func() { require.NoError(p.Close(context.Background())) })
 	require.NotNil(telemetry.MeterProvider())
+}
+
+func TestNewMeterProvider_RPCDurationBuckets(t *testing.T) {
+	require := require.New(t)
+	reader := sdkmetric.NewManualReader()
+	telemetry.SetMeterProvider(newMeterProvider(resource.Empty(), []sdkmetric.Reader{reader}))
+	t.Cleanup(func() { telemetry.SetMeterProvider(nil) })
+
+	h := telemetry.ServerHandler()
+	start := time.Now()
+	ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/abfs.ABFS/Headers"})
+	h.HandleRPC(ctx, &stats.Begin{BeginTime: start})
+	h.HandleRPC(ctx, &stats.End{BeginTime: start, EndTime: start.Add(200 * time.Microsecond)})
+
+	points := collect(t, reader, "rpc.server.call.duration").(metricdata.Histogram[float64]).DataPoints
+	require.Len(points, 1)
+	require.Equal(rpcDurationBuckets, points[0].Bounds)
+	require.Equal(uint64(1), points[0].BucketCounts[2], "a 200 us call lands in the bucket up to 250 us")
 }

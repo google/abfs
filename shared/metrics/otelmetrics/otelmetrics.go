@@ -36,6 +36,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 
 	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/telemetry"
@@ -49,6 +50,15 @@ const (
 	// slow endpoint must not turn into a slow start.
 	failedStartTimeout = time.Second
 )
+
+// rpcDurationBuckets replace the otelgrpc buckets of rpc.server.call.duration,
+// which start at 5 ms.
+var rpcDurationBuckets = []float64{
+	0.00005, 0.0001, 0.00025, 0.0005, // sub-millisecond, warm Headers
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+	1, 2.5, 5, 10, 30,
+	60, 300, 900, 3600, // large objects and slow clients
+}
 
 func init() {
 	metrics.Register(ProviderName, newProvider)
@@ -71,11 +81,7 @@ func newProvider(enabled bool) metrics.Provider {
 		log.Printf("Warning: metrics: failed to create the metric exporter, falling back to Noop: %v", err)
 		return metrics.NewNoopProvider()
 	}
-	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
-	for _, reader := range r.readers {
-		opts = append(opts, sdkmetric.WithReader(reader))
-	}
-	provider := sdkmetric.NewMeterProvider(opts...)
+	provider := newMeterProvider(res, r.readers)
 	// Listeners start only once every reader exists, so a failure leaves none open.
 	if err := r.start(); err != nil {
 		log.Printf("Warning: metrics: failed to start the metric exporter, falling back to Noop: %v", err)
@@ -88,6 +94,20 @@ func newProvider(enabled bool) metrics.Provider {
 	}
 	telemetry.SetMeterProvider(provider)
 	return metrics.WrapBackend(newBackend(provider, r.spaced))
+}
+
+func newMeterProvider(res *resource.Resource, readers []sdkmetric.Reader) *sdkmetric.MeterProvider {
+	opts := []sdkmetric.Option{
+		sdkmetric.WithResource(res),
+		sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{Name: "rpc.server.call.duration"},
+			sdkmetric.Stream{Aggregation: sdkmetric.AggregationExplicitBucketHistogram{Boundaries: rpcDurationBuckets}},
+		)),
+	}
+	for _, reader := range readers {
+		opts = append(opts, sdkmetric.WithReader(reader))
+	}
+	return sdkmetric.NewMeterProvider(opts...)
 }
 
 // backend implements metrics.Backend on an OpenTelemetry MeterProvider.
