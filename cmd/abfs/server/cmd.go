@@ -132,6 +132,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	composedServer = servers.NewMetricsServer(composedServer, metrics.GetProvider())
 	// The gRPC handler records into the metrics backend, so build it first.
 	metrics.Init()
 	var extraOpts []grpc.ServerOption

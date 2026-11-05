@@ -105,6 +105,18 @@ abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE file-based --local-d
 
 </details>
 
+#### Server metrics
+
+The server records the metrics below through the metrics provider that the `metrics-provider` config key selects, when `record-client-metrics` is `true`. Without a provider it records none of them.
+
+* `abfs_server_requests_total{method,result}` counts requests by method and result.
+* `abfs_server_requests_in_flight{method}` is the number of requests in progress.
+* `abfs_server_headers_keys_total{result}` counts the keys that `Headers` looked up, with `result` `found` or `not_found`.
+* `abfs_server_headers_batch_keys` is a histogram of the number of keys in each `Headers` call.
+* `abfs_server_object_bytes_total{direction}` counts encoded object bytes, `in` for `PutObject` and `out` for `GetObject`.
+
+The `result` of a request is `ok`, `not_found` (the object does not exist, or the ref's server is unknown), `missing_links` (the server does not have every object the request links to), `permission_denied`, `canceled` (the client canceled the request or its deadline passed) or `error` (any other error).
+
 ### Configuration
 
 Some configuration of ABFS is still done through command-line flags, but we are trying to move everything to use configuration stored in the CAS itself for dynamic update purposes. We call this feature Hashpaths and you can read more in the [Hashpath code comments](../../shared/hashpath/README.md).
