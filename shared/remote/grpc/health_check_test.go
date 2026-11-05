@@ -15,8 +15,11 @@
 package grpc
 
 import (
+	"context"
 	"net"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -119,3 +122,57 @@ type mockBytesStatHandler struct{}
 
 func (m mockBytesStatHandler) AddBytesSent(int64)     {}
 func (m mockBytesStatHandler) AddBytesReceived(int64) {}
+
+// flipHealthServer reports NOT_SERVING for its first notServing checks, then SERVING.
+type flipHealthServer struct {
+	grpc_health_v1.UnimplementedHealthServer
+	notServing int32
+	checks     atomic.Int32
+}
+
+func (f *flipHealthServer) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	if f.checks.Add(1) <= f.notServing {
+		return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_NOT_SERVING}, nil
+	}
+	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+}
+
+func dialFlipHealthServer(t *testing.T, notServing int32) (*flipHealthServer, error) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s := grpc.NewServer()
+	hs := &flipHealthServer{notServing: notServing}
+	grpc_health_v1.RegisterHealthServer(s, hs)
+	go func() { _ = s.Serve(lis) }()
+	t.Cleanup(s.Stop)
+
+	conn, err := GrpcDialHealthy(&GrpcDialOpts{
+		ServiceName:      "test-service",
+		Address:          lis.Addr().String(),
+		BytesStatHandler: mockBytesStatHandler{},
+		ClientVersion:    "0.1.2",
+		ServerMinVersion: "0.1.1",
+		DisableTLS:       true,
+	})
+	if err == nil {
+		require.NoError(t, conn.Close())
+	}
+	return hs, err
+}
+
+func TestGrpcDialHealthy_RetriesNotServing(t *testing.T) {
+	_, err := dialFlipHealthServer(t, 2)
+	require.NoError(t, err)
+}
+
+func TestGrpcDialHealthy_NotServingPastTimeout(t *testing.T) {
+	defer func(d time.Duration) { connectHealthTimeout = d }(connectHealthTimeout)
+	connectHealthTimeout = 3 * time.Second
+
+	start := time.Now()
+	hs, err := dialFlipHealthServer(t, 1000)
+	require.ErrorContains(t, err, "not healthy, status was NOT_SERVING")
+	require.Less(t, time.Since(start), connectHealthTimeout+time.Second)
+	require.Greater(t, hs.checks.Load(), int32(1))
+}
