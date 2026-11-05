@@ -117,6 +117,7 @@ func TestGetObjectLinkedContentThresholdAndFallback(t *testing.T) {
 	master := depot.NewMasterDepot([]depot.Depot{fake})
 
 	s := createTestServer(t, master)
+	s.linksContent = true
 	s.SetLinksContentThreshold(100)
 
 	// Store a chunk in the fake depot
@@ -175,6 +176,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 	master := depot.NewMasterDepot([]depot.Depot{noLink})
 
 	s := createTestServer(t, master)
+	s.linksContent = true
 	s.SetLinksContentThreshold(100)
 
 	contentStr := "some data in memory depot without linked content support"
@@ -199,7 +201,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 }
 
 func TestSupportsLinksContentVersionCheck(t *testing.T) {
-	s := &GCPServer{}
+	s := &GCPServer{linksContent: true}
 	s.SetLinksContentThreshold(100)
 
 	// No metadata in context -> false
@@ -783,4 +785,19 @@ func TestPutObject_FailureBeforeAddObjectRemovesContent(t *testing.T) {
 	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
 	require.ErrorContains(err, "expected hash")
 	require.Eventually(func() bool { return rec.removedCount() == 1 }, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestSupportsLinksContent_OffUnlessEnabled(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("client-version", "0.1.23"))
+
+	s := &GCPServer{}
+	s.SetLinksContentThreshold(100)
+	assert.False(t, s.supportsLinksContent(ctx))
+
+	s.linksContent = true
+	assert.True(t, s.supportsLinksContent(ctx))
+
+	// A zero threshold returns links for every object; it does not turn links off.
+	s.SetLinksContentThreshold(0)
+	assert.True(t, s.supportsLinksContent(ctx))
 }

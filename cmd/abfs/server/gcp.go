@@ -47,6 +47,7 @@ type gcpCmd struct {
 	bucket                string
 	maxCachedHeaders      int
 	maxCachedContents     int
+	linksContent          bool
 	linksContentThreshold int64
 }
 
@@ -69,7 +70,8 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.bucket, "bucket", "", "The GCS Bucket Name (required)")
 	fl.IntVarP(&c.maxCachedHeaders, "headers-cache", "", defaultMaxCachedHeaders, "The maximum number of cached objects' headers")
 	fl.IntVarP(&c.maxCachedContents, "contents-cache", "", defaultMaxCachedContents, "The maximum number of cached objects' content")
-	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The threshold in bytes above which to return links content")
+	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
+	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -108,6 +110,7 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		BucketName:            c.bucket,
 		MaxCachedHeaders:      c.maxCachedHeaders,
 		MaxCachedContents:     c.maxCachedContents,
+		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
 	})
 	if err != nil {

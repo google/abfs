@@ -198,6 +198,7 @@ type GCPServer struct {
 	depot                 *depot.MasterDepot
 	storeLinks            bool
 	validateHash          bool
+	linksContent          bool
 	linksContentThreshold int64
 
 	headers        []*lru.Cache[entities.Hash, CachedHeader]
@@ -221,10 +222,13 @@ type NewServerOpts struct {
 	BtAppProfile string
 	// BtConnPool sets the Bigtable gRPC connection pool size. A non-positive
 	// value uses DefaultBtConnPool.
-	BtConnPool            int
-	BucketName            string
-	MaxCachedHeaders      int
-	MaxCachedContents     int
+	BtConnPool        int
+	BucketName        string
+	MaxCachedHeaders  int
+	MaxCachedContents int
+	// LinksContent makes GetObject return signed Cloud Storage URLs instead of the
+	// content for objects larger than LinksContentThreshold bytes.
+	LinksContent          bool
 	LinksContentThreshold int64
 }
 
@@ -247,9 +251,8 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if maxCachedContents == 0 {
 		maxCachedContents = DefaultMaxCachedContents
 	}
-	linksThreshold := opts.LinksContentThreshold
-	if linksThreshold == 0 {
-		linksThreshold = DefaultLinksContentThreshold
+	if opts.LinksContentThreshold < 0 {
+		return nil, fmt.Errorf("invalid links content threshold %d", opts.LinksContentThreshold)
 	}
 	s := &GCPServer{
 		headers:               make([]*lru.Cache[entities.Hash, CachedHeader], 256),
@@ -258,7 +261,8 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		projectsByID:          make(map[int64][2]string),
 		storeLinks:            false,
 		validateHash:          true,
-		linksContentThreshold: linksThreshold,
+		linksContent:          opts.LinksContent,
+		linksContentThreshold: opts.LinksContentThreshold,
 		casdb:                 cas,
 		addObject:             cas.AddObject,
 	}
@@ -338,7 +342,7 @@ func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities
 }
 
 func (s *GCPServer) supportsLinksContent(ctx context.Context) bool {
-	if s.linksContentThreshold == 0 {
+	if !s.linksContent {
 		return false
 	}
 	var clientVersion string
