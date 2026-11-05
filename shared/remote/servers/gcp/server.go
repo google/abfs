@@ -198,6 +198,7 @@ type GCPServer struct {
 	casdb                 *casdb.CASDB
 	addObject             func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error
 	depot                 *depot.MasterDepot
+	storage               *storage.Client
 	storeLinks            bool
 	validateHash          bool
 	validateLinks         bool
@@ -284,6 +285,10 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if err := s.setMasterDepot(ctx, opts.BucketName); err != nil {
 		_ = cas.Close()
 		return nil, err
+	}
+	if err := s.checkResources(ctx, opts.BucketName); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("resources missing, run 'abfs server gcp init' to create them: %w", err)
 	}
 	// As file-based, so that trees and refs that link the empty file or
 	// directory pass link validation on a new database.
@@ -788,6 +793,7 @@ func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string) error
 	if err != nil {
 		return err
 	}
+	s.storage = bucketCli
 
 	writeDepots := []depot.Depot{
 		depot.NewInlineDepot("inline", 32*1024, true),

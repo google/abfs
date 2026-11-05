@@ -108,9 +108,27 @@ func checkBucket(ctx context.Context, bucketName string) error {
 		return fmt.Errorf("failed to create the Cloud Storage client: %w", err)
 	}
 	defer client.Close()
-	_, err = client.Bucket(bucketName).Objects(ctx, &storage.Query{Prefix: "abfs-setup-check/"}).Next()
+	return checkBucketWith(ctx, client, bucketName)
+}
+
+func checkBucketWith(ctx context.Context, client *storage.Client, bucketName string) error {
+	_, err := client.Bucket(bucketName).Objects(ctx, &storage.Query{Prefix: "abfs-setup-check/"}).Next()
 	if err != nil && !errors.Is(err, iterator.Done) {
 		return fmt.Errorf("cannot list objects of bucket %s: %w", bucketName, err)
 	}
 	return nil
+}
+
+// checkResources checks that the Spanner tables, the Bigtable tables and the
+// bucket the server needs exist and can be read.
+func (s *GCPServer) checkResources(ctx context.Context, bucketName string) error {
+	if err := s.casdb.CheckSchema(ctx); err != nil {
+		return err
+	}
+	for _, table := range bigtableTables {
+		if _, err := s.casdb.BTClient().Open(table.name).ReadRow(ctx, "abfs-setup-check"); err != nil {
+			return fmt.Errorf("cannot read Bigtable table %s: %w", table.name, err)
+		}
+	}
+	return checkBucketWith(ctx, s.storage, bucketName)
 }

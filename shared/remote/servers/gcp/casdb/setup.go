@@ -20,6 +20,7 @@ import (
 	"log"
 	"strings"
 
+	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"google.golang.org/grpc/codes"
@@ -85,5 +86,31 @@ func createDatabase(ctx context.Context, client *database.DatabaseAdminClient, s
 		return fmt.Errorf("failed to create %s: %w", spannerDB, err)
 	}
 	log.Printf("Created %s", spannerDB)
+	return nil
+}
+
+// CheckSchema checks that the server's tables are readable and that the ref
+// target foreign key of earlier schemas is gone.
+func (c *CASDB) CheckSchema(ctx context.Context) error {
+	for _, table := range []string{"Projects", "Refs"} {
+		err := c.dbClient.Single().Query(ctx, spanner.Statement{SQL: "SELECT 1 FROM " + table + " LIMIT 1"}).Do(func(*spanner.Row) error { return nil })
+		if err != nil {
+			return fmt.Errorf("cannot read Spanner table %s: %w", table, err)
+		}
+	}
+	stmt := spanner.Statement{
+		SQL:    "SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_NAME = 'Refs' AND CONSTRAINT_NAME = @name",
+		Params: map[string]any{"name": refsTargetForeignKey},
+	}
+	found := false
+	if err := c.dbClient.Single().Query(ctx, stmt).Do(func(*spanner.Row) error {
+		found = true
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to read the Spanner schema: %w", err)
+	}
+	if found {
+		return fmt.Errorf("spanner table Refs has the foreign key %s, which rejects refs to objects", refsTargetForeignKey)
+	}
 	return nil
 }

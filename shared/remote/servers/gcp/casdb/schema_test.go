@@ -84,7 +84,17 @@ func newEmulatorDatabase(t *testing.T, ddl []string) string {
 	require.NoError(t, err)
 	_, err = dop.Wait(ctx)
 	require.NoError(t, err)
-	return fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID)
+	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID)
+	// The emulator limits the number of databases per instance.
+	t.Cleanup(func() {
+		dc, err := database.NewDatabaseAdminClient(context.Background())
+		if err != nil {
+			return
+		}
+		defer dc.Close()
+		_ = dc.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath})
+	})
+	return dbPath
 }
 
 func newEmulatorCASDB(t *testing.T) (*CASDB, string) {

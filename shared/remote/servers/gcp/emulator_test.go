@@ -88,6 +88,7 @@ func newEmulatorDatabase(t *testing.T) string {
 	}
 
 	dbID := randomID(t, "t")
+	dropDatabaseAtCleanup(t, dbID)
 	dc, err := database.NewDatabaseAdminClient(ctx)
 	require.NoError(t, err)
 	defer dc.Close()
@@ -188,4 +189,21 @@ func newEmulatorServer(t *testing.T, opts *NewServerOpts) *GCPServer {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// dropDatabaseAtCleanup drops the database when the test ends, because the
+// emulator limits the number of databases per instance.
+func dropDatabaseAtCleanup(t *testing.T, dbID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		dc, err := database.NewDatabaseAdminClient(ctx)
+		if err != nil {
+			return
+		}
+		defer dc.Close()
+		_ = dc.DropDatabase(ctx, &databasepb.DropDatabaseRequest{
+			Database: fmt.Sprintf("projects/%s/instances/%s/databases/%s", emulatorProject, emulatorInstance, dbID),
+		})
+	})
 }

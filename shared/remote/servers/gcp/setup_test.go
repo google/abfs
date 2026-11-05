@@ -30,6 +30,7 @@ import (
 )
 
 func setupOpts(t *testing.T, dbID string) *SetupOpts {
+	dropDatabaseAtCleanup(t, dbID)
 	return &SetupOpts{
 		ProjectID:  emulatorProject,
 		InstanceID: emulatorInstance,
@@ -123,4 +124,87 @@ func TestSetup_MissingBucket(t *testing.T) {
 	opts := setupOpts(t, randomID(t, "t"))
 	opts.BucketName = "no-such-bucket"
 	require.ErrorContains(t, Setup(context.Background(), opts), "no-such-bucket")
+}
+
+func TestNew_ChecksResources(t *testing.T) {
+	ctx := context.Background()
+	newOpts := func(o *SetupOpts) *NewServerOpts {
+		return &NewServerOpts{
+			ProjectID: o.ProjectID, InstanceID: o.InstanceID, DatabaseID: o.DatabaseID,
+			BtInstance: o.BtInstance, BucketName: o.BucketName, MaxCachedHeaders: 1024, MaxCachedContents: 1024,
+		}
+	}
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T) *SetupOpts
+		wantErr string
+	}{
+		{
+			name: "missing bucket",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmulatorBigtable(t)
+				o := setupOpts(t, newEmulatorDatabase(t))
+				o.BucketName = "no-such-bucket"
+				return o
+			},
+			wantErr: "no-such-bucket",
+		},
+		{
+			name: "missing Bigtable table",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmptyEmulatorBigtable(t)
+				return setupOpts(t, newEmulatorDatabase(t))
+			},
+			wantErr: "Bigtable table objects",
+		},
+		{
+			name: "missing Spanner table",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmulatorBigtable(t)
+				newEmulatorDatabase(t)
+				o := setupOpts(t, randomID(t, "t"))
+				createDatabase(t, o, []string{"CREATE TABLE Other (Id INT64) PRIMARY KEY (Id)"})
+				return o
+			},
+			wantErr: "Projects",
+		},
+		{
+			name: "refs target foreign key",
+			prepare: func(t *testing.T) *SetupOpts {
+				newEmulatorBigtable(t)
+				newEmulatorDatabase(t)
+				o := setupOpts(t, randomID(t, "t"))
+				createDatabase(t, o, schemaWithRefsTargetForeignKey)
+				return o
+			},
+			wantErr: "FK_Refs_TargetId",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := tt.prepare(t)
+			s, err := New(ctx, newOpts(o))
+			if err == nil {
+				_ = s.Close()
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+			require.ErrorContains(t, err, "abfs server gcp init")
+		})
+	}
+}
+
+func createDatabase(t *testing.T, o *SetupOpts, ddl []string) {
+	t.Helper()
+	ctx := context.Background()
+	dc, err := database.NewDatabaseAdminClient(ctx)
+	require.NoError(t, err)
+	defer dc.Close()
+	op, err := dc.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
+		Parent:          fmt.Sprintf("projects/%s/instances/%s", o.ProjectID, o.InstanceID),
+		CreateStatement: "CREATE DATABASE `" + o.DatabaseID + "`",
+		ExtraStatements: ddl,
+	})
+	require.NoError(t, err)
+	_, err = op.Wait(ctx)
+	require.NoError(t, err)
 }
