@@ -15,7 +15,9 @@
 package depot
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -53,13 +55,30 @@ func (d BucketDepot) Name() string {
 }
 
 func (d *BucketDepot) Store(ctx context.Context, name string, r io.Reader) (s Chunk, err error) {
-	w := d.bucket.Object(name).NewWriter(ctx)
+	// The previous chunk can end exactly at its limit; do not create an empty
+	// object for the end of the stream.
+	first := make([]byte, 1)
+	n, err := io.ReadFull(r, first)
+	if n == 0 {
+		if errors.Is(err, io.EOF) {
+			return s, io.EOF
+		}
+		return s, err
+	}
+	r = io.MultiReader(bytes.NewReader(first), r)
+
+	// Closing a writer completes the upload, so a failed copy cancels the
+	// writer's context instead to discard what was written.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := d.bucket.Object(name).NewWriter(wctx)
 	if d.maxBytes < int64(w.ChunkSize) {
 		w.ChunkSize = int(d.maxBytes)
 	}
-	n, err := copyNBuffer(w, r, d.maxBytes)
+	written, err := copyNBuffer(w, r, d.maxBytes)
 	if err != nil && err != io.EOF {
-		w.Close()
+		cancel()
+		_ = w.Close()
 		return s, err
 	}
 	if err := w.Close(); err != nil {
@@ -67,8 +86,8 @@ func (d *BucketDepot) Store(ctx context.Context, name string, r io.Reader) (s Ch
 	}
 	s.Depot = d.name
 	s.ID = name
-	s.Size = n
-	if n < d.maxBytes {
+	s.Size = written
+	if written < d.maxBytes {
 		err = io.EOF
 	}
 	return
