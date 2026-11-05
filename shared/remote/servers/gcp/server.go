@@ -205,6 +205,7 @@ type GCPServer struct {
 	validateLinks         bool
 	linksContent          bool
 	linksContentThreshold int64
+	bucketName            string
 
 	headers        []*lru.Cache[entities.Hash, CachedHeader]
 	content        []*lru.Cache[entities.Hash, *ObjectContent]
@@ -283,6 +284,7 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 		validateLinks:         !opts.NoLinkValidation,
 		linksContent:          opts.LinksContent,
 		linksContentThreshold: opts.LinksContentThreshold,
+		bucketName:            opts.BucketName,
 		casdb:                 cas,
 		addObject:             cas.AddObject,
 	}

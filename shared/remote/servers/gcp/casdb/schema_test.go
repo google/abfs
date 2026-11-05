@@ -152,3 +152,24 @@ func TestSchema_StatementsCanBeReappliedWithoutDataLoss(t *testing.T) {
 	require.NoError(err)
 	require.Equal(id, got)
 }
+
+func TestCASDB_CheckTables(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	c, dbPath := newEmulatorCASDB(t)
+	require.NoError(c.CheckTables(ctx))
+	require.NoError(c.CheckSchema(ctx))
+
+	dc, err := database.NewDatabaseAdminClient(ctx)
+	require.NoError(err)
+	defer dc.Close()
+	op, err := dc.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
+		Database:   dbPath,
+		Statements: []string{"DROP INDEX RefsRefIndex", "DROP TABLE Refs"},
+	})
+	require.NoError(err)
+	require.NoError(op.Wait(ctx))
+
+	require.ErrorContains(c.CheckTables(ctx), "Spanner table Refs")
+	require.ErrorContains(c.CheckSchema(ctx), "Spanner table Refs")
+}

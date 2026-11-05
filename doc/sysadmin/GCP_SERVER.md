@@ -88,6 +88,8 @@ The other flags (`--port`, TLS, `--auth-enabled`, `--acl-enabled`, logging) are 
 
 The server serves Prometheus metrics on `/metrics` of the HTTP server.
 
+`HealthProbes` gives one read-only probe per backend, for a health check that runs while the server serves: one query each on the Spanner tables `Projects` and `Refs`, one read of an absent row in each of the Bigtable tables `objects`, `maps` and `chunks`, and one listing of the bucket with a prefix that matches nothing (a Class A operation). Because the probes only read, a lost write permission, an exhausted write quota or failing Spanner commits fail every upload while the probes pass. Servers that share a backend fail their probes together when it is down, so a health check that takes a failing server out of service takes all of them out together. A Cloud Storage outage alone does this too, although refs and objects up to 1 MiB would still work.
+
 Several servers can share the same database, tables and bucket. Put them behind one address, for example a load balancer, and give clients that address in `--remote-servers`.
 
 ## Try it locally with emulators

@@ -176,6 +176,16 @@ func (s *FilterServer) RegisterHTTPRoutes(r *mux.Router) {
 	}
 }
 
+// HealthProbes returns the backend health checks of the underlying server, if it has any.
+func (s *FilterServer) HealthProbes() map[string]func(context.Context) error {
+	if h, ok := s.server.(interface {
+		HealthProbes() map[string]func(context.Context) error
+	}); ok {
+		return h.HealthProbes()
+	}
+	return nil
+}
+
 // Close implements remote.RemoteCloser.
 func (s *FilterServer) Close() error {
 	if err := s.validate(context.Background()); err != nil {
