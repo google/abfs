@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/cacheman/client"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -120,6 +121,26 @@ func FindRootForSocket(root, socketName string) (string, error) {
 	return "", entities.NotExistErrf("error reading the expected unix domain socket %q starting from %q", socketName, root)
 }
 
+// MountRootForSocket returns the root of the mount whose daemon socket is found from path. A
+// Soong top below the mount root has a socket of its own, so the socket's directory is not
+// always the root. Inside a sandbox that bind mounts only the top, such as Soong's at /src, the
+// walk ends at the bind mount and returns the top; no caller runs there today.
+func MountRootForSocket(path, socketName string) (string, error) {
+	socketDir, err := FindRootForSocket(path, socketName)
+	if err != nil {
+		return "", err
+	}
+	return mountRoot(socketDir), nil
+}
+
+func mountRoot(socketDir string) string {
+	root, err := bindcas.MountPoint(socketDir)
+	if err != nil {
+		return socketDir
+	}
+	return root
+}
+
 func NewClient(rootDir, socketName string, cacheDir string, localOnly bool, fetchTimeout time.Duration) (*Client, error) {
 	root, err := FindRootForSocket(rootDir, socketName)
 	if err != nil {
@@ -141,7 +162,7 @@ func NewClient(rootDir, socketName string, cacheDir string, localOnly bool, fetc
 
 	return &Client{
 		cli:         cli,
-		root:        root,
+		root:        mountRoot(root),
 		store:       store,
 		cacheDir:    cacheDir,
 		cacheClient: store.CachemanClient(),
