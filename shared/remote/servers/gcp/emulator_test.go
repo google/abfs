@@ -105,21 +105,25 @@ func newEmulatorDatabase(t *testing.T) string {
 // newEmulatorBigtable starts an in-process Bigtable with the server tables.
 func newEmulatorBigtable(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
+	newEmptyEmulatorBigtable(t)
+	adm, err := bigtable.NewAdminClient(context.Background(), emulatorProject, emulatorBigtable)
+	require.NoError(t, err)
+	defer adm.Close()
+	for _, table := range bigtableTables {
+		require.NoError(t, adm.CreateTable(context.Background(), table.name))
+		for _, f := range table.families {
+			require.NoError(t, adm.CreateColumnFamily(context.Background(), table.name, f))
+		}
+	}
+}
+
+// newEmptyEmulatorBigtable starts an in-process Bigtable without tables.
+func newEmptyEmulatorBigtable(t *testing.T) {
+	t.Helper()
 	srv, err := bttest.NewServer("localhost:0")
 	require.NoError(t, err)
 	t.Cleanup(srv.Close)
 	t.Setenv("BIGTABLE_EMULATOR_HOST", srv.Addr)
-
-	adm, err := bigtable.NewAdminClient(ctx, emulatorProject, emulatorBigtable)
-	require.NoError(t, err)
-	defer adm.Close()
-	for table, families := range map[string][]string{"objects": {"meta", "data"}, "maps": {"cf"}, "chunks": {"data"}} {
-		require.NoError(t, adm.CreateTable(ctx, table))
-		for _, f := range families {
-			require.NoError(t, adm.CreateColumnFamily(ctx, table, f))
-		}
-	}
 }
 
 // newEmulatorCASDBServer returns a server whose metadata is on the emulators and
