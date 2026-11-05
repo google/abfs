@@ -20,6 +20,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -95,6 +96,8 @@ type setupCmd struct {
 	abfsSourceDir    string
 	mountPoint       string
 	Chroot           string
+	listTopsOnly     bool
+	errOut           io.Writer
 	quiet            bool
 	verbose          bool
 	listOverlays     bool
@@ -126,7 +129,7 @@ func NewCmd(rootCmd *root.RootCmd) *setupCmd {
 func (c *setupCmd) Spec() cmd.CmdSpec {
 	return cmd.CmdSpec{
 		Name:    "setup",
-		Usage:   "[-l] [-q] [-s <source-dir>] [-c <chroot>] [-o <overlays>] [--salt <salt>] <casfs root or descendant>",
+		Usage:   "[-l] [-q] [-s <source-dir>] [-c <chroot>] [-o <overlays>] [--list] [--salt <salt>] <casfs root or descendant>",
 		Aliases: []string{},
 		Desc: `Setup an already mounted abfs environment for an abfs build.
 
@@ -138,6 +141,7 @@ to the mount point) that selects the overlays and views for --target.`,
 func (c *setupCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVarP(&c.abfsSourceDir, "source-dir", "s", ".", "The ABFS source directory to compile the patches from")
 	fl.StringVarP(&c.Chroot, "chroot", "c", "", "The root to apply applicable overlays on top, relative to mount point")
+	fl.BoolVar(&c.listTopsOnly, "list", false, "List the Soong tops of the mount and what is in place in each, without changing anything")
 	fl.BoolVarP(&c.quiet, "quiet", "q", false, "Do not print any logs")
 	fl.BoolVarP(&c.verbose, "verbose", "v", false, "Print the logs of steps")
 	fl.BoolVarP(&c.listOverlays, "overlays-list", "l", false, "List the available overlay combinations")
@@ -161,7 +165,8 @@ func (c *setupCmd) RegisterFlags(fl *pflag.FlagSet) {
 
 func (c *setupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	var err error
-	c.mountPoint, err = cmd.MountPoint(args.EnsureSingleArg(fl))
+	start := args.EnsureSingleArg(fl)
+	c.mountPoint, err = cmd.MountPoint(start)
 	if err != nil {
 		log.Fatalf("Could not find mount point: %v", err)
 	}
@@ -205,6 +210,14 @@ func (c *setupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 
 	if c.Config == nil {
 		return clierr.CLIErr("Config of setup cmd not set")
+	}
+
+	if c.listTopsOnly {
+		tops, source, err := c.findTops(start)
+		if err != nil {
+			return err
+		}
+		return c.listTops(os.Stdout, tops, source)
 	}
 
 	c.abfs, err = binding.NewClient(c.mountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
