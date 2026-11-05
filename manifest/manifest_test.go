@@ -68,6 +68,48 @@ func TestRemoveProjects(t *testing.T) {
 	require.NoError(t, m.Validate())
 }
 
+// A parsed manifest marshals back with every attribute and child it was read with.
+func TestRawManifestRoundTrip(t *testing.T) {
+	in := `<manifest>
+ <remote name="aosp" fetch=".."></remote>
+ <default remote="aosp" revision="main"></default>
+ <include name="extra.xml" groups="extra" revision="v1"></include>
+ <project name="p/one" path="one" groups="a,b"></project>
+ <project name="p/two" path="two"></project>
+ <remove-project path="one" optional="true" base-rev="main"></remove-project>
+ <extend-project name="p/two" path="two" groups="eg" revision="v2" remote="aosp" dest-path="moved" dest-branch="dev" upstream="up" base-rev="main">
+  <annotation name="k" value="v"></annotation>
+  <copyfile src="a" dest="b"></copyfile>
+  <linkfile src="c" dest="d"></linkfile>
+ </extend-project>
+</manifest>`
+
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	got, err := xml.MarshalIndent(m, "", " ")
+	require.NoError(t, err)
+	require.Equal(t, in, string(got))
+
+	again, err := Parse(got)
+	require.NoError(t, err)
+	require.Equal(t, m.Ordered, again.Ordered)
+	require.NoError(t, again.Validate())
+}
+
+func TestParseGroups(t *testing.T) {
+	in := `<manifest>
+ <project name="p/one" groups="a, b,,a	c"></project>
+ <project name="p/two"></project>
+ <extend-project name="p/one" groups=" d,e  d"></extend-project>
+</manifest>`
+
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b", "c"}, m.Project[0].Groups)
+	require.Empty(t, m.Project[1].Groups)
+	require.Equal(t, []string{"d", "e"}, m.ExtendProject[0].Groups)
+}
+
 // After cloning a manifest, the order of elements should be identical.
 func TestCloneOrder(t *testing.T) {
 	in := `<manifest>

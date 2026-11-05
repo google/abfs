@@ -17,16 +17,29 @@ package manifest
 import (
 	"encoding/xml"
 	"os"
+	"slices"
 	"strings"
+	"unicode"
 )
 
 func (p *Project) parse() {
-	for _, s := range strings.Split(p.GroupsString, ",") {
-		if s == "" {
-			continue
+	p.Groups = parseGroups(p.GroupsString)
+}
+
+func (e *ExtendProject) parse() {
+	e.Groups = parseGroups(e.GroupsString)
+}
+
+// parseGroups splits a groups attribute as repo does: on commas and white space,
+// dropping empty and repeated names.
+func parseGroups(s string) []string {
+	var groups []string
+	for _, g := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || unicode.IsSpace(r) }) {
+		if !slices.Contains(groups, g) {
+			groups = append(groups, g)
 		}
-		p.Groups = append(p.Groups, s)
 	}
+	return groups
 }
 
 // Parse parses the given XML data.
@@ -38,6 +51,9 @@ func Parse(contents []byte) (*Manifest, error) {
 
 	for i := range m.Project {
 		m.Project[i].parse()
+	}
+	for i := range m.ExtendProject {
+		m.ExtendProject[i].parse()
 	}
 	return &m, nil
 }

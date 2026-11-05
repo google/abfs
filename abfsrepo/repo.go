@@ -172,8 +172,8 @@ func (r *Repo) loadManifest(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var m *manifest.Manifest
-	if err := xml.Unmarshal(masterManBytes, &m); err != nil {
+	m, err := manifest.Parse(masterManBytes)
+	if err != nil {
 		return err
 	}
 
@@ -188,15 +188,6 @@ func (r *Repo) loadManifest(ctx context.Context) error {
 
 	if err := m.Validate(); err != nil {
 		return err
-	}
-
-	// TODO maybe move this to manfiest parser
-	for _, p := range m.Project {
-		if p.GroupsString != "" {
-			p.Groups = strings.Split(p.GroupsString, ",")
-		} else {
-			p.Groups = nil
-		}
 	}
 
 	r.flatMan = m
