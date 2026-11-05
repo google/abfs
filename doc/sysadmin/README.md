@@ -32,6 +32,8 @@ Depending on your Android history, the full git-pusher source code run could tak
 
 Start the main CAS gRPC server with an existing backing directory.
 
+To keep the CAS in Google Cloud (Spanner, Bigtable and Cloud Storage) instead of a local directory, see [GCP_SERVER.md](GCP_SERVER.md).
+
 > [!WARNING]
 > This release is missing authentication and authorization. Anyone who has network access to the CAS server can read and write any data. Please ensure it is firewalled appropriately.
 
