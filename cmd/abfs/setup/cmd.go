@@ -452,7 +452,7 @@ func (c *setupCmd) setupChroot(p string) error {
 		if err := c.abfs.Chroot(c.top, nil, nil); err != nil {
 			return err
 		}
-		if err := bindcas.SetExcluded(p, true); err != nil {
+		if err := includeTop(p); err != nil {
 			return err
 		}
 		// Setup used to copy the mount details into the top, and abfsbox prefers such a
@@ -505,6 +505,21 @@ func (c *setupCmd) setupChroot(p string) error {
 	// Relative symlink .repo/mount-details -> ../.abfs.mount-details; a top set up before
 	// may have one that points out of the chroot.
 	return replaceLink(chrootMountDetailsSym, filepath.Join("..", abfs.MountDetailsFileName))
+}
+
+// includeTop keeps a top in the workspace snapshot, so that the files a user keeps there
+// survive a remount. Setup used to exclude the top, so this clears the flag on a tree set up
+// before. A project directory stays excluded: the snapshot keeps it as a git repository.
+func includeTop(dir string) error {
+	excluded, err := bindcas.Excluded(dir)
+	if err != nil || !excluded {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+		return nil
+	}
+	log.Printf("Include %s in the workspace snapshot again", dir)
+	return bindcas.SetExcluded(dir, false)
 }
 
 // linkMountDetails points <top>/.repo/mount-details at the mount details in the mount root,

@@ -219,7 +219,7 @@ func TestSetup_TreeBelowTheRoot(t *testing.T) {
 	link, err := os.Readlink(filepath.Join(root, "android/.repo/mount-details"))
 	require.NoError(t, err)
 	require.Equal(t, "../../.abfs.mount-details", link)
-	require.Subset(t, cas.excludedPaths(t, root), []string{"android/.ninjago.conf", "android/vendor"})
+	require.Equal(t, []string{"android/.ninjago.conf", "android/vendor"}, cas.excludedPaths(t, root), "the top itself is not excluded")
 }
 
 func TestSetup_SeveralTops(t *testing.T) {
@@ -287,7 +287,6 @@ func TestSetup_MissingBinary(t *testing.T) {
 }
 
 func TestSetup_MigratesChrootTree(t *testing.T) {
-	useFakeCASFS(t)
 	installedBinaries(t)
 	root := t.TempDir()
 	writeProjectsList(t, root, "android/build/soong")
@@ -298,9 +297,13 @@ func TestSetup_MigratesChrootTree(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(top, ".repo"), 0755))
 	require.NoError(t, os.Symlink("../.abfs.mount-details", filepath.Join(top, ".repo/mount-details")))
 
+	cas := useFakeCASFS(t)
+	cas.excluded[top] = true
+
 	c, _ := newSetupForTest(t, root)
 	require.NoError(t, c.run(root))
 
+	require.False(t, cas.excluded[top], "the top is in the workspace snapshot again")
 	require.NoFileExists(t, filepath.Join(top, ".abfs.mount-details"))
 	link, err := os.Readlink(filepath.Join(top, ".repo/mount-details"))
 	require.NoError(t, err)
@@ -350,6 +353,21 @@ func TestSetup_ChrootAfterDetection(t *testing.T) {
 	target, err = os.Readlink(link)
 	require.NoError(t, err)
 	require.Equal(t, "../.abfs.mount-details", target)
+}
+
+func TestSetup_ProjectTopStaysExcluded(t *testing.T) {
+	cas := useFakeCASFS(t)
+	installedBinaries(t)
+	root := t.TempDir()
+	makeSoongTop(t, root, "android")
+	top := filepath.Join(root, "android")
+	require.NoError(t, os.Mkdir(filepath.Join(top, ".git"), 0755))
+	cas.excluded[top] = true
+
+	c, _ := newSetupForTest(t, root)
+	c.Tops = []string{"android"}
+	require.NoError(t, c.run(root))
+	require.True(t, cas.excluded[top], "a project directory is kept as a git repository")
 }
 
 func TestSetup_RunningBuild(t *testing.T) {
