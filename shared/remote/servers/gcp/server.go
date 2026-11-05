@@ -597,7 +597,10 @@ func (s *GCPServer) projectForRefs(ctx context.Context, server string, project s
 func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error) {
 	id, err := s.projectForRefs(ctx, server, project, false)
 	if errors.Is(err, casdb.ErrNotFound) {
-		return nil, entities.ErrNotExist
+		if err := s.checkServerExists(ctx, server); err != nil {
+			return nil, err
+		}
+		return make([]remote.Hash, len(refs)), nil
 	}
 	if err != nil {
 		return nil, err
@@ -605,20 +608,39 @@ func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, 
 	return s.casdb.GetRefs(ctx, id, refs)
 }
 
+// checkServerExists returns a not-exist error when no project of server has
+// been created, as file-based does for a server it has no refs file for.
+func (s *GCPServer) checkServerExists(ctx context.Context, server string) error {
+	exists, err := s.casdb.HostExists(ctx, server)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return entities.NotExistErrf("server %q not found", server)
+	}
+	return nil
+}
+
 // SearchRefs implements remote.RemoteProvider.
 func (s *GCPServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
 	var projectID *int64
 	if project != "" {
 		id, err := s.projectForRefs(ctx, server, project, false)
+		if errors.Is(err, casdb.ErrNotFound) {
+			return nil, s.checkServerExists(ctx, server)
+		}
 		if err != nil {
 			return nil, err
 		}
 		projectID = &id
 	}
 
-	refIDs, err := s.casdb.SearchRefs(ctx, projectID, refPrefix, limit)
+	refIDs, err := s.casdb.SearchRefs(ctx, server, projectID, refPrefix, limit)
 	if err != nil {
 		return nil, err
+	}
+	if len(refIDs) == 0 {
+		return nil, s.checkServerExists(ctx, server)
 	}
 
 	s.projectIDsLock.RLock()
@@ -656,9 +678,6 @@ func (s *GCPServer) SearchRefs(ctx context.Context, server string, project strin
 	defer s.projectIDsLock.RUnlock()
 	for _, refID := range refIDs {
 		sp := s.projectsByID[refID.ProjectID]
-		if sp[0] != server {
-			continue
-		}
 		refs = append(refs, remote.ProjectRefHash{
 			Project: sp[1],
 			Ref:     refID.Ref,

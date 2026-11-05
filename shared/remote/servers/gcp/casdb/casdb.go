@@ -30,6 +30,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -483,7 +484,7 @@ func (c *CASDB) XchgRefs(ctx context.Context, projectID int64, refs []remote.Ref
 		return nil
 	}
 	if len(refs) > maxRefsBatch {
-		return fmt.Errorf("cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
+		return status.Errorf(codes.InvalidArgument, "cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
 	}
 
 	cols := []string{"ProjectId", "Ref", "UpdateTime", "Target"}
@@ -605,36 +606,48 @@ type ProjectRefHash struct {
 	Hash      entities.Hash
 }
 
-func (c *CASDB) SearchRefs(ctx context.Context, projectID *int64, refPrefix string, limit int) ([]ProjectRefHash, error) {
+// SearchRefs returns the refs of host whose name is refPrefix or starts with
+// refPrefix and a slash, newest name first, without deleted refs. An empty
+// refPrefix matches every ref. projectID limits the search to one project.
+func (c *CASDB) SearchRefs(ctx context.Context, host string, projectID *int64, refPrefix string, limit int) ([]ProjectRefHash, error) {
 	refPrefix = strings.Trim(refPrefix, "/")
 
-	var stmt spanner.Statement
-	if projectID == nil {
-		stmt = spanner.Statement{
-			SQL: "SELECT ProjectId, Ref, Target FROM Refs WHERE Ref = @refPrefix OR STARTS_WITH(Ref, @refPrefix || '/')",
-			Params: map[string]any{
-				"refPrefix": refPrefix,
-			},
-		}
-	} else {
-		stmt = spanner.Statement{
-			SQL: "SELECT ProjectId, Ref, Target FROM Refs WHERE ProjectId = @projectId AND (Ref = @refPrefix OR STARTS_WITH(Ref, @refPrefix || '/'))",
-			Params: map[string]any{
-				"projectId": *projectID,
-				"refPrefix": refPrefix,
-			},
-		}
+	sql := `SELECT r.ProjectId, r.Ref, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId
+		WHERE p.Host = @host AND r.Target IS NOT NULL`
+	params := map[string]any{"host": host}
+	if projectID != nil {
+		sql += " AND r.ProjectId = @projectId"
+		params["projectId"] = *projectID
 	}
+	if refPrefix != "" {
+		sql += " AND (r.Ref = @refPrefix OR STARTS_WITH(r.Ref, @refPrefix || '/'))"
+		params["refPrefix"] = refPrefix
+	}
+	sql += " ORDER BY r.Ref DESC"
 	if limit > 0 {
-		stmt.SQL += " ORDER BY Ref DESC LIMIT @limit"
-		stmt.Params["limit"] = limit
+		sql += " LIMIT @limit"
+		params["limit"] = limit
 	}
 
 	capHint := limit
 	if capHint <= 0 {
 		capHint = 16
 	}
-	return c.runProjectIDRefTargetQuery(ctx, stmt, capHint)
+	return c.runProjectIDRefTargetQuery(ctx, spanner.Statement{SQL: sql, Params: params}, capHint)
+}
+
+// HostExists reports whether any project of host has been created.
+func (c *CASDB) HostExists(ctx context.Context, host string) (bool, error) {
+	stmt := spanner.Statement{
+		SQL:    "SELECT 1 FROM Projects WHERE Host = @host LIMIT 1",
+		Params: map[string]any{"host": host},
+	}
+	found := false
+	err := c.dbClient.Single().Query(ctx, stmt).Do(func(row *spanner.Row) error {
+		found = true
+		return nil
+	})
+	return found, err
 }
 
 func hashesToStrings(hashes []entities.Hash) []string {
