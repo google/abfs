@@ -95,12 +95,16 @@ lunch aosp_cf_x86_64_only_phone-aosp_current-userdebug
 m droid
 ```
 
+If your Android tree sits in a subdirectory of the workspace (for example `android/`), run these
+commands in that directory. See [Tree layouts](../sysadmin/LAYOUTS.md).
+
 On Android 15 QPR1 and later and on Android 16 r1 and r2, Soong passes nsjail a bind mount
 named `{ABFS_DIR}` that nothing fills in, so `lunch` would fail with `Couldn't mount '{ABFS_DIR}'`.
 On those releases `abfs setup` moves `prebuilts/build-tools/linux-x86/bin/nsjail` to
-`nsjail.real` and puts a wrapper in its place that fills in the ABFS cache directory, so
-`repo status` lists `nsjail` as changed. `repo sync` puts the original back while it syncs
-and the wrapper back after it; if the sync fails, run `abfs setup` to wrap nsjail again.
+`nsjail.real` in each Android tree of the workspace and puts a wrapper in its place that fills
+in the ABFS cache directory, so `repo status` lists `nsjail` as changed. `repo sync` puts the
+originals back while it syncs and the wrappers back after it; if the sync fails, run
+`abfs setup` to wrap nsjail again.
 
 At the beginning of your build, you should ensure `SOONG_NINJA=ninjago` and this log line from ninjago are output:
 
