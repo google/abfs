@@ -25,6 +25,7 @@ import (
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
 	"github.com/google/abfs/shared/cmd/root"
+	"github.com/google/abfs/shared/dagsync"
 	"github.com/google/abfs/shared/hashpath"
 )
 
@@ -69,6 +70,7 @@ func (c *gitPusherCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 
 func (c *gitPusherCmd) run(ctx context.Context) error {
 	config := c.Config
+	defer dagsync.FlushFailureLog()
 
 	hp, err := hashpath.Parse(c.configHashPath)
 	if err != nil {

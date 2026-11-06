@@ -786,6 +786,11 @@ func (d *DAGSync) handleFailedExec(n *node, err error) {
 	} else {
 		d.transit(n, FailedState)
 		d.schedule(d.failedNodeCooldown(n), n, func() { d.Send(&retryFailedNode{n}) })
+		// Log the first failure and then every doubling of the retries, so a node that keeps failing stays visible
+		// without a line on every retry. The process-wide limit bounds the lines when many nodes fail at once.
+		if n.retries&(n.retries-1) == 0 {
+			processFailureLog.Printf(d.logger, "Failed to push %s (attempt %d), retrying in %s: %v", n, n.retries, d.failedNodeCooldown(n), err)
+		}
 	}
 	d.executedCallback(n, err)
 }
