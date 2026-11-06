@@ -16,6 +16,7 @@ package dagsync_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
@@ -604,6 +606,77 @@ func TestMissingLinkRetry(t *testing.T) {
 	waitForObjects(t, updater, 3, 5*time.Second)
 	require.NoError(t, d.Wait(10*time.Second))
 
+	assertSyncIsGood(t, d)
+}
+
+// linkRoundsUpdater answers the first linkRounds pushes of parent with a missing link to child, fails
+// the next push with a non-link error and accepts the pushes after that.
+type linkRoundsUpdater struct {
+	*inmemory.InMemoryServer
+	parent     entities.Hash
+	child      entities.Hash
+	linkRounds int
+
+	mu       sync.Mutex
+	attempts []time.Time
+}
+
+func (u *linkRoundsUpdater) PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error {
+	if key != u.parent {
+		return u.InMemoryServer.PutObject(ctx, key, reader)
+	}
+	u.mu.Lock()
+	u.attempts = append(u.attempts, time.Now())
+	n := len(u.attempts)
+	u.mu.Unlock()
+	switch {
+	case n <= u.linkRounds:
+		return &remote.ErrObjectLinkValidation{MissingLinks: []entities.Hash{u.child}}
+	case n == u.linkRounds+1:
+		return errors.New("connection reset")
+	}
+	return u.InMemoryServer.PutObject(ctx, key, reader)
+}
+
+// TestMissingLinksResetCooldown checks that a push failing after several missing-links answers is
+// retried after one FailCooldown, not after one FailCooldown per earlier answer.
+func TestMissingLinksResetCooldown(t *testing.T) {
+	accessor := newTestAccessor()
+	accessor.blobs[hash1] = content1
+	obj := newObject(hash1)
+	accessor.objects[obj.Hash] = obj.Encoded
+	updater := &linkRoundsUpdater{InMemoryServer: inmemory.New(), parent: obj.Hash, child: hash1, linkRounds: 20}
+	d := dagsync.New(&dagsync.DagSyncOpts{Updater: updater, Accessor: accessor, WorkersCount: 1})
+	d.FailCooldown = 100 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+
+	go func() {
+		d.Start(ctx)
+		close(stopped)
+	}()
+
+	d.PutObject(obj.Hash)
+	// Wait counts a node that waits out its cooldown as failed, so wait for the last push first.
+	attempts := func() int {
+		updater.mu.Lock()
+		defer updater.mu.Unlock()
+		return len(updater.attempts)
+	}
+	require.Eventually(t, func() bool { return attempts() == updater.linkRounds+2 }, 10*time.Second, time.Millisecond)
+	require.NoError(t, d.Wait(10*time.Second))
+
+	updater.mu.Lock()
+	defer updater.mu.Unlock()
+	// One FailCooldown is 100 ms; one per earlier answer would be 2.1 s.
+	gap := updater.attempts[updater.linkRounds+1].Sub(updater.attempts[updater.linkRounds])
+	require.GreaterOrEqual(t, gap, d.FailCooldown)
+	require.Less(t, gap, time.Second)
 	assertSyncIsGood(t, d)
 }
 

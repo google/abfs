@@ -779,11 +779,13 @@ func (d *DAGSync) handleExecuted(e *executed) {
 }
 
 func (d *DAGSync) handleFailedExec(n *node, err error) {
-	n.retries++
 	var linkErr *remote.ErrObjectLinkValidation
 	if errors.As(err, &linkErr) && len(linkErr.MissingLinks) > 0 {
+		// The server answered, so a later failure starts its cooldown afresh.
+		n.retries = 0
 		d.handleMissingLinks(n, linkErr)
 	} else {
+		n.retries++
 		d.transit(n, FailedState)
 		d.schedule(d.failedNodeCooldown(n), n, func() { d.Send(&retryFailedNode{n}) })
 	}
