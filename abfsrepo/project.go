@@ -16,6 +16,7 @@ package abfsrepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/google/abfs/manifest"
 
@@ -118,6 +120,10 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		return fmt.Errorf("cannot stat git dir %s: %w", gitDir, err)
 	}
 
+	if err := r.checkWorkTreePath(project); err != nil {
+		return err
+	}
+
 	var cloneBranch string
 	var cloneCommit entities.Hash
 	if entities.IsHash(revision) {
@@ -130,6 +136,7 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		Directory:        projectPath,
 		GitDir:           gitDir,
 		ObjectsDir:       objDir,
+		Nested:           true,
 		Origin:           remoteName,
 		Branch:           cloneBranch,
 		Commit:           cloneCommit,
@@ -142,6 +149,10 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 	})
 
 	if err != nil {
+		var inWorkTree *casgit.RepositoryInWorkTreeError
+		if errors.As(err, &inWorkTree) {
+			return r.repositoryInWorkTree(project, inWorkTree)
+		}
 		if !opts.FallbackToGit {
 			return err
 		}
@@ -177,13 +188,72 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 	return nil
 }
 
+// checkWorkTreePath fails when a file sits at the project's path or at a directory above it, and
+// names the project that has the file. repo fails to create the work tree there too.
+func (r *Repo) checkWorkTreePath(project *manifest.Project) error {
+	for p := project.GetPath(); p != "." && p != "/"; p = path.Dir(p) {
+		stat, err := os.Stat(path.Join(r.repoRoot, p))
+		if entities.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if stat.IsDir() {
+			return nil
+		}
+		if outer := r.outerProject(p); outer != nil {
+			return fmt.Errorf("cannot check out %s: file %s lies in the work tree of project %s", project.GetPath(), p, outer.Name)
+		}
+		return fmt.Errorf("cannot check out %s: %s is not a directory", project.GetPath(), p)
+	}
+	return nil
+}
+
+// outerProject returns the project whose work tree holds p, or nil.
+func (r *Repo) outerProject(p string) *manifest.Project {
+	for outer := path.Dir(p); outer != "." && outer != "/"; outer = path.Dir(outer) {
+		if project, ok := r.projectsByPath[outer]; ok {
+			return project
+		}
+	}
+	return nil
+}
+
+// repositoryInWorkTree names the project whose work tree the clone of project would replace with
+// a file. Neither project can be checked out over the other, so the clone does not fall back to
+// git.
+func (r *Repo) repositoryInWorkTree(project *manifest.Project, err *casgit.RepositoryInWorkTreeError) error {
+	file, fileErr := filepath.Rel(r.repoRoot, err.Path)
+	inner, innerErr := filepath.Rel(r.repoRoot, err.Repository)
+	if fileErr != nil || innerErr != nil {
+		return err
+	}
+	holder := "the repository at " + inner
+	if p, ok := r.projectsByPath[inner]; ok {
+		holder = "project " + p.Name
+	}
+	return fmt.Errorf("cannot check out project %s: its file %s would replace the work tree of %s", project.Name, file, holder)
+}
+
+// cleanWorkTree removes what a failed checkout left. The work tree of a project inside another
+// project keeps its directory, which can hold files of the outer project; only its .git goes, and
+// the directory goes back into the outer work tree's hash.
+func (r *Repo) cleanWorkTree(project *manifest.Project, projectPath string) {
+	if r.outerProject(project.GetPath()) != nil {
+		_ = os.Remove(filepath.Join(projectPath, ".git"))
+		_ = r.CASFS.SetExcluded(projectPath, false)
+		return
+	}
+	_ = removeWorkTree(projectPath)
+}
+
 func (r *Repo) cloneProjectFallback(ctx context.Context, project *manifest.Project, projectPath, gitDir, objDir, remoteName, revision string, projectURL *url.URL) (returnErr error) {
 	log.Printf("ABFS clone for %s failed, attempting fallback to git...", project.Name)
 
 	// Clean up on exit if fallback fails completely
 	defer func() {
 		if returnErr != nil {
-			_ = os.RemoveAll(projectPath)
+			r.cleanWorkTree(project, projectPath)
 			_ = os.RemoveAll(gitDir)
 		}
 	}()
@@ -200,12 +270,13 @@ func (r *Repo) cloneProjectFallback(ctx context.Context, project *manifest.Proje
 			return nil
 		} else {
 			log.Printf("Optimized fallback for %s failed (%v), falling back to full git clone...", project.Name, err)
+			r.cleanWorkTree(project, projectPath)
 		}
 	}
 
-	// 2. Full bare clone fallback with worktree
+	// 2. Full bare clone fallback with worktree. The checkout keeps files of other projects in
+	// the work tree, as the clone does.
 	log.Printf("Optimized fallback for %s failed, falling back to full git clone...", project.Name)
-	_ = os.RemoveAll(projectPath)
 	_ = os.RemoveAll(gitDir)
 
 	if err := os.MkdirAll(projectPath, 0755); err != nil {
@@ -233,7 +304,6 @@ func (r *Repo) cloneProjectFallback(ctx context.Context, project *manifest.Proje
 }
 
 func (r *Repo) tryOptimizedFallback(ctx context.Context, project *manifest.Project, projectPath, gitDir, objDir, remoteName, revision, fallbackBranch string, projectURL *url.URL) error {
-	_ = os.RemoveAll(projectPath)
 	_ = os.RemoveAll(gitDir)
 
 	if err := r.Git.Clone(ctx, casgit.CloneOptions{
@@ -241,6 +311,7 @@ func (r *Repo) tryOptimizedFallback(ctx context.Context, project *manifest.Proje
 		Directory:        projectPath,
 		GitDir:           gitDir,
 		ObjectsDir:       objDir,
+		Nested:           true,
 		Origin:           remoteName,
 		Branch:           fallbackBranch,
 		PrefetchIndices:  r.PrefetchIndices,

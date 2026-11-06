@@ -22,6 +22,7 @@ import (
 	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -114,45 +115,53 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 	var lock sync.Mutex
 	var failedErrors []error
 	var failedProjects []string
-	grp, ctx := errgroup.WithContext(ctx)
+	var synced []*manifest.Project
 	limit := opts.Jobs
 	if limit <= 0 {
 		limit = runtime.NumCPU()
 	}
-	grp.SetLimit(limit)
-	for p := range toSync {
-		grp.Go(func() error {
-			project := r.projectsByName[p]
-			if project == nil {
+	for _, level := range r.checkoutLevels(toSync) {
+		grp, gctx := errgroup.WithContext(ctx)
+		grp.SetLimit(limit)
+		for _, p := range level {
+			grp.Go(func() error {
+				project := r.projectsByName[p]
+				if project == nil {
+					lock.Lock()
+					errWithPath := fmt.Errorf("project %s not found", p)
+					failedErrors = append(failedErrors, errWithPath)
+					failedProjects = append(failedProjects, p)
+					lock.Unlock()
+					return nil
+				}
+				progress.StartTask(project.GetPath())
+				err := r.syncProject(gctx, project, opts)
+				progress.EndTask(project.GetPath(), err == nil)
+				if err != nil {
+					lock.Lock()
+					errWithName := fmt.Errorf("project %s: %w", p, err)
+					failedErrors = append(failedErrors, errWithName)
+					failedProjects = append(failedProjects, p)
+					lock.Unlock()
+					return nil
+				}
+
 				lock.Lock()
-				errWithPath := fmt.Errorf("project %s not found", p)
-				failedErrors = append(failedErrors, errWithPath)
-				failedProjects = append(failedProjects, p)
+				r.curProjects[project.GetPath()] = struct{}{}
+				synced = append(synced, project)
 				lock.Unlock()
 				return nil
-			}
-			progress.StartTask(project.GetPath())
-			err := r.syncProject(ctx, project, opts)
-			progress.EndTask(project.GetPath(), err == nil)
-			if err != nil {
-				lock.Lock()
-				errWithName := fmt.Errorf("project %s: %w", p, err)
-				failedErrors = append(failedErrors, errWithName)
-				failedProjects = append(failedProjects, p)
-				lock.Unlock()
-				return nil
-			}
+			})
+		}
 
-			lock.Lock()
-			r.curProjects[project.GetPath()] = struct{}{}
-			lock.Unlock()
-			return nil
-		})
+		if err := grp.Wait(); err != nil {
+			return err
+		}
 	}
 
-	if err := grp.Wait(); err != nil {
-		return err
-	}
+	errs, failed := r.finishCheckouts(synced)
+	failedErrors = append(failedErrors, errs...)
+	failedProjects = append(failedProjects, failed...)
 
 	if len(failedProjects) > 0 {
 		for _, e := range failedErrors {
@@ -167,6 +176,53 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 	}
 
 	return nil
+}
+
+// finishCheckouts makes the link and copy files of the checked-out projects after every checkout,
+// as a destination may lie inside the path of a project checked out later. Then it checks that
+// every work tree is still there. It returns the errors and the failing projects.
+func (r *Repo) finishCheckouts(synced []*manifest.Project) ([]error, []string) {
+	var errs []error
+	var failed []string
+	slices.SortFunc(synced, func(a, b *manifest.Project) int { return strings.Compare(a.GetPath(), b.GetPath()) })
+	for _, project := range synced {
+		if err := r.syncProjectFiles(project); err != nil {
+			errs = append(errs, fmt.Errorf("project %s: %w", project.Name, err))
+			failed = append(failed, project.Name)
+		}
+	}
+	for _, project := range synced {
+		if err := r.checkWorkTree(project); err != nil {
+			delete(r.curProjects, project.GetPath())
+			if !slices.Contains(failed, project.Name) {
+				failed = append(failed, project.Name)
+			}
+			errs = append(errs, err)
+		}
+	}
+	return errs, failed
+}
+
+// checkoutLevels splits the project names into levels by path, as repo orders its checkouts: a
+// project whose path lies inside another project's path comes in a later level.
+func (r *Repo) checkoutLevels(names map[string]struct{}) [][]string {
+	byPath := make(map[string]string, len(names))
+	for name := range names {
+		projectPath := name
+		if project := r.projectsByName[name]; project != nil {
+			projectPath = project.GetPath()
+		}
+		byPath[projectPath] = name
+	}
+	var levels [][]string
+	for _, paths := range PathLevels(slices.Collect(maps.Keys(byPath))) {
+		level := make([]string, 0, len(paths))
+		for _, p := range paths {
+			level = append(level, byPath[p])
+		}
+		levels = append(levels, level)
+	}
+	return levels
 }
 
 func (r *Repo) syncRemoves() error {
@@ -190,11 +246,58 @@ func (r *Repo) syncProjectRemoves() error {
 			toRemove = append(toRemove, p)
 		}
 	}
+	// Deepest first, as repo removes obsolete projects, so an inner project goes before the
+	// project around it.
+	slices.Sort(toRemove)
+	slices.Reverse(toRemove)
 	for _, p := range toRemove {
-		if err := os.RemoveAll(path.Join(r.repoRoot, p)); err != nil {
+		if err := removeWorkTree(path.Join(r.repoRoot, p)); err != nil {
 			return err
 		}
 		delete(r.curProjects, p)
+	}
+	return nil
+}
+
+// removeWorkTree removes a work tree except the directories that hold another project's .git,
+// as repo deletes an obsolete checkout, so projects inside it and their changes stay.
+func removeWorkTree(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if entities.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	kept := false
+	for _, e := range entries {
+		p := path.Join(dir, e.Name())
+		if !e.IsDir() {
+			if err := os.Remove(p); err != nil && !entities.IsNotExist(err) {
+				return err
+			}
+			continue
+		}
+		if _, err := os.Lstat(path.Join(p, ".git")); err == nil {
+			kept = true
+			continue
+		}
+		if err := removeWorkTree(p); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(p); err == nil {
+			kept = true
+		}
+	}
+	if kept {
+		return nil
+	}
+	return os.Remove(dir)
+}
+
+// checkWorkTree fails when the project's work tree has no .git.
+func (r *Repo) checkWorkTree(project *manifest.Project) error {
+	if _, err := os.Lstat(path.Join(r.repoRoot, project.GetPath(), ".git")); err != nil {
+		return fmt.Errorf("project %s: work tree %s is missing after sync: %w", project.Name, project.GetPath(), err)
 	}
 	return nil
 }
@@ -254,6 +357,10 @@ func (r *Repo) syncProject(ctx context.Context, project *manifest.Project, opts 
 		return fmt.Errorf("error while link repo shareable dir: %w", err)
 	}
 
+	return nil
+}
+
+func (r *Repo) syncProjectFiles(project *manifest.Project) error {
 	if err := r.createSymlinks(project); err != nil {
 		return fmt.Errorf("error while creating the manifest symlinks: %w", err)
 	}

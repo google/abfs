@@ -19,11 +19,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -350,95 +352,125 @@ func (c *SnapshotService) restore(ctx context.Context, snapshot binding.Snapshot
 		return fmt.Errorf("failed to sync workspace: %w", err)
 	}
 
-	grp, ctx := errgroup.WithContext(ctx)
-	grp.SetLimit(runtime.NumCPU())
-	for _, p := range snapshot.GitRepos {
-		grp.Go(func() (retErr error) {
-			progress.StartTask(p.WorkDir)
-			defer func() {
-				progress.EndTask(p.WorkDir, retErr == nil)
-			}()
+	return restoreInLevels(ctx, snapshot.GitRepos, func(ctx context.Context, p binding.GitRepoSnapshot) error {
+		return c.restoreGitRepo(ctx, progress, p)
+	})
+}
 
-			gitDir := strings.Replace(p.GitDir, "{workdir}", p.WorkDir, 1)
-			objectsDir := strings.Replace(p.ObjectsDir, "{workdir}", p.WorkDir, 1)
+// restoreInLevels restores the git repos by levels, as repo sync checks out: a repo inside another
+// repo's work dir comes after it, so the outer repo's sync of its work dir cannot meet a
+// half-created inner one. The repos of one level are restored in parallel.
+func restoreInLevels(ctx context.Context, repos []binding.GitRepoSnapshot, restore func(context.Context, binding.GitRepoSnapshot) error) error {
+	for _, level := range gitRepoLevels(repos) {
+		grp, gctx := errgroup.WithContext(ctx)
+		grp.SetLimit(runtime.NumCPU())
+		for _, p := range level {
+			grp.Go(func() error {
+				return restore(gctx, p)
+			})
+		}
+		if err := grp.Wait(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-			c.reposLock.Lock()
-			r, gitExists := c.gitRepos[p.WorkDir]
-			c.reposLock.Unlock()
+// gitRepoLevels groups the git repos by abfsrepo.PathLevels of their work dirs.
+func gitRepoLevels(repos []binding.GitRepoSnapshot) [][]binding.GitRepoSnapshot {
+	byDir := make(map[string][]binding.GitRepoSnapshot, len(repos))
+	for _, p := range repos {
+		byDir[p.WorkDir] = append(byDir[p.WorkDir], p)
+	}
+	var levels [][]binding.GitRepoSnapshot
+	for _, dirs := range abfsrepo.PathLevels(slices.Collect(maps.Keys(byDir))) {
+		var level []binding.GitRepoSnapshot
+		for _, d := range dirs {
+			level = append(level, byDir[d]...)
+		}
+		levels = append(levels, level)
+	}
+	return levels
+}
 
-			if !gitExists {
-				r = &gitRepo{
-					workDir:    p.WorkDir,
-					gitDir:     gitDir,
-					objectsDir: objectsDir,
-				}
-			}
+func (c *SnapshotService) restoreGitRepo(ctx context.Context, progress *abfsrepo.SyncProgress, p binding.GitRepoSnapshot) (retErr error) {
+	progress.StartTask(p.WorkDir)
+	defer func() {
+		progress.EndTask(p.WorkDir, retErr == nil)
+	}()
 
-			//TODO check if git-dir or objectsDir have changed
+	gitDir := strings.Replace(p.GitDir, "{workdir}", p.WorkDir, 1)
+	objectsDir := strings.Replace(p.ObjectsDir, "{workdir}", p.WorkDir, 1)
 
-			if !gitExists {
-				if err := workspaces.SetupEmptyGitRepos(c.casfs, c.mountPoint, p.WorkDir, gitDir, objectsDir); err != nil {
-					return fmt.Errorf("failed to setup empty git repo for %s: %w", p.WorkDir, err)
-				}
-			}
+	c.reposLock.Lock()
+	r, gitExists := c.gitRepos[p.WorkDir]
+	c.reposLock.Unlock()
 
-			deeptree, err := binding.DeepTreeForTree(ctx, p.WorkDirHash, c.store)
-			if err != nil {
-				return err
-			}
-			if err := c.syncWorkDir(ctx, p.WorkDir, deeptree); err != nil {
-				return fmt.Errorf("failed to sync git workdir %s: %w", p.WorkDir, err)
-			}
-
-			if c.mountDetails.Config.GitPrefetchSymlinks {
-				if err := binding.PrefetchSymlinks(ctx, deeptree, c.store, c.cacheman); err != nil {
-					log.Printf("Failed to prefetch symlinks for %s: %v", p.WorkDir, err)
-				}
-			}
-			if err := c.syncDir(ctx, gitDir, p.GitDirHash); err != nil {
-				return fmt.Errorf("failed to sync git-dir %s: %w", gitDir, err)
-			}
-			_ = os.Remove(filepath.Join(gitDir, "index.lock"))
-
-			packsDir := path.Join(objectsDir, "pack")
-			if err := c.syncDir(ctx, packsDir, p.PacksHash); err != nil {
-				return fmt.Errorf("failed to sync git pack dir %s: %w", packsDir, err)
-			}
-
-			if err := c.touchIndices(packsDir); err != nil {
-				return fmt.Errorf("failed to touch indices for repo %s: %w", p.WorkDir, err)
-			}
-
-			if c.mountDetails.Config.GitPrefetchIndices {
-				if err := binding.PrefetchDirs([]string{filepath.Join(packsDir, "*.idx")}, c.cacheman, binding.ContentPrefetchPriority); err != nil {
-					log.Printf("Content prefetch failed: %v", err)
-				}
-			}
-
-			if p.GitDirHash != r.cachedGitDirHash {
-				headTreeHash, err := c.resolveHeadTree(ctx, r)
-				if err != nil {
-					return err
-				}
-				r.cachedHeadTree = headTreeHash
-				r.cachedGitDirHash = p.GitDirHash
-			}
-
-			if err := c.RestoreIndex(ctx, p.IndexHash, r); err != nil {
-				return fmt.Errorf("failed to restore staging index for %s: %w", p.WorkDir, err)
-			}
-
-			c.reposLock.Lock()
-			c.gitRepos[p.WorkDir] = r
-			c.reposLock.Unlock()
-
-			return nil
-		})
+	if !gitExists {
+		r = &gitRepo{
+			workDir:    p.WorkDir,
+			gitDir:     gitDir,
+			objectsDir: objectsDir,
+		}
 	}
 
-	if err := grp.Wait(); err != nil {
+	//TODO check if git-dir or objectsDir have changed
+
+	if !gitExists {
+		if err := workspaces.SetupEmptyGitRepos(c.casfs, c.mountPoint, p.WorkDir, gitDir, objectsDir); err != nil {
+			return fmt.Errorf("failed to setup empty git repo for %s: %w", p.WorkDir, err)
+		}
+	}
+
+	deeptree, err := binding.DeepTreeForTree(ctx, p.WorkDirHash, c.store)
+	if err != nil {
 		return err
 	}
+	if err := c.syncWorkDir(ctx, p.WorkDir, deeptree); err != nil {
+		return fmt.Errorf("failed to sync git workdir %s: %w", p.WorkDir, err)
+	}
+
+	if c.mountDetails.Config.GitPrefetchSymlinks {
+		if err := binding.PrefetchSymlinks(ctx, deeptree, c.store, c.cacheman); err != nil {
+			log.Printf("Failed to prefetch symlinks for %s: %v", p.WorkDir, err)
+		}
+	}
+	if err := c.syncDir(ctx, gitDir, p.GitDirHash); err != nil {
+		return fmt.Errorf("failed to sync git-dir %s: %w", gitDir, err)
+	}
+	_ = os.Remove(filepath.Join(gitDir, "index.lock"))
+
+	packsDir := path.Join(objectsDir, "pack")
+	if err := c.syncDir(ctx, packsDir, p.PacksHash); err != nil {
+		return fmt.Errorf("failed to sync git pack dir %s: %w", packsDir, err)
+	}
+
+	if err := c.touchIndices(packsDir); err != nil {
+		return fmt.Errorf("failed to touch indices for repo %s: %w", p.WorkDir, err)
+	}
+
+	if c.mountDetails.Config.GitPrefetchIndices {
+		if err := binding.PrefetchDirs([]string{filepath.Join(packsDir, "*.idx")}, c.cacheman, binding.ContentPrefetchPriority); err != nil {
+			log.Printf("Content prefetch failed: %v", err)
+		}
+	}
+
+	if p.GitDirHash != r.cachedGitDirHash {
+		headTreeHash, err := c.resolveHeadTree(ctx, r)
+		if err != nil {
+			return err
+		}
+		r.cachedHeadTree = headTreeHash
+		r.cachedGitDirHash = p.GitDirHash
+	}
+
+	if err := c.RestoreIndex(ctx, p.IndexHash, r); err != nil {
+		return fmt.Errorf("failed to restore staging index for %s: %w", p.WorkDir, err)
+	}
+
+	c.reposLock.Lock()
+	c.gitRepos[p.WorkDir] = r
+	c.reposLock.Unlock()
 
 	return nil
 }
