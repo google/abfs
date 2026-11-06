@@ -55,6 +55,7 @@ type recvStream struct {
 	last           bool
 	buf            []byte
 	totalBytesRead int64
+	resets         int
 }
 
 type Chunker interface {
@@ -171,6 +172,16 @@ func (s *recvStream) receive() error {
 
 		if s.releaseChunker != nil {
 			s.releaseChunker(chunker)
+		}
+
+		if isStreamReset(err) && s.openStream != nil {
+			// A download is idempotent, so a reset stream is reopened a bounded number of times.
+			if err = s.reopenAfterReset(err); err == nil {
+				if len(s.buf) > 0 || s.last {
+					return nil
+				}
+				continue
+			}
 		}
 
 		// Check if retryable

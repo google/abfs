@@ -73,7 +73,8 @@ func (c *PBClient) Headers(ctx context.Context, keys []remote.Hash) ([]entities.
 	headers := make([]entities.ObjectHeader, 0, len(keys))
 
 	for subKeys := range slices.Chunk(keys, maxHeaderLen) {
-		resp, err := c.pb.Headers(ctx, &pb.HeadersRequest{Keys: HashesToHashBytes(subKeys)})
+		req := &pb.HeadersRequest{Keys: HashesToHashBytes(subKeys)}
+		resp, err := callWithResetRetry(ctx, "Headers", func() (*pb.HeadersReply, error) { return c.pb.Headers(ctx, req) })
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +93,8 @@ func (c *PBClient) SHA256(ctx context.Context, keys []remote.Hash) ([]entities.S
 	shas := make([]entities.SHA256, 0, len(keys))
 
 	for subKeys := range slices.Chunk(keys, maxHeaderLen) {
-		resp, err := c.pb.SHA256(ctx, &pb.SHA256Request{Keys: HashesToHashBytes(subKeys)})
+		req := &pb.SHA256Request{Keys: HashesToHashBytes(subKeys)}
+		resp, err := callWithResetRetry(ctx, "SHA256", func() (*pb.SHA256Reply, error) { return c.pb.SHA256(ctx, req) })
 		if err != nil {
 			return nil, err
 		}
@@ -103,6 +105,7 @@ func (c *PBClient) SHA256(ctx context.Context, keys []remote.Hash) ([]entities.S
 
 // GetObject implements remote.RemoteProvider.
 func (c *PBClient) GetObject(ctx context.Context, key remote.Hash) (remote.ContentReadCloser, error) {
+	ctx = withCallContext(ctx)
 	openStream := func() (Stream, error) {
 		return c.pb.GetObject(ctx, &pb.GetObjectRequest{Key: HashToBytes(key)})
 	}
@@ -158,7 +161,8 @@ func (c *PBClient) PutObject(ctx context.Context, key remote.Hash, reader remote
 
 // MapResults implements remote.RemoteProvider.
 func (c *PBClient) MapResults(ctx context.Context, from remote.Hash) ([]remote.Hash, error) {
-	r, err := c.pb.MapResults(ctx, &pb.MapResultsRequest{Id: from[:]})
+	req := &pb.MapResultsRequest{Id: from[:]}
+	r, err := callWithResetRetry(ctx, "MapResults", func() (*pb.MapResultsReply, error) { return c.pb.MapResults(ctx, req) })
 	if err != nil {
 		return nil, err
 	}
@@ -168,17 +172,19 @@ func (c *PBClient) MapResults(ctx context.Context, from remote.Hash) ([]remote.H
 // AddMapResult implements remote.RemoteProvider.
 func (c *PBClient) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
 	// TODO: can map entries be larger than 4 MB? Then need to use a slower streaming function
-	_, err := c.pb.AddMapResult(ctx, &pb.AddMapResultRequest{From: from[:], To: to[:]})
+	req := &pb.AddMapResultRequest{From: from[:], To: to[:]}
+	_, err := callWithResetRetry(ctx, "AddMapResult", func() (*pb.AddMapResultReply, error) { return c.pb.AddMapResult(ctx, req) })
 	return UnwrapMissingLinkError(err)
 }
 
 // GetRefs implements remote.RemoteProvider.
 func (c *PBClient) GetRefs(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error) {
-	result, err := c.pb.GetRefs(ctx, &pb.GetRefsRequest{
+	req := &pb.GetRefsRequest{
 		Server:  server,
 		Project: project,
 		Refs:    refs,
-	})
+	}
+	result, err := callWithResetRetry(ctx, "GetRefs", func() (*pb.GetRefsReply, error) { return c.pb.GetRefs(ctx, req) })
 	if err != nil {
 		return nil, rewrapNotFound(err)
 	}
@@ -194,12 +200,13 @@ func rewrapNotFound(err error) error {
 
 // SearchRefs implements remote.RemoteProvider.
 func (c *PBClient) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
-	refs, err := c.pb.SearchRefs(ctx, &pb.SearchRefsRequest{
+	req := &pb.SearchRefsRequest{
 		Server:    server,
 		Project:   project,
 		RefPrefix: refPrefix,
 		Limit:     int32(limit),
-	})
+	}
+	refs, err := callWithResetRetry(ctx, "SearchRefs", func() (*pb.SearchRefsReply, error) { return c.pb.SearchRefs(ctx, req) })
 	if err != nil {
 		return nil, rewrapNotFound(err)
 	}
