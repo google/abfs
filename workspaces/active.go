@@ -17,6 +17,7 @@ package workspaces
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -508,7 +509,7 @@ func SetupEmptyGitRepos(casfs bindcas.CASFS, root, workDir, gitDir, objectsDir s
 		}
 	}
 
-	if err := casfs.CreateGitObjects(path.Dir(objectsDirAbs), path.Base(objectsDir)); err != nil {
+	if err := createGitObjectsDir(casfs, objectsDirAbs); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(path.Join(objectsDirAbs, "pack"), 0755); err != nil {
@@ -530,5 +531,29 @@ func SetupEmptyGitRepos(casfs bindcas.CASFS, root, workDir, gitDir, objectsDir s
 		}
 	}
 
+	return nil
+}
+
+// createGitObjectsDir creates the git objects dir when it does not exist and reuses an existing
+// one: the checkouts of one project name share it, and casfs refuses to create it twice.
+func createGitObjectsDir(casfs bindcas.CASFS, dir string) error {
+	info, err := os.Stat(dir)
+	if entities.IsNotExist(err) {
+		err = casfs.CreateGitObjects(path.Dir(dir), path.Base(dir))
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("failed to create git objects dir %s: %w", dir, err)
+		}
+		// Another checkout created it between the stat and the create.
+		info, err = os.Stat(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to stat objects directory %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("objects directory %s is not a directory", dir)
+	}
 	return nil
 }
