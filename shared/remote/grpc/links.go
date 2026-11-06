@@ -16,9 +16,11 @@ package grpc
 
 import (
 	"errors"
+	"fmt"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 
 	"github.com/google/abfs/shared/remote"
 	pb "github.com/google/abfs/shared/remote/grpc/proto"
@@ -43,17 +45,27 @@ func WrapErrorInStatus(err error) error {
 	return err
 }
 
+// maxMissingLinksInStatus bounds the links listed in a missing-links status. The status is sent in
+// the grpc-status-details-bin trailer, at about 84 bytes per listed link, and proxies limit the size
+// of response headers (60 KB on some load balancers). 160 links make about 14 KB, which leaves room
+// for other headers and longer hashes. Clients push the listed links and retry, so a partial list
+// converges.
+const maxMissingLinksInStatus = 160
+
 func LinkValidationToStatus(e *remote.ErrObjectLinkValidation) (*status.Status, error) {
-	st := status.New(codes.FailedPrecondition, "One or more of the provided object's links is missing. Details: "+e.Error())
-	var err error
+	seen := make(map[Hash]struct{}, len(e.MissingLinks))
+	details := make([]protoadapt.MessageV1, 0, min(len(e.MissingLinks), maxMissingLinksInStatus))
 	for _, l := range e.MissingLinks {
-		l := &pb.ObjectLink{Key: HashToBytes(l)}
-		st, err = st.WithDetails(l)
-		if err != nil {
-			return nil, err
+		if _, ok := seen[l]; ok {
+			continue
+		}
+		seen[l] = struct{}{}
+		if len(details) < maxMissingLinksInStatus {
+			details = append(details, &pb.ObjectLink{Key: HashToBytes(l)})
 		}
 	}
-	return st, nil
+	msg := fmt.Sprintf("One or more of the provided object's links is missing. Details: %d missing, %d listed", len(seen), len(details))
+	return status.New(codes.FailedPrecondition, msg).WithDetails(details...)
 }
 
 // UnwrapMissingLinkError looks for a grpc status error that has any ObjectLink details and unwraps it
