@@ -17,6 +17,8 @@ package daemon
 import (
 	"context"
 	"path"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +69,7 @@ func TestRestoreInLevels(t *testing.T) {
 	workDirs := []string{"a/child/deep", "a/child", "b", "a"}
 	var repos []binding.GitRepoSnapshot
 	for _, d := range workDirs {
-		repos = append(repos, binding.GitRepoSnapshot{WorkDir: d})
+		repos = append(repos, binding.GitRepoSnapshot{WorkDir: d, ObjectsDir: "{workdir}/.git/objects"})
 	}
 	var lock sync.Mutex
 	done := make(map[string]bool)
@@ -88,4 +90,58 @@ func TestRestoreInLevels(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, done, len(workDirs))
+}
+
+// Repos that share an objects dir are restored one after another, other repos of the level in
+// parallel.
+func TestRestoreInLevels_SharedObjectsDir(t *testing.T) {
+	// A repo snapshot keeps its objects dir with its own work dir replaced by {workdir}, so the two
+	// checkouts of one name record different strings for the same dir, and an unrelated repo can
+	// record the same string as one of them.
+	const shared = ".repo/project-objects/platform/external/foo.git/objects"
+	repos := []binding.GitRepoSnapshot{
+		{WorkDir: "external/foo", ObjectsDir: ".repo/project-objects/platform/{workdir}.git/objects"},
+		{WorkDir: "vendor/foo", ObjectsDir: shared},
+		{WorkDir: "external/foo2", ObjectsDir: ".repo/project-objects/platform/{workdir}.git/objects"},
+		{WorkDir: "bar", ObjectsDir: "{workdir}/.git/objects"},
+	}
+	parallel := runtime.NumCPU() > 1
+	var others sync.WaitGroup
+	others.Add(2)
+	othersStarted := make(chan struct{})
+	go func() {
+		others.Wait()
+		close(othersStarted)
+	}()
+	var lock sync.Mutex
+	sharedRunning := 0
+	restored := make(map[string]bool)
+	err := restoreInLevels(context.Background(), repos, func(ctx context.Context, p binding.GitRepoSnapshot) error {
+		if strings.Replace(p.ObjectsDir, "{workdir}", p.WorkDir, 1) == shared {
+			lock.Lock()
+			sharedRunning++
+			if sharedRunning > 1 {
+				t.Errorf("%s restored while another repo of %s ran", p.WorkDir, shared)
+			}
+			lock.Unlock()
+			// Give a repo of the same objects dir the time to start.
+			time.Sleep(20 * time.Millisecond)
+			lock.Lock()
+			sharedRunning--
+			lock.Unlock()
+		} else if parallel {
+			others.Done()
+			select {
+			case <-othersStarted:
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s not restored in parallel with the other repo that has its own objects dir", p.WorkDir)
+			}
+		}
+		lock.Lock()
+		restored[p.WorkDir] = true
+		lock.Unlock()
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, restored, len(repos))
 }

@@ -359,14 +359,23 @@ func (c *SnapshotService) restore(ctx context.Context, snapshot binding.Snapshot
 
 // restoreInLevels restores the git repos by levels, as repo sync checks out: a repo inside another
 // repo's work dir comes after it, so the outer repo's sync of its work dir cannot meet a
-// half-created inner one. The repos of one level are restored in parallel.
+// half-created inner one. The repos of one level are restored in parallel, except that repos
+// sharing an objects dir are restored one after another, since each syncs its pack dir.
 func restoreInLevels(ctx context.Context, repos []binding.GitRepoSnapshot, restore func(context.Context, binding.GitRepoSnapshot) error) error {
 	for _, level := range gitRepoLevels(repos) {
 		grp, gctx := errgroup.WithContext(ctx)
 		grp.SetLimit(runtime.NumCPU())
-		for _, p := range level {
+		for _, group := range groupByObjectsDir(level) {
 			grp.Go(func() error {
-				return restore(gctx, p)
+				for _, p := range group {
+					if err := gctx.Err(); err != nil {
+						return err
+					}
+					if err := restore(gctx, p); err != nil {
+						return err
+					}
+				}
+				return nil
 			})
 		}
 		if err := grp.Wait(); err != nil {
@@ -391,6 +400,23 @@ func gitRepoLevels(repos []binding.GitRepoSnapshot) [][]binding.GitRepoSnapshot 
 		levels = append(levels, level)
 	}
 	return levels
+}
+
+// groupByObjectsDir groups the git repos by their expanded objects dir, in the order of repos.
+func groupByObjectsDir(repos []binding.GitRepoSnapshot) [][]binding.GitRepoSnapshot {
+	index := make(map[string]int, len(repos))
+	var groups [][]binding.GitRepoSnapshot
+	for _, p := range repos {
+		objectsDir := strings.Replace(p.ObjectsDir, "{workdir}", p.WorkDir, 1)
+		i, ok := index[objectsDir]
+		if !ok {
+			i = len(groups)
+			index[objectsDir] = i
+			groups = append(groups, nil)
+		}
+		groups[i] = append(groups[i], p)
+	}
+	return groups
 }
 
 func (c *SnapshotService) restoreGitRepo(ctx context.Context, progress *abfsrepo.SyncProgress, p binding.GitRepoSnapshot) (retErr error) {
