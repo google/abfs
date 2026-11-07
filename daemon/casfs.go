@@ -90,8 +90,10 @@ func NewCASFS(opt *CASFSMountOpts) *casfs {
 	}
 }
 
-func (c *casfs) startCleanupWatch(ctx context.Context) {
+func (c *casfs) startCleanupWatch(ctx context.Context) <-chan struct{} {
+	cleaned := make(chan struct{})
 	go func() {
+		defer close(cleaned)
 		<-ctx.Done()
 
 		log.Printf("Stopping...")
@@ -100,6 +102,7 @@ func (c *casfs) startCleanupWatch(ctx context.Context) {
 		}
 		log.Printf("...Stopping Done")
 	}()
+	return cleaned
 }
 
 func (c *casfs) SetInitConfig(cfg *entities.FSConfig) {
@@ -107,7 +110,7 @@ func (c *casfs) SetInitConfig(cfg *entities.FSConfig) {
 }
 
 func (c *casfs) Serve(ctx context.Context) error {
-	c.startCleanupWatch(ctx)
+	cleaned := c.startCleanupWatch(ctx)
 
 	c.workspaces = workspaces.NewWorkspaces(c.store, c.cacheman)
 
@@ -167,7 +170,10 @@ func (c *casfs) Serve(ctx context.Context) error {
 	}
 
 	fmt.Printf("Starting to serve read/write filesystem on %s\n", c.mountPoint)
-	return c.mnt.Serve()
+	err := c.mnt.Serve()
+	// Serve returns once the unmount has started; the unmount runs in the cleanups.
+	<-cleaned
+	return err
 }
 
 func (c *casfs) addCleanup(cleanup func()) {
