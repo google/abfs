@@ -24,6 +24,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -124,27 +125,16 @@ func (c *mountCmd) runForeground(ctx context.Context) error {
 	}
 	out, err := exec.CommandContext(ctx, os.Args[0], "ws", "attach", "-s", "remote-wins", "--from-mount", c.WSName, c.MountPoint).CombinedOutput()
 	if err != nil {
-		// Unmount before failing, so that no mount is left without the process that serves it.
-		stopMount()
-		mountErr := <-c.done
 		_, _ = os.Stderr.Write(out)
-		if isMountPoint(c.MountPoint) {
-			if mountErr == nil {
-				mountErr = errors.New("it is still mounted")
-			}
-			return fmt.Errorf("failed to attach workspace %s at %s: %w; failed to unmount it: %w", c.WSName, c.MountPoint, err, mountErr)
-		}
-		if mountErr != nil {
-			log.Printf("Mount of %s ended with: %v", c.MountPoint, mountErr)
-		}
-		return fmt.Errorf("failed to attach workspace %s at %s, unmounted it again: %w", c.WSName, c.MountPoint, err)
+		// Unmount before failing, so that no mount is left without the process that serves it.
+		return unmountAfterFailure(stopMount, c.done, c.MountPoint, isMountPoint, fmt.Errorf("failed to attach workspace %s at %s: %w", c.WSName, c.MountPoint, err))
 	}
 	// Attaching runs abfs setup under sync.auto-setup.
 	_, _ = os.Stdout.Write(out)
 
 	client, err := binding.NewClient(c.MountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
 	if err != nil {
-		return fmt.Errorf("failed to get cache client: %w", err)
+		return unmountAfterFailure(stopMount, c.done, c.MountPoint, isMountPoint, fmt.Errorf("failed to get cache client: %w", err))
 	}
 	defer func() {
 		if err := client.Close(); err != nil {
@@ -183,6 +173,30 @@ func isMountPoint(dir string) bool {
 	}
 	mountPoint, err := cmd.MountPoint(abs)
 	return err == nil && mountPoint == abs
+}
+
+var mountEndTimeout = 30 * time.Second
+
+// unmountAfterFailure stops the mount, waits up to mountEndTimeout until it has ended and returns
+// cause together with whether mountPoint is still mounted.
+func unmountAfterFailure(stop func(), done <-chan error, mountPoint string, isMounted func(string) bool, cause error) error {
+	stop()
+	var mountErr error
+	select {
+	case mountErr = <-done:
+	case <-time.After(mountEndTimeout):
+		return fmt.Errorf("%w; %s is still unmounting after %s", cause, mountPoint, mountEndTimeout)
+	}
+	if isMounted(mountPoint) {
+		if mountErr == nil {
+			mountErr = errors.New("it is still mounted")
+		}
+		return fmt.Errorf("%w; failed to unmount %s: %w", cause, mountPoint, mountErr)
+	}
+	if mountErr != nil {
+		log.Printf("Mount of %s ended with: %v", mountPoint, mountErr)
+	}
+	return fmt.Errorf("%w; unmounted %s again", cause, mountPoint)
 }
 
 func (c *mountCmd) mount(ctx context.Context) error {

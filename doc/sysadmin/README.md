@@ -309,7 +309,7 @@ abfs mount --branch android-latest-release --tmp-ws $MOUNT
 
 Projects that haven't been pushed yet are reported as `project <name>: remote branch <revision> not found in upstream <server>/<name>`, followed by a `Failing projects:` list.
 
-A failed mount stays mounted, so unmount it before you try again:
+A failed mount unmounts itself. If its error says that the unmount failed too, unmount it before you try again:
 
 ```sh
 abfs unmount -k $MOUNT
