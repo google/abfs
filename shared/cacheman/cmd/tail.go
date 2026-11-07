@@ -57,10 +57,10 @@ func (c *tailCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 
 	logPath := filepath.Join(c.Config.LogDir, "cacheman")
 
-	currInstanceOnly := true
-	cachemans, err := loadCachemans(c.Instance, currInstanceOnly)
+	peer, found, err := findCacheman(c.Instance)
 	if err != nil {
-		log.Fatal(err)
+		// The log file does not need cacheman.
+		log.Printf("Warning: %v", err)
 	}
 
 	var args []string
@@ -70,9 +70,9 @@ func (c *tailCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		args = append(args, "-F")
 	}
 	args = append(args, logPath)
-	if len(cachemans.infos) == 1 {
+	if found && peer.Pid != 0 {
 		// Also tail the stdout and stderr logs if they point to a real file.
-		args = append(args, stdoutStderrFiles(cachemans.infos[0].pid)...)
+		args = append(args, stdoutStderrFiles(peer.Pid)...)
 	}
 	cmd := exec.CommandContext(ctx, "tail", args...)
 	cmd.Stdout = os.Stdout

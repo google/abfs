@@ -177,9 +177,31 @@ func (c *cleanCmd) remove(p string) {
 // outside of cacheman because the empty cache is a consistent index state.
 // However, we need to stop cacheman to clear in-memory state.
 func (c *cleanCmd) cleanAll(ctx context.Context) error {
-	config := c.Config
-	active := cachemanActive()
+	if SystemctlSupported() {
+		return c.cleanAllWith(ctx, cachemanActive(), stopCacheman, startCacheman)
+	}
+	return c.cleanAllWithoutSystemd(ctx)
+}
 
+// cleanAllWithoutSystemd cleans everything with cacheman run by hand. There is no
+// start command then, so it starts cacheman as restart does.
+func (c *cleanCmd) cleanAllWithoutSystemd(ctx context.Context) error {
+	_, active, err := findCacheman(c.Instance)
+	if err != nil {
+		return err
+	}
+	stop := func() error { return stopCachemanInst(ctx, c.Instance) }
+	start := func() error {
+		_, err := runDetached(c.Instance)
+		return err
+	}
+	return c.cleanAllWith(ctx, active, stop, start)
+}
+
+// cleanAllWith cleans everything. If active, it stops cacheman first and starts it
+// again at the end.
+func (c *cleanCmd) cleanAllWith(ctx context.Context, active bool, stopCacheman, startCacheman func() error) error {
+	config := c.Config
 	if active {
 		if err := stopCacheman(); err != nil {
 			return fmt.Errorf("could not stop cacheman: %v", err)
