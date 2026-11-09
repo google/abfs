@@ -134,6 +134,11 @@ func (m *CasfsMount) Hashes(ctx context.Context, goCount int64, prefix string, p
 			// to not line up with the input list. Also, there shouldn't be an issue retrieving
 			// the hash of the root. The fuse implementation supports this.
 		}
+		if err := checkInMount(p); err != nil {
+			result[i] = ""
+			errs[p] = err.Error()
+			continue
+		}
 		h, err = m.casfs.Hash(p)
 		if err == nil {
 			result[i] = h.String()
@@ -158,6 +163,10 @@ func (m *CasfsMount) HashStats(ctx context.Context, goCount int64, prefix string
 		p = path.Join(prefix, p)
 		if p == "" || p == "/" {
 			p = "."
+		}
+		if err := checkInMount(p); err != nil {
+			errs[p] = err.Error()
+			continue
 		}
 
 		hs, err := m.casfs.HashStat(p)
@@ -200,6 +209,25 @@ func IsGitPath(p string) bool {
 	return false
 }
 
+// checkInMount rejects a joined request path that leaves the mount. The daemon works relative
+// to the mount point, so such a path would reach files outside the mount.
+func checkInMount(name string) error {
+	if path.IsAbs(name) || name == ".." || strings.HasPrefix(name, "../") {
+		return fmt.Errorf("path %q is outside the mount", name)
+	}
+	return nil
+}
+
+// ignorePatchEntry reports whether the patch entry at p, relative to chroot, is left alone.
+// Below a Soong top, the repo workspace's git state is at ../.repo and the like, so git paths
+// are tested in the mount too.
+func (m *CasfsMount) ignorePatchEntry(chroot, p string) bool {
+	if m.ignoreMatch(p) {
+		return true
+	}
+	return chroot != "" && chroot != "." && IsGitPath(path.Join(chroot, p))
+}
+
 func (m *CasfsMount) ignoreMatch(p string) bool {
 	if strings.HasSuffix(p, ".path_interposer_origpath") {
 		return true
@@ -219,12 +247,15 @@ func (m *CasfsMount) ignoreMatch(p string) bool {
 func (m *CasfsMount) Matches(ctx context.Context, goCount int64, chroot string, patch entities.Patch) error {
 
 	matchFunc := func(p *entities.PatchEntry) error {
-		if m.ignoreMatch(p.Path) {
+		if m.ignorePatchEntry(chroot, p.Path) {
 			return nil
 		}
 
 		name := p.Path
 		name = path.Join(chroot, name)
+		if err := checkInMount(name); err != nil {
+			return err
+		}
 
 		if p.Mode&entities.FileModeDir == entities.FileModeDir {
 			stat, err := m.casfs.Lstat(name)
@@ -427,6 +458,18 @@ func (m *CasfsMount) AddEntry(ctx context.Context, name string, mode entities.Fi
 }
 
 func (m *CasfsMount) MatchAndPatch(ctx context.Context, goCount int64, chroot string, readPatch, writePatch entities.Patch, deletes entities.DeletePatch) error {
+	// Check every path before the first change.
+	for _, p := range writePatch {
+		if err := checkInMount(path.Join(chroot, p.Path)); err != nil && !m.ignorePatchEntry(chroot, p.Path) {
+			return err
+		}
+	}
+	for _, p := range deletes {
+		if err := checkInMount(path.Join(chroot, p)); err != nil {
+			return err
+		}
+	}
+
 	if err := m.Matches(ctx, goCount, chroot, readPatch); err != nil {
 		return err
 	}
@@ -440,7 +483,7 @@ func (m *CasfsMount) MatchAndPatch(ctx context.Context, goCount int64, chroot st
 	}
 
 	applyFunc := func(p *entities.PatchEntry) error {
-		if m.ignoreMatch(p.Path) {
+		if m.ignorePatchEntry(chroot, p.Path) {
 			return nil
 		}
 

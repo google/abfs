@@ -223,10 +223,28 @@ func (c *mountRepoCmd) runForeground(ctx context.Context) (retErr error) {
 
 	c.MountPoint = instance.AbsPath(c.MountPoint)
 
-	if err := c.mount(ctx); err != nil {
+	mountCtx, stopMount := context.WithCancel(ctx)
+	defer stopMount()
+	if err := c.mount(mountCtx); err != nil {
 		return err
 	}
+	if err := c.populate(ctx, wsSnapshot); err != nil {
+		// Unmount before failing, so that no mount is left without the process that serves it.
+		return unmountAfterFailure(stopMount, c.done, c.MountPoint, isMountPoint, err)
+	}
 
+	// The CLI exits once the daemon switches, so the steps whose failure the CLI must report run before it.
+	if !c.foreground {
+		if c.daemon != nil {
+			c.daemon.Switch()
+		}
+	}
+
+	return <-c.done
+}
+
+// populate fills the mounted workspace and attaches it.
+func (c *mountRepoCmd) populate(ctx context.Context, wsSnapshot *binding.WSSnapshot) error {
 	if err := os.Chdir(c.MountPoint); err != nil {
 		return fmt.Errorf("failed to chdir to %s: %w", c.MountPoint, err)
 	}
@@ -264,19 +282,14 @@ func (c *mountRepoCmd) runForeground(ctx context.Context) (retErr error) {
 		}
 	}
 
-	if !c.foreground {
-		if c.daemon != nil {
-			c.daemon.Switch()
-		}
-	}
-
 	if c.WSName != "" {
 		if out, err := exec.CommandContext(ctx, os.Args[0], "ws", "attach", c.WSName, "-n").CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to attach workspace: %w\n%s", err, out)
+			_, _ = os.Stderr.Write(out)
+			// The attach can fail after it has written the workspace ref.
+			return fmt.Errorf("failed to attach workspace %s, which may exist now: %w", c.WSName, err)
 		}
 	}
-
-	return <-c.done
+	return nil
 }
 
 func discoverWSName(mountPoint string) (string, error) {

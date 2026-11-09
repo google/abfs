@@ -479,8 +479,15 @@ func (a *ABFS) handleChroot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	socketPath := path.Join(a.MountPoint, p, entities.ABFSSocketFileName)
 	dir, err := a.mnt.Chroot(r.Context(), p)
 	if errors.Is(err, os.ErrExist) {
+		// The overlays are in place already; only the listener may be gone.
+		if err := a.listenChrootSocket(socketPath); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, "error checking the socket of chroot %s: %s\n", p, err)
+			return
+		}
 		_, _ = fmt.Fprintf(w, "chroot already exists\n")
 		return
 	}
@@ -520,14 +527,28 @@ func (a *ABFS) handleChroot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err := a.listenChrootSocket(socketPath); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "error checking the socket of chroot %s: %s\n", p, err)
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "done\n")
+}
+
+// listenChrootSocket serves the socket of a chroot unless a server already answers on it.
+func (a *ABFS) listenChrootSocket(socketPath string) error {
+	listen, err := daemon.NeedListener(socketPath)
+	if err != nil || !listen {
+		return err
+	}
 	go func() {
-		err := a.listenUnixSocket(path.Join(a.MountPoint, p, entities.ABFSSocketFileName))
+		err := a.listenUnixSocket(socketPath)
 		if err != nil {
 			log.Print(boostMsg(fmt.Sprintf("ERROR: listenUnixSocket failed: %s", err)))
 		}
 	}()
-
-	_, _ = fmt.Fprintf(w, "done\n")
+	return nil
 }
 
 func (a *ABFS) handleProviderPing(w http.ResponseWriter, r *http.Request) {
