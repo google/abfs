@@ -15,6 +15,7 @@
 package casdb
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
@@ -55,7 +57,10 @@ type CASDB struct {
 	headersSem   chan struct{}
 }
 
-func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int) (*CASDB, error) {
+// New connects to the Spanner database and the Bigtable instance. The client
+// libraries export their built-in metrics to Cloud Monitoring only when
+// clientMetrics is set.
+func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile string, btConnPoolSize int, clientMetrics bool) (*CASDB, error) {
 	sessionPoolConfig := spanner.SessionPoolConfig{
 		MinOpened:     400,
 		MaxOpened:     5000,
@@ -64,15 +69,18 @@ func New(ctx context.Context, spannerDB, projectID, btInstance, btAppProfile str
 
 	numChannels := option.WithGRPCConnectionPool(int(sessionPoolConfig.MaxOpened) / 100)
 	client, err := spanner.NewClientWithConfig(ctx, spannerDB, spanner.ClientConfig{
-		SessionPoolConfig: sessionPoolConfig,
+		SessionPoolConfig:    sessionPoolConfig,
+		DisableNativeMetrics: !clientMetrics,
 	}, numChannels)
 	if err != nil {
 		return nil, err
 	}
 
-	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, bigtable.ClientConfig{
-		AppProfile: btAppProfile,
-	}, bigtableClientOptions(btConnPoolSize)...)
+	btConfig := bigtable.ClientConfig{AppProfile: btAppProfile}
+	if !clientMetrics {
+		btConfig.MetricsProvider = bigtable.NoopMetricsProvider{}
+	}
+	btClient, err := bigtable.NewClientWithConfig(ctx, projectID, btInstance, btConfig, bigtableClientOptions(btConnPoolSize)...)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to create bigtable client: %w", err)
@@ -316,22 +324,38 @@ func (c *CASDB) AddMapResult(ctx context.Context, from, to entities.Hash) error 
 	return c.mapsTable.Apply(ctx, rowKey, mut)
 }
 
+// MapResults returns the results added for from, oldest first, as file-based
+// does. Rows are keyed by result, so the order comes from the cell timestamps;
+// results added in the same millisecond keep the row key order. Each server
+// sets the timestamps from its own clock, so with several servers the order of
+// results added close together follows their clock skew.
 func (c *CASDB) MapResults(ctx context.Context, from entities.Hash) ([]entities.Hash, error) {
 	prefix := from.String() + "#"
-	var results []entities.Hash
+	type mapResult struct {
+		hash  entities.Hash
+		added bigtable.Timestamp
+	}
+	var results []mapResult
 
 	filter := bigtable.ChainFilters(bigtable.CellsPerRowLimitFilter(1), bigtable.StripValueFilter())
 	err := c.mapsTable.ReadRows(ctx, bigtable.PrefixRange(prefix), func(row bigtable.Row) bool {
 		toStr := strings.TrimPrefix(row.Key(), prefix)
-		if toStr != "" {
-			results = append(results, entities.NewHash(toStr))
+		if toStr != "" && len(row["cf"]) > 0 {
+			results = append(results, mapResult{hash: entities.NewHash(toStr), added: row["cf"][0].Timestamp})
 		}
 		return true
 	}, bigtable.RowFilter(filter))
 	if err != nil {
 		return nil, err
 	}
-	return results, nil
+	slices.SortStableFunc(results, func(a, b mapResult) int {
+		return cmp.Compare(a.added, b.added)
+	})
+	hashes := make([]entities.Hash, len(results))
+	for i, r := range results {
+		hashes[i] = r.hash
+	}
+	return hashes, nil
 }
 
 func (c *CASDB) GetOrCreateProject(ctx context.Context, host, project string) (int64, error) {
@@ -466,7 +490,7 @@ func (c *CASDB) XchgRefs(ctx context.Context, projectID int64, refs []remote.Ref
 		return nil
 	}
 	if len(refs) > maxRefsBatch {
-		return fmt.Errorf("cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
+		return status.Errorf(codes.InvalidArgument, "cannot xchg %d refs in a single transaction (max %d)", len(refs), maxRefsBatch)
 	}
 
 	cols := []string{"ProjectId", "Ref", "UpdateTime", "Target"}
@@ -588,36 +612,48 @@ type ProjectRefHash struct {
 	Hash      entities.Hash
 }
 
-func (c *CASDB) SearchRefs(ctx context.Context, projectID *int64, refPrefix string, limit int) ([]ProjectRefHash, error) {
+// SearchRefs returns the refs of host whose name is refPrefix or starts with
+// refPrefix and a slash, newest name first, without deleted refs. An empty
+// refPrefix matches every ref. projectID limits the search to one project.
+func (c *CASDB) SearchRefs(ctx context.Context, host string, projectID *int64, refPrefix string, limit int) ([]ProjectRefHash, error) {
 	refPrefix = strings.Trim(refPrefix, "/")
 
-	var stmt spanner.Statement
-	if projectID == nil {
-		stmt = spanner.Statement{
-			SQL: "SELECT ProjectId, Ref, Target FROM Refs WHERE Ref = @refPrefix OR STARTS_WITH(Ref, @refPrefix || '/')",
-			Params: map[string]any{
-				"refPrefix": refPrefix,
-			},
-		}
-	} else {
-		stmt = spanner.Statement{
-			SQL: "SELECT ProjectId, Ref, Target FROM Refs WHERE ProjectId = @projectId AND (Ref = @refPrefix OR STARTS_WITH(Ref, @refPrefix || '/'))",
-			Params: map[string]any{
-				"projectId": *projectID,
-				"refPrefix": refPrefix,
-			},
-		}
+	sql := `SELECT r.ProjectId, r.Ref, r.Target FROM Refs AS r JOIN Projects AS p ON p.ProjectId = r.ProjectId
+		WHERE p.Host = @host AND r.Target IS NOT NULL`
+	params := map[string]any{"host": host}
+	if projectID != nil {
+		sql += " AND r.ProjectId = @projectId"
+		params["projectId"] = *projectID
 	}
+	if refPrefix != "" {
+		sql += " AND (r.Ref = @refPrefix OR STARTS_WITH(r.Ref, @refPrefix || '/'))"
+		params["refPrefix"] = refPrefix
+	}
+	sql += " ORDER BY r.Ref DESC"
 	if limit > 0 {
-		stmt.SQL += " ORDER BY Ref DESC LIMIT @limit"
-		stmt.Params["limit"] = limit
+		sql += " LIMIT @limit"
+		params["limit"] = limit
 	}
 
 	capHint := limit
 	if capHint <= 0 {
 		capHint = 16
 	}
-	return c.runProjectIDRefTargetQuery(ctx, stmt, capHint)
+	return c.runProjectIDRefTargetQuery(ctx, spanner.Statement{SQL: sql, Params: params}, capHint)
+}
+
+// HostExists reports whether any project of host has been created.
+func (c *CASDB) HostExists(ctx context.Context, host string) (bool, error) {
+	stmt := spanner.Statement{
+		SQL:    "SELECT 1 FROM Projects WHERE Host = @host LIMIT 1",
+		Params: map[string]any{"host": host},
+	}
+	found := false
+	err := c.dbClient.Single().Query(ctx, stmt).Do(func(row *spanner.Row) error {
+		found = true
+		return nil
+	})
+	return found, err
 }
 
 func hashesToStrings(hashes []entities.Hash) []string {

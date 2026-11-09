@@ -15,7 +15,9 @@
 package gcp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -28,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"cloud.google.com/go/bigtable"
@@ -91,11 +94,12 @@ func (f *fakeURLDepot) LinkedContent(ctx context.Context, s depot.Chunk) (remote
 
 func createTestServer(t *testing.T, master *depot.MasterDepot) *GCPServer {
 	s := &GCPServer{
-		headers:      make([]*lru.Cache[entities.Hash, CachedHeader], 256),
-		content:      make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
-		depot:        master,
-		storeLinks:   false,
-		validateHash: true,
+		headers:       make([]*lru.Cache[entities.Hash, CachedHeader], 256),
+		content:       make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
+		depot:         master,
+		storeLinks:    false,
+		validateHash:  true,
+		validateLinks: true,
 	}
 	for i := range s.headers {
 		var err error
@@ -115,6 +119,7 @@ func TestGetObjectLinkedContentThresholdAndFallback(t *testing.T) {
 	master := depot.NewMasterDepot([]depot.Depot{fake})
 
 	s := createTestServer(t, master)
+	s.linksContent = true
 	s.SetLinksContentThreshold(100)
 
 	// Store a chunk in the fake depot
@@ -173,6 +178,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 	master := depot.NewMasterDepot([]depot.Depot{noLink})
 
 	s := createTestServer(t, master)
+	s.linksContent = true
 	s.SetLinksContentThreshold(100)
 
 	contentStr := "some data in memory depot without linked content support"
@@ -197,7 +203,7 @@ func TestGetObjectLinkedContentFallbackWhenUnsupported(t *testing.T) {
 }
 
 func TestSupportsLinksContentVersionCheck(t *testing.T) {
-	s := &GCPServer{}
+	s := &GCPServer{linksContent: true}
 	s.SetLinksContentThreshold(100)
 
 	// No metadata in context -> false
@@ -600,7 +606,7 @@ func createTestServerWithCASDB(t *testing.T) (*GCPServer, *fakeSpannerServer) {
 	t.Setenv("BIGTABLE_EMULATOR_HOST", btSrv.Addr)
 	t.Setenv("SPANNER_EMULATOR_HOST", spLis.Addr().String())
 
-	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", "", 1)
+	db, err := casdb.New(ctx, "projects/test-proj/instances/test-inst/databases/test-db", "test-proj", "test-bt", "", 1, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -608,6 +614,7 @@ func createTestServerWithCASDB(t *testing.T) (*GCPServer, *fakeSpannerServer) {
 	master := depot.NewMasterDepot([]depot.Depot{mem})
 	s := createTestServer(t, master)
 	s.casdb = db
+	s.addObject = db.AddObject
 	s.projectsByName = make(map[[2]string]int64)
 	s.projectsByID = make(map[int64][2]string)
 	return s, fakeSpanner
@@ -696,4 +703,199 @@ func TestFilterServerXchgRefAndXchgRefs(t *testing.T) {
 	require.NoError(t, filterServer.XchgRefs(allowedCtx, "srv", "proj", []remote.RefXchg{
 		{Ref: "refs/heads/main", Current: hash1, Desired: entities.ZeroHash},
 	}))
+}
+
+func TestPutObject_FailedAddObjectKeepsCommittedContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, _ := createTestServerWithCASDB(t)
+
+	// The mutation is applied but the call still fails, as when the response is lost.
+	s.addObject = func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error {
+		require.NoError(s.casdb.AddObject(ctx, hdr, content))
+		return errors.New("response lost")
+	}
+	content := []byte("blob 11\x00hello world")
+	key := objects.HashBlobBytes([]byte("hello world"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.Error(err)
+
+	readable := func() bool {
+		r, err := s.GetObject(ctx, key)
+		if err != nil {
+			return false
+		}
+		defer r.Close()
+		_, err = io.ReadAll(r)
+		return err == nil
+	}
+	require.Never(func() bool { return !readable() }, 500*time.Millisecond, 10*time.Millisecond)
+}
+
+// recordingDepot records the chunks it removes.
+type recordingDepot struct {
+	depot.Depot
+	mu      sync.Mutex
+	removed []string
+}
+
+func (d *recordingDepot) Remove(ctx context.Context, c depot.Chunk) error {
+	d.mu.Lock()
+	d.removed = append(d.removed, c.ID)
+	d.mu.Unlock()
+	return d.Depot.Remove(ctx, c)
+}
+
+func (d *recordingDepot) removedCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.removed)
+}
+
+func newRecordingServer(t *testing.T) (*GCPServer, *recordingDepot) {
+	t.Helper()
+	s, _ := createTestServerWithCASDB(t)
+	rec := &recordingDepot{Depot: depot.NewMemoryDepot("mem", 1000000)}
+	s.depot = depot.NewMasterDepot([]depot.Depot{rec})
+	return s, rec
+}
+
+func TestPutObject_AttemptedAddObjectKeepsContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, rec := newRecordingServer(t)
+
+	// Whether the row was written is unknown, so the content must stay.
+	s.addObject = func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error {
+		return errors.New("write failed")
+	}
+	content := []byte("blob 11\x00hello again")
+	key := objects.HashBlobBytes([]byte("hello again"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.Error(err)
+	require.Never(func() bool { return rec.removedCount() > 0 }, 500*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestPutObject_FailureBeforeAddObjectRemovesContent(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s, rec := newRecordingServer(t)
+
+	// The content does not hash to the key, so PutObject fails before AddObject.
+	content := []byte("blob 11\x00hello again")
+	key := objects.HashBlobBytes([]byte("other content"))
+	err := s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(content)), remote.EncodingRaw))
+	require.ErrorContains(err, "expected hash")
+	require.Eventually(func() bool { return rec.removedCount() == 1 }, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestSupportsLinksContent_OffUnlessEnabled(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("client-version", "0.1.23"))
+
+	s := &GCPServer{}
+	s.SetLinksContentThreshold(100)
+	assert.False(t, s.supportsLinksContent(ctx))
+
+	s.linksContent = true
+	assert.True(t, s.supportsLinksContent(ctx))
+
+	// A zero threshold returns links for every object; it does not turn links off.
+	s.SetLinksContentThreshold(0)
+	assert.True(t, s.supportsLinksContent(ctx))
+}
+
+func TestSearchRefs_ConcurrentWithProjectCacheWrites(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	s := newEmulatorCASDBServer(t)
+
+	target := entities.NewHash("1111111111111111111111111111111111111111")
+	s.headers[target[0]].Add(target, newCachedHeader(&ObjectHeader{Id: target, Size: 10, Type: string(entities.ObjectTypeBlob)}))
+	require.NoError(s.PutRefs(ctx, "race.example", "seed", []remote.RefHash{{Ref: "refs/heads/r", Hash: target}}))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := int64(1); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// What projectForRefs does when another request creates a project.
+			s.projectIDsLock.Lock()
+			s.projectsByID[-i] = [2]string{"race.example", fmt.Sprintf("p%d", i)}
+			s.projectsByName[[2]string{"race.example", fmt.Sprintf("p%d", i)}] = -i
+			s.projectIDsLock.Unlock()
+		}
+	}()
+	for range 50 {
+		refs, err := s.SearchRefs(ctx, "race.example", "", "refs/heads/r", 0)
+		require.NoError(err)
+		require.Len(refs, 1)
+	}
+	close(stop)
+	<-done
+}
+
+func TestNew_AddsEmptyObjects(t *testing.T) {
+	require := require.New(t)
+	s := newEmulatorServer(t, nil)
+
+	hdrs, err := s.Headers(context.Background(), []entities.Hash{entities.EmptyFileHash, entities.EmptyDirHash})
+	require.NoError(err)
+	require.Equal(entities.ObjectTypeBlob, hdrs[0].Type)
+	require.Equal(gitobjects.ObjectTypeDir, hdrs[1].Type)
+}
+
+func TestNew_CacheSizesBelowShardCount(t *testing.T) {
+	s := newEmulatorServer(t, &NewServerOpts{MaxCachedHeaders: 100, MaxCachedContents: 1})
+	require.Len(t, s.headers, 256)
+	// Each shard holds at least one entry.
+	s.headers[0].Add(entities.Hash{0, 1}, CachedHeader{Valid: true})
+	s.headers[0].Add(entities.Hash{0, 2}, CachedHeader{Valid: true})
+	require.Equal(t, 1, s.headers[0].Len())
+}
+
+// treeWithMissingBlob returns a tree object that links a blob nobody stored.
+func treeWithMissingBlob() (entities.Hash, []byte) {
+	missing := objects.HashBlobBytes([]byte("never stored"))
+	entry := append([]byte("100644 file\x00"), missing[:]...)
+	data := append(fmt.Appendf(nil, "tree %d\x00", len(entry)), entry...)
+	return entities.Hash(sha1.Sum(data)), data
+}
+
+func TestNew_ValidationOptions(t *testing.T) {
+	ctx := context.Background()
+	treeKey, treeData := treeWithMissingBlob()
+	put := func(s *GCPServer, key entities.Hash, data []byte) error {
+		return s.PutObject(ctx, key, remote.NewContentReader(io.NopCloser(bytes.NewReader(data)), remote.EncodingRaw))
+	}
+	missing := objects.HashBlobBytes([]byte("never stored"))
+	wrongKey := objects.HashBlobBytes([]byte("other content"))
+	blob := []byte("blob 5\x00hello")
+
+	strict := newEmulatorServer(t, nil)
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(t, put(strict, treeKey, treeData), &linkErr)
+	require.ErrorAs(t, strict.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: missing}}), &linkErr)
+	require.ErrorContains(t, put(strict, wrongKey, blob), "expected hash")
+
+	lax := newEmulatorServer(t, &NewServerOpts{NoLinkValidation: true, NoHashValidation: true})
+	require.NoError(t, put(lax, treeKey, treeData))
+	require.NoError(t, lax.PutRefs(ctx, "example.com", "p", []remote.RefHash{{Ref: "refs/heads/main", Hash: missing}}))
+	require.NoError(t, lax.AddMapResult(ctx, missing, treeKey))
+	require.NoError(t, put(lax, wrongKey, blob))
+}
+
+func TestAddMapResult_RejectsZeroHashes(t *testing.T) {
+	ctx := context.Background()
+	s := newEmulatorCASDBServer(t)
+	h := putTestBlob(t, s, "map result target")
+
+	var linkErr *remote.ErrObjectLinkValidation
+	require.ErrorAs(t, s.AddMapResult(ctx, entities.ZeroHash, h), &linkErr)
+	require.ErrorAs(t, s.AddMapResult(ctx, h, entities.ZeroHash), &linkErr)
+	require.NoError(t, s.AddMapResult(ctx, h, h))
 }

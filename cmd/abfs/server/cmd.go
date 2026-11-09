@@ -23,6 +23,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +52,7 @@ import (
 type serverCmd struct {
 	*root.RootCmd
 	port             int
+	httpHost         string
 	httpPort         int
 	noLinkValidation bool
 	noHashValidation bool
@@ -84,6 +86,7 @@ func (c *serverCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVarP(&c.noHashValidation, "no-hash-validation", "c", false, "Skip validating checksum of objects")
 	fl.BoolVarP(&c.noLogging, "no-logging", "L", false, "Skip logging of requests")
 	fl.IntVarP(&c.port, "port", "p", 50051, "The server port")
+	fl.StringVar(&c.httpHost, "http-host", "localhost", "The host or address the http (v1) server listens on. Its endpoints, such as /debug and /server/status, have no authentication; use an address other than localhost only on a trusted network")
 	fl.IntVar(&c.httpPort, "http-port", 0, "The http (v1) server port")
 	fl.DurationVar(&c.maxConnectionAge, "max-connection-age", 0, "A duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. Supports units like '1h', '30m', '1s'. Default is 0 (no limit).")
 	// TODO: override hashpath or some other solution for local testing?
@@ -178,9 +181,6 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		}
 		cancel()
 		s.GracefulStop()
-		if err := abfsServer.Close(); err != nil {
-			log.Printf("WARNING: error closing abfs server: %v", err)
-		}
 		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer metricsCancel()
 		if err := provider.Shutdown(metricsCtx); err != nil {
@@ -195,12 +195,11 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 
 	go func() {
 		// This goroutine will be terminated when the main process exits.
-		httpLis, err := net.Listen("tcp", fmt.Sprintf(":%d", c.httpPort))
+		httpLis, err := net.Listen("tcp", net.JoinHostPort(c.httpHost, strconv.Itoa(c.httpPort)))
 		if err != nil {
-			log.Fatalf("Could not bind to port %d: %v", c.httpPort, err)
+			log.Fatalf("Could not bind to %s port %d: %v", c.httpHost, c.httpPort, err)
 		}
-		port := httpLis.Addr().(*net.TCPAddr).Port
-		log.Printf("Starting a web-server on http://localhost:%d/ (but available off of localhost)", port)
+		log.Printf("Starting a web-server on http://%s/", httpLis.Addr())
 		router := mux.NewRouter()
 		router.PathPrefix("/debug").Handler(http.DefaultServeMux)
 		router.Path("/mark/{hash}/{key}/{value}").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
