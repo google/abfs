@@ -16,7 +16,9 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -272,41 +274,75 @@ func (d *Doctor) logVerbose(format string, args ...any) {
 	}
 }
 
+// cachemanPingTimeout bounds each request to cacheman, so a stuck cacheman fails the
+// check instead of hanging the command.
+var cachemanPingTimeout = 5 * time.Second
+
+// cachemanStartupWait bounds the wait for a cacheman that accepts connections but does
+// not answer yet, as while it restores its index after a start. It matches the default
+// wait of `abfs cacheman restart`.
+var cachemanStartupWait = 2 * time.Minute
+
+// checkCachemanStatus pings the instance's cacheman over its socket, which works from
+// any pid namespace and needs no process list.
 func (d *Doctor) checkCachemanStatus() error {
-	abfsPath, err := exec.LookPath("abfs")
-	if err != nil {
+	cacheDir := d.Instance.Config.CacheDir
+	socket := filepath.Join(cacheDir, "http.socket")
+	if err := pingCacheman(cacheDir, socket); err != nil {
+		abfsCmd := "abfs"
+		if d.Instance.Name != "" && d.Instance.Name != instance.DefaultInstanceName {
+			abfsCmd = "abfs --instance " + d.Instance.Name
+		}
 		return clierr.CLIErr(
 			"%s",
 			NewDoctorMessage().
-				AppendError("could not locate `abfs` executable in PATH: %v\n", err).
-				AppendSuggestion("Ensure abfs is installed and in your PATH.").
+				AppendError("could not detect a running cacheman: %s\n", cachemanDownReason(socket, err)).
+				AppendSuggestion("Ensure `%[1]s init` has been run. If cacheman was previously stopped, try `%[1]s cacheman restart`. Check that cacheman runs: `%[1]s cacheman status`.", abfsCmd).
 				String(),
 		)
 	}
 
-	args := []string{}
-	if d.Instance != nil && d.Instance.Name != "" {
-		args = append(args, "--instance", d.Instance.Name)
-	}
-	args = append(args, "cacheman", "status")
-	statusCmd := exec.Command(abfsPath, args...)
-	statusOutBytes, statusErr := statusCmd.CombinedOutput()
-
-	if statusErr != nil {
-		statusOut := string(statusOutBytes)
-
-		return clierr.CLIErr(
-			"%s",
-			NewDoctorMessage().
-				AppendError("could not detect a running cacheman. `abfs cacheman status` is below:\n").
-				AppendString(strings.TrimSpace(statusOut)+"\n").
-				AppendSuggestion("Ensure `abfs init` has been run. If cacheman was previously stopped, try `abfs cacheman restart`").
-				String(),
-		)
-	}
-
-	d.logVerbose("Cacheman service: RUNNING (command: %s %s)", abfsPath, strings.Join(args, " "))
+	d.logVerbose("Cacheman service: RUNNING (answered ping on %s)", socket)
 	return nil
+}
+
+// pingCacheman retries while cacheman accepts connections but does not answer, up to
+// cachemanStartupWait. Other errors mean that no cacheman listens, so they return at once.
+func pingCacheman(cacheDir, socket string) error {
+	deadline := time.Now().Add(cachemanStartupWait)
+	waiting := false
+	var err error
+	for left := cachemanStartupWait; left > 0; left = time.Until(deadline) {
+		err = cachemanclient.NewHTTPClientWithTimeout(cacheDir, min(cachemanPingTimeout, left)).Ping()
+		var netErr net.Error
+		if !errors.Is(err, syscall.EAGAIN) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+			return err
+		}
+		if !waiting {
+			fmt.Fprintf(os.Stderr, "Waiting for cacheman to answer on %s...\n", socket)
+			waiting = true
+		}
+		time.Sleep(min(200*time.Millisecond, time.Until(deadline)))
+	}
+	return err
+}
+
+func cachemanDownReason(socket string, err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, syscall.ENOENT):
+		return fmt.Sprintf("%s does not exist, so cacheman is not running", socket)
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return fmt.Sprintf("nothing listens on %s, so cacheman stopped or crashed", socket)
+	case errors.Is(err, syscall.EACCES):
+		return fmt.Sprintf("permission denied on %s, so cacheman may run as another user", socket)
+	case errors.Is(err, syscall.EAGAIN):
+		return fmt.Sprintf("the listen queue of %s stayed full for %s", socket, cachemanStartupWait)
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return fmt.Sprintf("cacheman did not answer on %s within %s", socket, cachemanStartupWait)
+	default:
+		return err.Error()
+	}
 }
 
 func (d *Doctor) cachemanTailLog() string {
@@ -345,7 +381,7 @@ func (d *Doctor) cachemanTailLog() string {
 }
 
 func (d *Doctor) checkCachemanCompatibility() error {
-	client := cachemanclient.NewHTTPClient(d.Instance.Config.CacheDir)
+	client := cachemanclient.NewHTTPClientWithTimeout(d.Instance.Config.CacheDir, cachemanPingTimeout)
 	impStr, reqStr, err := client.InterfaceVersion()
 	if err != nil {
 		return clierr.CLIErr(
