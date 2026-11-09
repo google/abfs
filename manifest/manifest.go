@@ -15,7 +15,6 @@
 package manifest
 
 import (
-	"container/list"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -54,6 +53,7 @@ func (m *Manifest) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 
 // Maybe use reflection here in the future to account for newly added fields.
 func (m *Manifest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var unknown unmodelled
 	for {
 		token, err := d.Token()
 		if err == io.EOF {
@@ -64,6 +64,7 @@ func (m *Manifest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 		}
 
 		if se, ok := token.(xml.StartElement); ok {
+			unknown.add(se)
 			switch se.Name.Local {
 			case "notice":
 				var n Notice
@@ -102,11 +103,19 @@ func (m *Manifest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 				}
 				m.AddRemoveProject(&rp)
 			case "project":
-				var p Project
+				var p struct {
+					Project
+					Nested []struct{} `xml:"project"`
+				}
 				if err := d.DecodeElement(&p, &se); err != nil {
 					return err
 				}
-				m.AddProject(&p)
+				if len(p.Nested) > 0 {
+					m.warnings = append(m.warnings, fmt.Sprintf("<project name=%q>: nested project elements are not applied", p.Name))
+				}
+				// encoding/xml does not set the name of an embedded struct.
+				p.XMLName = se.Name
+				m.AddProject(&p.Project)
 			case "extend-project":
 				var ep ExtendProject
 				if err := d.DecodeElement(&ep, &se); err != nil {
@@ -135,9 +144,12 @@ func (m *Manifest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 				if err := m.AddSuperProject(&s); err != nil {
 					return err
 				}
+			case "submanifest":
+				m.warnings = append(m.warnings, fmt.Sprintf("<submanifest name=%q> is not applied", attr(se, "name")))
 			}
 		}
 	}
+	m.warnings = append(m.warnings, unknown.warnings()...)
 	return nil
 }
 
@@ -231,6 +243,10 @@ func (mf *Manifest) Filter() {
 type ManifestBytes func(ctx context.Context, name string) ([]byte, error)
 
 func (mf *Manifest) IncludeManifestFile(ctx context.Context, file string, manifestBytes ManifestBytes) error {
+	return mf.includeManifestFile(ctx, file, manifestBytes, nil, "")
+}
+
+func (mf *Manifest) includeManifestFile(ctx context.Context, file string, manifestBytes ManifestBytes, groups []string, revision string) error { //nolint:revive // same receiver as IncludeManifestFile, which it implements
 	manBytes, err := manifestBytes(ctx, file)
 	if err != nil {
 		return err
@@ -239,8 +255,11 @@ func (mf *Manifest) IncludeManifestFile(ctx context.Context, file string, manife
 	if err != nil {
 		return err
 	}
+	for _, w := range included.warnings {
+		mf.warnings = append(mf.warnings, file+": "+w)
+	}
 
-	return mf.MergeManifest(ctx, included, manifestBytes)
+	return mf.mergeManifest(ctx, included, manifestBytes, groups, revision)
 }
 
 // FlattenIncludes unrolls all the includes specified in this manifest to produce a flattened manifest.
@@ -249,7 +268,7 @@ func (mf *Manifest) FlattenIncludes(ctx context.Context, manifestBytes ManifestB
 		return nil
 	}
 
-	newMan := &Manifest{}
+	newMan := &Manifest{warnings: mf.warnings}
 	if err := newMan.MergeManifest(ctx, mf, manifestBytes); err != nil {
 		return err
 	}
@@ -300,6 +319,13 @@ func (mf *Manifest) Validate() error {
 // MergeManifest merges the input manifest into this manifest to produce a flattened manifest
 // with all the Includes unrolled.
 func (mf *Manifest) MergeManifest(ctx context.Context, toMerge *Manifest, manifestBytes ManifestBytes) error {
+	return mf.mergeManifest(ctx, toMerge, manifestBytes, nil, "")
+}
+
+// mergeManifest applies the groups and revision of the include elements that led to toMerge as
+// repo does: the groups are added to every project and extend-project, the revision is set on
+// every project and include that has none.
+func (mf *Manifest) mergeManifest(ctx context.Context, toMerge *Manifest, manifestBytes ManifestBytes, groups []string, revision string) error { //nolint:revive // same receiver as MergeManifest, which it implements
 	// We have to merge the elements in the correct order
 	for _, ele := range toMerge.Ordered {
 		switch ele := ele.(type) {
@@ -310,8 +336,20 @@ func (mf *Manifest) MergeManifest(ctx context.Context, toMerge *Manifest, manife
 				}
 			}
 		case *Remote:
+			// As in repo, a remote may be defined again only with the same attributes.
+			if existing := mf.RemoteFromName(ele.Name); existing != nil {
+				same := *existing
+				same.XMLName = ele.XMLName
+				if same != *ele {
+					return fmt.Errorf("remote %s already exists with different attributes", ele.Name)
+				}
+			}
 			mf.AddRemote(ele)
 		case *Default:
+			// As in repo, a repeated default that is empty or equal to the first one is ignored.
+			if ele != nil && mf.Default != nil && (*ele == *mf.Default || *ele == Default{XMLName: ele.XMLName}) {
+				continue
+			}
 			if ele != nil {
 				if err := mf.AddDefault(ele); err != nil {
 					return err
@@ -326,8 +364,19 @@ func (mf *Manifest) MergeManifest(ctx context.Context, toMerge *Manifest, manife
 		case *RemoveProject:
 			mf.AddRemoveProject(ele)
 		case *Project:
+			if ele.Revision == "" {
+				ele.Revision = revision
+			}
+			if len(groups) > 0 {
+				ele.Groups = addGroups(ele.Groups, groups)
+				ele.GroupsString = strings.Join(ele.Groups, ",")
+			}
 			mf.AddProject(ele)
 		case *ExtendProject:
+			if len(groups) > 0 {
+				ele.Groups = addGroups(ele.Groups, groups)
+				ele.GroupsString = strings.Join(ele.Groups, ",")
+			}
 			mf.AddExtendProject(ele)
 		case *RepoHooks:
 			if ele != nil {
@@ -336,7 +385,12 @@ func (mf *Manifest) MergeManifest(ctx context.Context, toMerge *Manifest, manife
 				}
 			}
 		case *Include:
-			if err := mf.IncludeManifestFile(ctx, ele.Name, manifestBytes); err != nil {
+			includeRevision := ele.Revision
+			if includeRevision == "" {
+				includeRevision = revision
+			}
+			includeGroups := addGroups(parseGroups(ele.Groups), groups)
+			if err := mf.includeManifestFile(ctx, ele.Name, manifestBytes, includeGroups, includeRevision); err != nil {
 				return err
 			}
 		case *SuperProject:
@@ -351,43 +405,6 @@ func (mf *Manifest) MergeManifest(ctx context.Context, toMerge *Manifest, manife
 	}
 
 	return nil
-}
-
-// ApplyRemoves returns a new Project list with the resolved set of
-// projects after applying remove-projects. The original manifest
-// is left intact.
-func (m *Manifest) ApplyRemoves() ([]*Project, error) {
-	l := list.New()
-	projects := make(map[string][]*list.Element)
-
-	for _, ele := range m.OrderedXProject {
-		switch ele := ele.(type) {
-		case *Project:
-			e := l.PushBack(ele)
-			projects[ele.Name] = append(projects[ele.Name], e)
-		case *RemoveProject:
-			targets, found := projects[ele.Name]
-			if !found {
-				return nil, fmt.Errorf("encountered remove project without accompanying project for %q", ele.Name)
-			}
-			for _, tgt := range targets {
-				l.Remove(tgt)
-			}
-			delete(projects, ele.Name)
-		case *ExtendProject:
-			// Nothing yet
-		default:
-			return nil, fmt.Errorf("encountered unexpected type: %T", ele)
-
-		}
-	}
-
-	applied := make([]*Project, 0, l.Len())
-	for e := l.Front(); e != nil; e = e.Next() {
-		applied = append(applied, e.Value.(*Project))
-	}
-
-	return applied, nil
 }
 
 func CloneManifest(man *Manifest) (*Manifest, error) {

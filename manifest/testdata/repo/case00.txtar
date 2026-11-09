@@ -1,0 +1,49 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" dest-branch="main-db" />
+  <include name="inc1.xml" />
+  <project name="platform/example/p1" path="ex/p1" revision="rev-a" groups="notdefault" />
+  <project name="platform/example/p2" path="ex/p2" groups="pdk" />
+  <extend-project name="platform/example/p1" path="ex/multi2" revision="v1" base-rev="rev-a" dest-path="ex/p3" upstream="main"></extend-project>
+  <project name="platform/example/p4" path="ex/none" />
+  <extend-project name="platform/example/p5" path="ex/p3" revision="v1" groups="x, y" remote="partner"></extend-project>
+  <remove-project name="platform/example/p2" path="ex/p0" optional="true" base-rev="rev-a" />
+  <remove-project path="ex/new1" optional="true" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <include name="inc2.xml" groups="inc2g,pdk" />
+  <project name="platform/example/p3" path="ex/p3" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <include name="inc3.xml" revision="inc-rev" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p0" path="ex/p0" />
+  <project name="platform/example/p4" path="ex/p4" remote="partner" />
+  <project name="platform/example/p5" path="ex/p5" remote="partner" />
+  <project name="platform/example/multi" path="ex/multi0" revision="rev-b" groups="a,b" />
+  <project name="platform/example/multi" path="ex/multi1" revision="rev-a" groups="notdefault" />
+  <project name="platform/example/multi" path="ex/multi2" groups="a,b" />
+</manifest>
+-- want --
+ex/multi0	platform/example/multi	rev-b	aosp	a,b,inc2g,pdk		main-db
+ex/multi1	platform/example/multi	rev-a	aosp	inc2g,notdefault,pdk		main-db
+ex/multi2	platform/example/multi	inc-rev	aosp	a,b,inc2g,pdk		main-db
+ex/none	platform/example/p4	main	aosp			main-db
+ex/p0	platform/example/p0	inc-rev	aosp	inc2g,pdk		main-db
+ex/p1	platform/example/p1	rev-a	aosp	notdefault		main-db
+ex/p2	platform/example/p2	main	aosp	pdk		main-db
+ex/p3	platform/example/p3	main	aosp			main-db
+ex/p4	platform/example/p4	inc-rev	partner	inc2g,pdk		main-db
+ex/p5	platform/example/p5	inc-rev	partner	inc2g,pdk		main-db

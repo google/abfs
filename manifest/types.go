@@ -120,8 +120,11 @@ type ManifestServer struct {
 }
 
 type RemoveProject struct {
-	XMLName xml.Name `xml:"remove-project"`
-	Name    string   `xml:"name,attr" json:"name"`
+	XMLName  xml.Name `xml:"remove-project"`
+	Name     string   `xml:"name,attr,omitempty" json:"name,omitempty"`
+	Path     string   `xml:"path,attr,omitempty" json:"path,omitempty"`
+	Optional string   `xml:"optional,attr,omitempty" json:"optional,omitempty"`
+	BaseRev  string   `xml:"base-rev,attr,omitempty" json:"baseRev,omitempty"`
 }
 
 type ExtendProject struct {
@@ -132,6 +135,14 @@ type ExtendProject struct {
 	Groups       []string `xml:"-" json:"groups,omitempty"`
 	Revision     string   `xml:"revision,attr,omitempty" json:"revision,omitempty"`
 	Remote       string   `xml:"remote,attr,omitempty" json:"remote,omitempty"`
+	DestPath     string   `xml:"dest-path,attr,omitempty" json:"destPath,omitempty"`
+	DestBranch   string   `xml:"dest-branch,attr,omitempty" json:"destBranch,omitempty"`
+	Upstream     string   `xml:"upstream,attr,omitempty" json:"upstream,omitempty"`
+	BaseRev      string   `xml:"base-rev,attr,omitempty" json:"baseRev,omitempty"`
+
+	Annotation []*Annotation `xml:"annotation,omitempty" json:"annotations,omitempty"`
+	Copyfile   []*Copyfile   `xml:"copyfile,omitempty" json:"copyFiles,omitempty"`
+	Linkfile   []*Linkfile   `xml:"linkfile,omitempty" json:"linkFiles,omitempty"`
 }
 
 type RepoHooks struct {
@@ -141,8 +152,10 @@ type RepoHooks struct {
 }
 
 type Include struct {
-	XMLName xml.Name `xml:"include"`
-	Name    string   `xml:"name,attr" json:"name"`
+	XMLName  xml.Name `xml:"include"`
+	Name     string   `xml:"name,attr" json:"name"`
+	Groups   string   `xml:"groups,attr,omitempty" json:"groups,omitempty"`
+	Revision string   `xml:"revision,attr,omitempty" json:"revision,omitempty"`
 }
 
 // Make a custom Notice type so that it can be marshalled
@@ -198,4 +211,7 @@ type Manifest struct {
 
 	// Name to Remote cache.
 	remotes map[string]*Remote
+
+	// Elements and attributes read but not applied, see Warnings.
+	warnings []string
 }

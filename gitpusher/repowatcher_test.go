@@ -18,29 +18,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/google/abfs/manifest"
 	"github.com/stretchr/testify/require"
 )
-
-func TestForAllManifests(t *testing.T) {
-	require := require.New(t)
-
-	contentor := &testContentor{}
-	// DFS pre-order traversal
-	want := []string{
-		"goog",
-		"r0_0_remote",
-		"r1_0_remote",
-		"r0_1_remote",
-	}
-	var got []string
-	err := forAllManifests(contentor, "default.xml", func(m *manifest.Manifest) error {
-		got = append(got, m.Remote[0].Name)
-		return nil
-	})
-	require.NoError(err)
-	require.Equal(want, got)
-}
 
 func TestProjectMappings(t *testing.T) {
 	require := require.New(t)
@@ -94,6 +73,45 @@ func TestDuplicateRemote(t *testing.T) {
 	require := require.New(t)
 	_, err := projectMappingsForFile(&testContentorDuplicateRemote{}, "https://android.com/platform/manifest", "default.xml")
 	require.Error(err)
+}
+
+type testContentorExtendRemote struct {
+}
+
+func (t *testContentorExtendRemote) Contents(manifestFile string) (string, error) {
+	switch manifestFile {
+	case "default.xml":
+		return `<manifest>
+  <remote fetch="https://gerrit.example.com/" name="gerrit" />
+  <remote fetch="https://mirror.example.com/" name="mirror" />
+  <default remote="gerrit" revision="main" />
+  <project name="platform/foo" />
+  <project name="platform/bar" />
+  <include name="moves.xml"/>
+</manifest>`, nil
+	case "moves.xml":
+		return `<manifest>
+  <extend-project name="platform/bar" remote="mirror" />
+  <remove-project name="platform/foo" />
+</manifest>`, nil
+	default:
+		return "", fmt.Errorf("unsupported file %q", manifestFile)
+	}
+}
+
+func TestProjectRemoteURLSet_ExtendAndRemove(t *testing.T) {
+	require := require.New(t)
+
+	mappings, err := projectMappingsForFile(&testContentorExtendRemote{}, "https://gerrit.example.com/platform/manifest", "default.xml")
+	require.NoError(err)
+	set := make(map[projectRemoteSchemeURL]struct{})
+	require.NoError(mappings.updateProjectRemoteURLSet(set))
+
+	// Clients mount the projects repo checks out, under the remote an extend-project gives them.
+	want := map[projectRemoteSchemeURL]struct{}{
+		{name: "platform/bar", server: "mirror.example.com", remote: "mirror", scheme: "https", url: "mirror.example.com/platform/bar"}: {},
+	}
+	require.Equal(want, set)
 }
 
 type testContentor struct {
@@ -201,13 +219,11 @@ func (t *testContentorDuplicateIncludes) Contents(manifestFile string) (string, 
 	}
 }
 
-func TestForAllManifests_DuplicateIncludesInfiniteLoop(t *testing.T) {
+func TestProjectMappings_DuplicateIncludesInfiniteLoop(t *testing.T) {
 	require := require.New(t)
 
 	contentor := &testContentorDuplicateIncludes{}
-	err := forAllManifests(contentor, "default.xml", func(m *manifest.Manifest) error {
-		return nil
-	})
+	_, err := projectMappingsForFile(contentor, "https://android.com/platform/manifest", "default.xml")
 	require.NoError(err)
 }
 
@@ -238,12 +254,10 @@ func (t *testContentorCycle) Contents(manifestFile string) (string, error) {
 	}
 }
 
-func TestForAllManifests_CycleInfiniteLoop(t *testing.T) {
+func TestProjectMappings_CycleInfiniteLoop(t *testing.T) {
 	require := require.New(t)
 
 	contentor := &testContentorCycle{}
-	err := forAllManifests(contentor, "default.xml", func(m *manifest.Manifest) error {
-		return nil
-	})
+	_, err := projectMappingsForFile(contentor, "https://android.com/platform/manifest", "default.xml")
 	require.NoError(err)
 }
