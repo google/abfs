@@ -17,6 +17,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -47,6 +49,8 @@ type gcpCmd struct {
 	bucket                string
 	maxCachedHeaders      int
 	maxCachedContents     int
+	clientMetrics         bool
+	linksContent          bool
 	linksContentThreshold int64
 }
 
@@ -56,6 +60,9 @@ func (c *gcpCmd) Spec() cmd.CmdSpec {
 		Usage:   "[-p <port>] --project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
 		Aliases: []string{},
 		Desc:    `Run a GCP-backed ABFS server.`,
+		Subcommands: []cmd.ABFSCmd{
+			&gcpInitCmd{RootCmd: c.RootCmd},
+		},
 	}
 }
 
@@ -69,7 +76,9 @@ func (c *gcpCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.StringVar(&c.bucket, "bucket", "", "The GCS Bucket Name (required)")
 	fl.IntVarP(&c.maxCachedHeaders, "headers-cache", "", defaultMaxCachedHeaders, "The maximum number of cached objects' headers")
 	fl.IntVarP(&c.maxCachedContents, "contents-cache", "", defaultMaxCachedContents, "The maximum number of cached objects' content")
-	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The threshold in bytes above which to return links content")
+	fl.BoolVar(&c.clientMetrics, "gcp-client-metrics", false, "Export the built-in metrics of the Spanner, Bigtable and Cloud Storage client libraries to Cloud Monitoring")
+	fl.BoolVar(&c.linksContent, "links-content", false, "Return signed Cloud Storage URLs instead of streaming objects larger than --links-content-threshold, so that clients download them from Cloud Storage directly. The server's service account must be able to sign URLs (iam.serviceAccounts.signBlob on itself)")
+	fl.Int64Var(&c.linksContentThreshold, "links-content-threshold", defaultLinksContentThreshold, "The size in bytes above which objects are returned as links when --links-content is set")
 }
 
 func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
@@ -78,20 +87,7 @@ func (c *gcpCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *gcpCmd) validate() error {
-	var missing []string
-	for _, f := range []struct{ name, value string }{
-		{"--project", c.project},
-		{"--instance", c.instance},
-		{"--bucket", c.bucket},
-	} {
-		if f.value == "" {
-			missing = append(missing, f.name)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
-	}
-	return nil
+	return requireFlags(map[string]string{"--project": c.project, "--instance": c.instance, "--bucket": c.bucket})
 }
 
 func (c *gcpCmd) run(ctx context.Context) error {
@@ -108,12 +104,71 @@ func (c *gcpCmd) run(ctx context.Context) error {
 		BucketName:            c.bucket,
 		MaxCachedHeaders:      c.maxCachedHeaders,
 		MaxCachedContents:     c.maxCachedContents,
+		NoLinkValidation:      c.noLinkValidation,
+		NoHashValidation:      c.noHashValidation,
+		ClientMetrics:         c.clientMetrics,
+		LinksContent:          c.linksContent,
 		LinksContentThreshold: c.linksContentThreshold,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create the ABFS GCP server: %w", err)
 	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("WARNING: error closing ABFS server: %v", err)
+		}
+	}()
 	return c.Serve(ctx, gcp.NewFilterServer(server, nil))
+}
+
+type gcpInitCmd struct {
+	*root.RootCmd
+	opts gcp.SetupOpts
+}
+
+func (c *gcpInitCmd) Spec() cmd.CmdSpec {
+	return cmd.CmdSpec{
+		Name:  "init",
+		Usage: "--project <project> --instance <instance> --bucket <bucket> [--db <db>] [--bt-instance <instance>]",
+		Desc: `Prepare the Spanner and Bigtable instances and the bucket of a GCP-backed ABFS server.
+Creates the Spanner database, its schema and the Bigtable tables when they are missing and
+checks that the bucket exists. The instances and the bucket must exist. Existing data is
+kept, so it is safe to run again, for example after an upgrade.`,
+	}
+}
+
+func (c *gcpInitCmd) RegisterFlags(fl *pflag.FlagSet) {
+	fl.StringVar(&c.opts.ProjectID, "project", "", "The GCP Project which contains the databases (required)")
+	fl.StringVar(&c.opts.InstanceID, "instance", "", "The GCP Spanner Database Instance (required)")
+	fl.StringVar(&c.opts.DatabaseID, "db", defaultDatabase, "The GCP Spanner Database Name")
+	fl.StringVar(&c.opts.BtInstance, "bt-instance", defaultBtInstance, "The GCP Bigtable Database Instance")
+	fl.StringVar(&c.opts.BucketName, "bucket", "", "The GCS Bucket Name (required)")
+}
+
+func (c *gcpInitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
+	args.EnsureNoArgs(fl)
+	if err := requireFlags(map[string]string{"--project": c.opts.ProjectID, "--instance": c.opts.InstanceID, "--bucket": c.opts.BucketName}); err != nil {
+		return err
+	}
+	if err := gcp.Setup(ctx, &c.opts); err != nil {
+		return fmt.Errorf("failed to set up the GCP server resources: %w", err)
+	}
+	fmt.Println("The GCP server resources are ready.")
+	return nil
+}
+
+func requireFlags(flags map[string]string) error {
+	var missing []string
+	for name, value := range flags {
+		if value == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // StandaloneGCPServerCmd provides a standalone command runner for the GCP server with flat flags.

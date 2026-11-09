@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/mux"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/mod/semver"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/google/abfs/shared/entities"
@@ -183,6 +184,8 @@ const (
 	// DefaultBtConnPool is the default Bigtable client gRPC connection pool size.
 	DefaultBtConnPool = 50
 	cleanupTimeout    = 10 * time.Second
+	// The caches are sharded by the first byte of the hash.
+	cacheShards = 256
 )
 
 // This is the gcpserver layer version
@@ -194,9 +197,13 @@ var _ remote.RemoteCloser = (*GCPServer)(nil)
 
 type GCPServer struct {
 	casdb                 *casdb.CASDB
+	addObject             func(ctx context.Context, hdr *ObjectHeader, content *ObjectContent) error
 	depot                 *depot.MasterDepot
+	storage               *storage.Client
 	storeLinks            bool
 	validateHash          bool
+	validateLinks         bool
+	linksContent          bool
 	linksContentThreshold int64
 
 	headers        []*lru.Cache[entities.Hash, CachedHeader]
@@ -220,24 +227,24 @@ type NewServerOpts struct {
 	BtAppProfile string
 	// BtConnPool sets the Bigtable gRPC connection pool size. A non-positive
 	// value uses DefaultBtConnPool.
-	BtConnPool            int
-	BucketName            string
-	MaxCachedHeaders      int
-	MaxCachedContents     int
+	BtConnPool        int
+	BucketName        string
+	MaxCachedHeaders  int
+	MaxCachedContents int
+	NoLinkValidation  bool
+	NoHashValidation  bool
+	// ClientMetrics exports the built-in metrics of the Spanner, Bigtable and
+	// Cloud Storage client libraries to Cloud Monitoring.
+	ClientMetrics bool
+	// LinksContent makes GetObject return signed Cloud Storage URLs instead of the
+	// content for objects larger than LinksContentThreshold bytes.
+	LinksContent          bool
 	LinksContentThreshold int64
 }
 
 func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	spannerDB := fmt.Sprintf("projects/%s/instances/%s/databases/%s", opts.ProjectID, opts.InstanceID, opts.DatabaseID)
 
-	btConnPool := opts.BtConnPool
-	if btConnPool <= 0 {
-		btConnPool = DefaultBtConnPool
-	}
-	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool)
-	if err != nil {
-		return nil, err
-	}
 	maxCachedHeaders := opts.MaxCachedHeaders
 	if maxCachedHeaders == 0 {
 		maxCachedHeaders = DefaultMaxCachedHeaders
@@ -246,37 +253,75 @@ func New(ctx context.Context, opts *NewServerOpts) (*GCPServer, error) {
 	if maxCachedContents == 0 {
 		maxCachedContents = DefaultMaxCachedContents
 	}
-	linksThreshold := opts.LinksContentThreshold
-	if linksThreshold == 0 {
-		linksThreshold = DefaultLinksContentThreshold
+	headers, err := newShardedCache[CachedHeader](maxCachedHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("invalid headers cache size: %w", err)
+	}
+	content, err := newShardedCache[*ObjectContent](maxCachedContents)
+	if err != nil {
+		return nil, fmt.Errorf("invalid contents cache size: %w", err)
+	}
+	if opts.LinksContentThreshold < 0 {
+		return nil, fmt.Errorf("invalid links content threshold %d", opts.LinksContentThreshold)
+	}
+
+	btConnPool := opts.BtConnPool
+	if btConnPool <= 0 {
+		btConnPool = DefaultBtConnPool
+	}
+	cas, err := casdb.New(ctx, spannerDB, opts.ProjectID, opts.BtInstance, opts.BtAppProfile, btConnPool, opts.ClientMetrics)
+	if err != nil {
+		return nil, err
 	}
 	s := &GCPServer{
-		headers:               make([]*lru.Cache[entities.Hash, CachedHeader], 256),
-		content:               make([]*lru.Cache[entities.Hash, *ObjectContent], 256),
+		headers:               headers,
+		content:               content,
 		projectsByName:        make(map[[2]string]int64),
 		projectsByID:          make(map[int64][2]string),
 		storeLinks:            false,
-		validateHash:          true,
-		linksContentThreshold: linksThreshold,
+		validateHash:          !opts.NoHashValidation,
+		validateLinks:         !opts.NoLinkValidation,
+		linksContent:          opts.LinksContent,
+		linksContentThreshold: opts.LinksContentThreshold,
 		casdb:                 cas,
+		addObject:             cas.AddObject,
 	}
-	for i := range s.headers {
-		s.headers[i], err = lru.New[entities.Hash, CachedHeader](maxCachedHeaders / 256)
-		if err != nil {
-			return nil, err
-		}
-	}
-	for i := range s.content {
-		s.content[i], err = lru.New[entities.Hash, *ObjectContent](maxCachedContents / 256)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := s.setMasterDepot(ctx, opts.BucketName); err != nil {
-		// Clean close on error
+	if err := s.setMasterDepot(ctx, opts.BucketName, opts.ClientMetrics); err != nil {
+		_ = cas.Close()
 		return nil, err
 	}
+	if err := s.checkResources(ctx, opts.BucketName); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("resources missing, run 'abfs server gcp init' to create them: %w", err)
+	}
+	// As file-based, so that trees and refs that link the empty file or
+	// directory pass link validation on a new database.
+	if err := s.PutObject(ctx, entities.EmptyFileHash, remote.NewZStdContentReader(entities.EmptyFileContent)); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to put empty file: %w", err)
+	}
+	if err := s.PutObject(ctx, entities.EmptyDirHash, remote.NewZStdContentReader(entities.EmptyDirContent)); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to put empty directory: %w", err)
+	}
 	return s, nil
+}
+
+// newShardedCache returns cacheShards LRU caches that hold size entries
+// together, at least one per shard.
+func newShardedCache[V any](size int) ([]*lru.Cache[entities.Hash, V], error) {
+	if size < 0 {
+		return nil, fmt.Errorf("negative size %d", size)
+	}
+	perShard := max(1, (size+cacheShards-1)/cacheShards)
+	caches := make([]*lru.Cache[entities.Hash, V], cacheShards)
+	for i := range caches {
+		var err error
+		if caches[i], err = lru.New[entities.Hash, V](perShard); err != nil {
+			return nil, err
+		}
+	}
+	return caches, nil
 }
 
 func (s *GCPServer) SetLinksContentThreshold(threshold int64) {
@@ -336,7 +381,7 @@ func (s *GCPServer) Headers(ctx context.Context, keys []remote.Hash) ([]entities
 }
 
 func (s *GCPServer) supportsLinksContent(ctx context.Context) bool {
-	if s.linksContentThreshold == 0 {
+	if !s.linksContent {
 		return false
 	}
 	var clientVersion string
@@ -459,22 +504,19 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 	if err != nil {
 		return err
 	}
+	addAttempted := false
 	defer func() {
-		if retErr != nil {
-			// Note: there is a tiny window where AddObject could commit on the
-			// server while returning a client-side context error, causing this
-			// cleanup to remove the committed chunk.
-			go func() {
-				start := time.Now()
-				cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-				defer cancel()
-				if err := s.depot.Remove(cleanupCtx, content); err != nil {
-					log.Printf("Failed to remove content of failed PutObject (%s): %v", key, err)
-				} else {
-					log.Printf("Removed content of failed PutObject (%s) in %s", key, time.Since(start))
-				}
-			}()
+		if retErr == nil {
+			return
 		}
+		if addAttempted {
+			// A failed AddObject call may still have written the object row, for
+			// example when the response was lost, and other replicas may have
+			// read it, so the content stays for a later orphan sweep.
+			log.Printf("Kept content of failed PutObject (%s): the object row may reference it", key)
+			return
+		}
+		go s.removeFailedContent(key, content)
 	}()
 
 	if err := validator.Close(); err != nil {
@@ -496,13 +538,27 @@ func (s *GCPServer) PutObject(ctx context.Context, key remote.Hash, reader remot
 		Content:  content,
 	}
 
-	err = s.casdb.AddObject(ctx, header, objContent)
+	addAttempted = true
+	err = s.addObject(ctx, header, objContent)
 	if err == nil {
 		s.headers[key[0]].PeekOrAdd(key, newCachedHeader(header))
 		s.content[key[0]].PeekOrAdd(key, objContent)
 	}
 
 	return err
+}
+
+// removeFailedContent removes the content stored by a PutObject that failed
+// before it tried to write the object row.
+func (s *GCPServer) removeFailedContent(key entities.Hash, content string) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	if err := s.depot.Remove(ctx, content); err != nil {
+		log.Printf("Failed to remove content of failed PutObject (%s): %v", key, err)
+	} else {
+		log.Printf("Removed content of failed PutObject (%s) in %s", key, time.Since(start))
+	}
 }
 
 // MapResults implements remote.RemoteProvider.
@@ -512,6 +568,10 @@ func (s *GCPServer) MapResults(ctx context.Context, from remote.Hash) ([]remote.
 
 // AddMapResult implements remote.RemoteProvider.
 func (s *GCPServer) AddMapResult(ctx context.Context, from remote.Hash, to remote.Hash) error {
+	if !s.validateLinks {
+		return s.casdb.AddMapResult(ctx, from, to)
+	}
+	// Unlike object links, a zero hash is not allowed here, as in file-based.
 	hdrs, err := s.getHeaders(ctx, []entities.Hash{from, to})
 	if err != nil {
 		return err
@@ -570,7 +630,10 @@ func (s *GCPServer) projectForRefs(ctx context.Context, server string, project s
 func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]remote.Hash, error) {
 	id, err := s.projectForRefs(ctx, server, project, false)
 	if errors.Is(err, casdb.ErrNotFound) {
-		return nil, entities.ErrNotExist
+		if err := s.checkServerExists(ctx, server); err != nil {
+			return nil, err
+		}
+		return make([]remote.Hash, len(refs)), nil
 	}
 	if err != nil {
 		return nil, err
@@ -578,20 +641,39 @@ func (s *GCPServer) GetRefs(ctx context.Context, server string, project string, 
 	return s.casdb.GetRefs(ctx, id, refs)
 }
 
+// checkServerExists returns a not-exist error when no project of server has
+// been created, as file-based does for a server it has no refs file for.
+func (s *GCPServer) checkServerExists(ctx context.Context, server string) error {
+	exists, err := s.casdb.HostExists(ctx, server)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return entities.NotExistErrf("server %q not found", server)
+	}
+	return nil
+}
+
 // SearchRefs implements remote.RemoteProvider.
 func (s *GCPServer) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
 	var projectID *int64
 	if project != "" {
 		id, err := s.projectForRefs(ctx, server, project, false)
+		if errors.Is(err, casdb.ErrNotFound) {
+			return nil, s.checkServerExists(ctx, server)
+		}
 		if err != nil {
 			return nil, err
 		}
 		projectID = &id
 	}
 
-	refIDs, err := s.casdb.SearchRefs(ctx, projectID, refPrefix, limit)
+	refIDs, err := s.casdb.SearchRefs(ctx, server, projectID, refPrefix, limit)
 	if err != nil {
 		return nil, err
+	}
+	if len(refIDs) == 0 {
+		return nil, s.checkServerExists(ctx, server)
 	}
 
 	s.projectIDsLock.RLock()
@@ -625,11 +707,10 @@ func (s *GCPServer) SearchRefs(ctx context.Context, server string, project strin
 	}
 
 	refs := make([]remote.ProjectRefHash, 0, len(refIDs))
+	s.projectIDsLock.RLock()
+	defer s.projectIDsLock.RUnlock()
 	for _, refID := range refIDs {
 		sp := s.projectsByID[refID.ProjectID]
-		if sp[0] != server {
-			continue
-		}
 		refs = append(refs, remote.ProjectRefHash{
 			Project: sp[1],
 			Ref:     refID.Ref,
@@ -706,16 +787,25 @@ func (s *GCPServer) WhoAmI(ctx context.Context) (string, error) {
 
 // Close implements remote.RemoteCloser.
 func (s *GCPServer) Close() error {
-	return s.casdb.Close()
+	err := s.casdb.Close()
+	if s.storage != nil {
+		err = errors.Join(err, s.storage.Close())
+	}
+	return err
 }
 
-func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string) error {
+func (s *GCPServer) setMasterDepot(ctx context.Context, bucketName string, clientMetrics bool) error {
 	btCli := s.casdb.BTClient()
 
-	bucketCli, err := storage.NewGRPCClient(ctx)
+	var storageOpts []option.ClientOption
+	if !clientMetrics {
+		storageOpts = append(storageOpts, storage.WithDisabledClientMetrics())
+	}
+	bucketCli, err := storage.NewGRPCClient(ctx, storageOpts...)
 	if err != nil {
 		return err
 	}
+	s.storage = bucketCli
 
 	writeDepots := []depot.Depot{
 		depot.NewInlineDepot("inline", 32*1024, true),
@@ -793,6 +883,9 @@ func (s *GCPServer) getHeaders(ctx context.Context, hashes []entities.Hash) ([]C
 }
 
 func (s *GCPServer) validateObjectLinks(ctx context.Context, links []entities.Hash) error {
+	if !s.validateLinks {
+		return nil
+	}
 	nonZeroLinks := links[:0]
 	for _, p := range links {
 		if !p.IsZero() {
