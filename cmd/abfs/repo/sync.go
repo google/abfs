@@ -21,13 +21,13 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 
 	"github.com/spf13/pflag"
 
 	"github.com/google/abfs/abfsrepo"
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/cmd/abfs/setup"
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/clierr"
 )
@@ -150,7 +150,9 @@ func (c *syncCmd) exec(ctx context.Context, projects []string) error {
 		return err
 	}
 
-	if err := repo.Sync(ctx, projects, c.SyncOpts); err != nil {
+	if err := setup.KeepNSJailWrapper(repo.Root(), func() error {
+		return repo.Sync(ctx, projects, c.SyncOpts)
+	}); err != nil {
 		return err
 	}
 
@@ -179,16 +181,8 @@ func (c *syncCmd) autoSetup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args := []string{"setup", "."}
-	if c.client.Root() != c.repo.Root() {
-		chroot, err := filepath.Rel(c.client.Root(), c.repo.Root())
-		if err != nil {
-			return err
-		}
-
-		args = append(args, "--chroot", chroot)
-	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	// Setup finds the Soong tops itself, in this checkout and below the mount root.
+	cmd := exec.CommandContext(ctx, bin, "setup", ".")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

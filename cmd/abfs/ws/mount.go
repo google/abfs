@@ -16,6 +16,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -116,12 +117,30 @@ func (c *mountCmd) runForeground(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := c.mount(ctx); err != nil {
+	mountCtx, stopMount := context.WithCancel(ctx)
+	defer stopMount()
+	if err := c.mount(mountCtx); err != nil {
 		return err
 	}
-	if out, err := exec.CommandContext(ctx, os.Args[0], "ws", "attach", "-s", "remote-wins", c.WSName, c.MountPoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to attach workspace: %w\n%s", err, out)
+	out, err := exec.CommandContext(ctx, os.Args[0], "ws", "attach", "-s", "remote-wins", "--from-mount", c.WSName, c.MountPoint).CombinedOutput()
+	if err != nil {
+		// Unmount before failing, so that no mount is left without the process that serves it.
+		stopMount()
+		mountErr := <-c.done
+		_, _ = os.Stderr.Write(out)
+		if isMountPoint(c.MountPoint) {
+			if mountErr == nil {
+				mountErr = errors.New("it is still mounted")
+			}
+			return fmt.Errorf("failed to attach workspace %s at %s: %w; failed to unmount it: %w", c.WSName, c.MountPoint, err, mountErr)
+		}
+		if mountErr != nil {
+			log.Printf("Mount of %s ended with: %v", c.MountPoint, mountErr)
+		}
+		return fmt.Errorf("failed to attach workspace %s at %s, unmounted it again: %w", c.WSName, c.MountPoint, err)
 	}
+	// Attaching runs abfs setup under sync.auto-setup.
+	_, _ = os.Stdout.Write(out)
 
 	client, err := binding.NewClient(c.MountPoint, entities.ABFSSocketFileName, c.Config.CacheDir, c.Config.LocalOnly, c.Config.FetchTimeout)
 	if err != nil {
@@ -154,6 +173,16 @@ func (c *mountCmd) runForeground(ctx context.Context) error {
 		}
 	}
 	return <-c.done
+}
+
+// isMountPoint reports whether dir is the root of a mount.
+func isMountPoint(dir string) bool {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	mountPoint, err := cmd.MountPoint(abs)
+	return err == nil && mountPoint == abs
 }
 
 func (c *mountCmd) mount(ctx context.Context) error {
