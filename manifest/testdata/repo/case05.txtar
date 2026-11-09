@@ -1,0 +1,46 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" />
+  <include name="inc1.xml" groups="inc2g,pdk" revision="inc-rev" />
+  <extend-project name="platform/example/p4" remote="aosp" upstream="up1" dest-branch="main"></extend-project>
+  <extend-project name="platform/example/p5" revision="v2" base-rev="inc-rev"></extend-project>
+  <remove-project path="ex/p2" optional="true" />
+  <extend-project name="platform/example/p0" path="ex/p3"></extend-project>
+  <extend-project name="platform/example/p5" revision="v1" groups="x, y" upstream="up1"></extend-project>
+  <remove-project name="platform/example/p2" path="ex/none" optional="true" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <include name="inc2.xml" groups="x y" revision="inc-rev" />
+  <project name="platform/example/p3" path="ex/p3" revision="rev-a" remote="partner" groups="pdk" />
+  <project name="platform/example/multi" path="ex/multi0" groups="notdefault" />
+  <project name="platform/example/multi" path="ex/multi1" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <include name="inc3.xml" />
+  <project name="platform/example/p0" path="ex/p0" />
+  <project name="platform/example/p2" path="ex/p2" revision="rev-b" remote="other" />
+  <project name="platform/example/p4" path="ex/p4" revision="rev-b" remote="other" groups="notdefault" />
+  <project name="platform/example/p5" path="ex/p5" groups="c d" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p1" path="ex/p1" revision="rev-b" remote="other" groups="notdefault" />
+</manifest>
+-- want --
+ex/multi0	platform/example/multi	inc-rev	aosp	inc2g,notdefault,pdk		
+ex/multi1	platform/example/multi	inc-rev	aosp	inc2g,pdk		
+ex/p0	platform/example/p0	inc-rev	aosp	inc2g,pdk,x,y		
+ex/p1	platform/example/p1	rev-b	other	inc2g,notdefault,pdk,x,y		
+ex/p3	platform/example/p3	rev-a	partner	inc2g,pdk		
+ex/p4	platform/example/p4	rev-b	aosp	inc2g,notdefault,pdk,x,y	up1	main
+ex/p5	platform/example/p5	v1	aosp	c,d,inc2g,pdk,x,y	up1	

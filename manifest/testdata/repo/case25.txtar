@@ -1,0 +1,40 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" />
+  <project name="platform/example/p0" path="ex/p0" remote="partner" />
+  <include name="inc1.xml" revision="inc-rev" />
+  <project name="platform/example/p3" path="ex/p5" revision="rev-a" groups="c d" />
+  <remove-project name="platform/example/p1" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <project name="platform/example/p1" path="ex/p1" groups="c d" />
+  <include name="inc2.xml" />
+  <project name="platform/example/p4" path="ex/p4" groups="c d" />
+  <project name="platform/example/p5" path="ex/p5" groups="pdk" />
+  <project name="platform/example/multi" path="ex/multi2" remote="partner" />
+  <remove-project path="ex/p5" optional="true" base-rev="v2" />
+  <extend-project name="platform/example/p4"></extend-project>
+  <extend-project name="platform/example/p5" path="ex/multi2" remote="nowhere"></extend-project>
+</manifest>
+-- inc2.xml --
+<manifest>
+  <project name="platform/example/p3" path="ex/p3" revision="rev-b" />
+  <project name="platform/example/multi" path="ex/multi0" />
+  <include name="inc3.xml" revision="inc-rev" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p2" path="ex/p2" remote="other" />
+  <project name="platform/example/multi" path="ex/multi1" groups="notdefault" />
+</manifest>
+-- want-error --
+not defined

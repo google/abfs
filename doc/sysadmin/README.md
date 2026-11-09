@@ -261,6 +261,10 @@ EOF
 
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
+If your manifest layers lists with `remove-project`, `extend-project` or include groups, or
+your builds mount another entry file than `default.xml`, see
+[Layered manifests](MANIFESTS.md) for the client and git-pusher setup.
+
 ### Push repo
 
 This is run on the client you set up above.
@@ -290,6 +294,9 @@ To enable faster source control operations, ABFS requires a slightly patched ver
     ```
 
 To update `repo` later, repeat these steps.
+
+[Layered manifests](MANIFESTS.md) lists the manifest elements ABFS applies and the
+known limits of `repo sync` and `repo-hooks` inside a mount.
 
 ## First Mount
 
