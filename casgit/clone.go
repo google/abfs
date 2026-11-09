@@ -23,10 +23,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/cas/fs/gitindex"
+	"github.com/google/abfs/filesystem/dirsync"
 	"github.com/google/abfs/maps"
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/entities"
@@ -59,6 +62,7 @@ type CloneOptions struct {
 	ObjectsDir       string
 	Quiet            bool
 	KeepOnFail       bool
+	Nested           bool
 	PrefetchIndices  bool
 	PrefetchSymlinks bool
 	DetachedHead     bool
@@ -94,10 +98,18 @@ func (g *CASGit) Clone(ctx context.Context, opts CloneOptions) error {
 }
 
 func (c *GitClone) clone(ctx context.Context) (returnErr error) {
-	if _, err := FindGitDir(c.Directory); err != nil && !entities.IsNotExist(err) {
-		return err
-	} else if err == nil {
-		return clierr.CLIErr("cannot clone inside an existing git repository")
+	// A nested clone sits inside the work tree of another repository, as a repo project whose
+	// path lies inside another project's path.
+	if c.Nested {
+		if slices.Contains(strings.Split(filepath.ToSlash(c.Directory), "/"), ".git") {
+			return clierr.CLIErr("cannot clone into %s: the path has a .git element", c.Directory)
+		}
+	} else {
+		if _, err := FindGitDir(c.Directory); err != nil && !entities.IsNotExist(err) {
+			return err
+		} else if err == nil {
+			return clierr.CLIErr("cannot clone inside an existing git repository")
+		}
 	}
 
 	absDir, err := filepath.Abs(c.Directory)
@@ -112,12 +124,16 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 		path.Dir(c.ObjectsDir),
 	}
 
+	createdDir := false
 	for _, d := range baseDirs {
 		// because there might be multiple .git in same level dir in repo setup
-		needEmpty := d == c.Directory
+		needEmpty := d == c.Directory && !c.Nested
 		if created, err := checkDirForClone(d, needEmpty); err != nil {
 			return err
 		} else if created {
+			if d == c.Directory {
+				createdDir = true
+			}
 			defer func() {
 				if returnErr != nil && !c.KeepOnFail {
 					if err := os.RemoveAll(d); err != nil {
@@ -130,6 +146,17 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 
 	if err := c.casgit.casfs.SetExcluded(c.Directory, true); err != nil {
 		return err
+	}
+	if c.Nested && !createdDir {
+		// The directory stays after a failed clone and can hold files of the work tree around
+		// it, so it goes back into that work tree's hash.
+		defer func() {
+			if returnErr != nil {
+				if err := c.casgit.casfs.SetExcluded(c.Directory, false); err != nil {
+					log.Printf("failed to include directory %s: %v", c.Directory, err)
+				}
+			}
+		}()
 	}
 	if err := c.casgit.casfs.CreateGitObjects(path.Dir(c.ObjectsDir), path.Base(c.ObjectsDir)); err != nil {
 		return err
@@ -179,7 +206,7 @@ func (c *GitClone) clone(ctx context.Context) (returnErr error) {
 
 	deepTree := mapObj.(*gitobjects.DeepTreeObject)
 
-	if err := c.casgit.casfs.SetDeepTree(c.Directory, mapObj.GetHash()); err != nil {
+	if err := c.setWorkTree(ctx, NewDeepTreeDir(c.casgit, deepTree), mapObj.GetHash()); err != nil {
 		return err
 	}
 
@@ -266,6 +293,155 @@ func (c *GitClone) setDefaultBranch(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// setWorkTree sets the deeptree of the work tree. A nested clone first clears what is in the way
+// of the tree, as casfs keeps an existing entry on a name clash. When the directory still holds
+// entries, it adds the missing entries of the tree instead: casfs sets the hash of every existing
+// directory a deeptree reaches to the tree's, so the entries kept there would drop out of the
+// work tree hashes and of the workspace snapshot.
+func (c *GitClone) setWorkTree(ctx context.Context, tree gitindex.TreeDirectory, deepTree entities.Hash) error {
+	if c.Nested {
+		if err := clearTreePaths(ctx, c.Directory, tree); err != nil {
+			return fmt.Errorf("failed to clear the work tree %s: %w", c.Directory, err)
+		}
+		entries, err := os.ReadDir(c.Directory)
+		if err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			missing, err := missingTreeEntries(ctx, c.casgit.store, c.Directory, "", entities.Hash(tree.Sha()))
+			if err != nil {
+				return fmt.Errorf("failed to list the missing entries of the work tree %s: %w", c.Directory, err)
+			}
+			return dirsync.DirSyncDiff(ctx, c.casgit.store, c.Directory, missing)
+		}
+	}
+	return c.casgit.casfs.SetDeepTree(c.Directory, deepTree)
+}
+
+// missingTreeEntries returns, as actions that add them, the entries of the tree that are missing
+// at rel in dir. It goes into the directories that are there and keeps every existing entry.
+func missingTreeEntries(ctx context.Context, store entities.CASStore, dir, rel string, treeHash entities.Hash) ([]dirsync.DiffAction, error) {
+	content, meta, err := store.GetTree(ctx, treeHash)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := entities.DecodeDir(content, meta)
+	if err != nil {
+		return nil, err
+	}
+	var missing []dirsync.DiffAction
+	for _, e := range entries {
+		p := path.Join(rel, e.Name)
+		stat, err := os.Lstat(filepath.Join(dir, p))
+		if entities.IsNotExist(err) {
+			missing = append(missing, dirsync.DiffAction{Path: p, HashB: e.Hash, ModeB: e.Mode, SizeB: e.Size})
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		if e.Mode.IsDir() && e.Hash != entities.EmptyDirHash && stat.IsDir() {
+			sub, err := missingTreeEntries(ctx, store, dir, p, e.Hash)
+			if err != nil {
+				return nil, err
+			}
+			missing = append(missing, sub...)
+		}
+	}
+	return missing, nil
+}
+
+// RepositoryInWorkTreeError is returned by a nested clone whose tree has a file where the work
+// tree has a directory that holds another repository, at the directory or below it.
+type RepositoryInWorkTreeError struct {
+	// Path is the directory where the tree has a file.
+	Path string
+	// Repository is the work tree of the repository at or below Path.
+	Repository string
+}
+
+var _ error = (*RepositoryInWorkTreeError)(nil)
+
+func (e *RepositoryInWorkTreeError) Error() string {
+	return fmt.Sprintf("cannot check out a file at %s: it would replace the repository at %s", e.Path, e.Repository)
+}
+
+// clearTreePaths removes the entries of dir that are in the way of tree and keeps the others, as
+// git read-tree --reset -u does when repo checks out a project into a directory that holds files
+// of the project around it. Directories that hold another repository are kept, as repo keeps them
+// when it removes a project.
+func clearTreePaths(ctx context.Context, dir string, tree gitindex.TreeDirectory) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return err
+	}
+	files, err := tree.Files(ctx)
+	if err != nil {
+		return err
+	}
+	subtrees, err := tree.Subtrees(ctx)
+	if err != nil {
+		return err
+	}
+	inTree := make(map[string]gitindex.TreeDirectory, len(files)+len(subtrees))
+	for _, f := range files {
+		inTree[f.Name] = nil
+	}
+	for _, s := range subtrees {
+		inTree[s.Name()] = s
+	}
+	for _, e := range entries {
+		sub, ok := inTree[e.Name()]
+		if !ok {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			if sub != nil {
+				if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+					continue
+				}
+				if err := clearTreePaths(ctx, p, sub); err != nil {
+					return err
+				}
+				continue
+			}
+			repo, err := findRepository(p)
+			if err != nil {
+				return err
+			}
+			if repo != "" {
+				return &RepositoryInWorkTreeError{Path: p, Repository: repo}
+			}
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// findRepository returns the first directory at or below dir that holds a .git, or "" if there
+// is none.
+func findRepository(dir string) (string, error) {
+	var repo string
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+			repo = p
+			return filepath.SkipAll
+		} else if !entities.IsNotExist(err) {
+			return err
+		}
+		return nil
+	})
+	return repo, err
 }
 
 // returns true if directory was created
