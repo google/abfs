@@ -26,13 +26,19 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/objects"
 	_ "github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
+	pb "github.com/google/abfs/shared/remote/grpc/proto"
 	"github.com/google/abfs/shared/remote/grpc/server"
+	"github.com/google/abfs/shared/remote/servers"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
@@ -271,6 +277,64 @@ func TestPutObjectMissingZeroHashLink(t *testing.T) {
 
 	err := c.PutObject(ctx, testObj.Hash, remote.NewReaderFromBytes(testObj.Encoded))
 	require.NoError(err, "expecting no validation error")
+}
+
+// missingLinksServer answers every PutObject with the same missing links.
+type missingLinksServer struct {
+	*inmemory.InMemoryServer
+	missing []entities.Hash
+}
+
+func (s *missingLinksServer) PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error {
+	_, _ = io.Copy(io.Discard, reader)
+	return &remote.ErrObjectLinkValidation{MissingLinks: s.missing}
+}
+
+// putObjectMissingLinks pushes an object through the gRPC server to a backend that reports the given
+// links as missing, and returns the client's error.
+func putObjectMissingLinks(t *testing.T, missing []entities.Hash, opts ...grpc.DialOption) error {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s, err := server.NewGRPCServer(&server.GRPCServerOpts{Server: &missingLinksServer{InMemoryServer: inmemory.New(), missing: missing}})
+	require.NoError(t, err)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	t.Cleanup(s.Stop)
+
+	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(lis.Addr().String(), opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	c := abfsgrpc.NewPBClient(pb.NewABFSClient(conn))
+
+	ctx := metadata.AppendToOutgoingContext(t.Context(), "client-version", servers.ClientMinVersion)
+	data := []byte("object with missing links")
+	return c.PutObject(ctx, objects.HashBlobBytes(data), remote.NewBlobReaderFromBytes(data))
+}
+
+func TestPutObjectMissingLinks(t *testing.T) {
+	missing := make([]entities.Hash, 1000)
+	for i := range missing {
+		missing[i] = objects.HashBlobBytes(fmt.Appendf(nil, "missing link %d", i))
+	}
+	tests := []struct {
+		name string
+		opts []grpc.DialOption
+	}{
+		// A proxy that limits response headers to 60 KB.
+		{name: "header_list_limit", opts: []grpc.DialOption{grpc.WithMaxHeaderListSize(60000)}},
+		// Fails if grpc-go lowers its default header list limit below the size of the answer.
+		{name: "default_dial"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := putObjectMissingLinks(t, missing, tt.opts...)
+			var e *remote.ErrObjectLinkValidation
+			require.ErrorAs(t, err, &e)
+			require.Equal(t, missing[:160], e.MissingLinks)
+		})
+	}
 }
 
 func TestAddMapResult_BrokenLinkRejected(t *testing.T) {
