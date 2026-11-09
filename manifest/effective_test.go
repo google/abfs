@@ -128,6 +128,23 @@ func TestEffective(t *testing.T) {
 			},
 		},
 		{
+			name: "optional in another case",
+			body: base + `
+ <remove-project name="platform/external/none" optional="True"></remove-project>
+ <remove-project name="platform/external/other" optional="YES"/>`,
+			want: []string{
+				"ws/a-uuid platform/external/uuid v1.3.0 aosp []",
+				"ws/b-uuid platform/external/uuid v1.3.0 aosp []",
+				"ws/cmp platform/external/cmp v0.5.9 aosp []",
+			},
+		},
+		{
+			name: "optional false fails",
+			body: base + `
+ <remove-project name="platform/external/none" optional="FALSE"/>`,
+			wantErr: `remove-project element specifies non-existent project: <remove-project name="platform/external/none" optional="FALSE"/>`,
+		},
+		{
 			name: "second name remove fails",
 			body: base + `
  <remove-project name="platform/external/cmp"></remove-project>

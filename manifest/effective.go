@@ -197,8 +197,9 @@ func projectPath(p *Project) string {
 	return strings.TrimRight(p.GetPath(), "/")
 }
 
+// xmlBool reads a boolean attribute as repo does, without regard to case.
 func xmlBool(s string) bool {
-	switch s {
+	switch strings.ToLower(s) {
 	case "true", "yes", "1":
 		return true
 	}
