@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,9 +45,10 @@ import (
 )
 
 const (
-	printStatusInterval     = 1 * time.Minute
-	minStatusReportCooldown = 20 * time.Minute
-	pushedRefsFile          = "pushed-refs"
+	printStatusInterval      = 1 * time.Minute
+	minStatusReportCooldown  = 20 * time.Minute
+	pushedRefsFile           = "pushed-refs"
+	pushedRefsCheckChunkSize = 1000
 )
 
 type PushState int
@@ -114,6 +117,12 @@ type pusher struct {
 	newCommits      map[entities.Hash]string
 	deepTreeMapLock sync.Mutex
 	deepTreeMap     map[entities.Hash]entities.Hash // from tree hash to its deeptree hash
+
+	// pushedRefsChecked is set once pushed-refs was checked against the server.
+	pushedRefsChecked bool
+	// correctedRefs holds the pushed-refs entries that checkPushedRefs took
+	// from the server, until a push saves their tree helper objects.
+	correctedRefs map[string]entities.Hash
 
 	// We don't persist this to disk, but the number of LFS backed
 	// objects should be a drop in the bucket compared to an entire android tree
@@ -240,6 +249,15 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 			return err
 		}
 	}
+	if !s.pushedRefsChecked {
+		if err := s.checkPushedRefs(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("Warning: failed to check pushed-refs of %s against the server: %v", s, err)
+			}
+		} else {
+			s.pushedRefsChecked = true
+		}
+	}
 
 	s.pushStart = time.Now()
 	defer func() {
@@ -307,6 +325,15 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	if err := s.writePushedRefs(); err != nil {
 		return fmt.Errorf("failed to write pushed-refs file: %w", err)
 	}
+
+	// The push that set a ref the check took from the server may have stopped
+	// before it saved the tree helper objects, so save them for that tip too.
+	for ref, h := range s.correctedRefs {
+		if s.newRefs[ref] == h && strings.HasPrefix(ref, "refs/heads/") {
+			s.newCommits[h] = ref
+		}
+	}
+	s.correctedRefs = nil
 
 	if err := s.saveTreeHelperObjects(ctx); err != nil {
 		return err
@@ -650,9 +677,9 @@ func (s *pusher) doRefreshRefObjects() error {
 	for hash := range newHashes {
 		includedHashes = append(includedHashes, hash)
 	}
-	excludedHashes := make([]entities.Hash, 0)
-	for hash := range oldHashes {
-		excludedHashes = append(excludedHashes, hash)
+	excludedHashes, err := s.presentHashes(slices.Collect(maps.Keys(oldHashes)))
+	if err != nil {
+		return err
 	}
 
 	rev, err := s.shgit.RevListObjects(s.dirPath, includedHashes, excludedHashes)
@@ -662,6 +689,90 @@ func (s *pusher) doRefreshRefObjects() error {
 	s.newBlobs = rev.Blobs
 	s.newObjects = rev.Objects
 	return nil
+}
+
+// checkPushedRefs makes the pushed-refs entries match what the server holds,
+// so the next push sends the refs the server misses and deletes the refs it
+// holds but upstream no longer has. An entry the server holds at another hash
+// takes the server's hash, and an entry the server does not hold is dropped.
+func (s *pusher) checkPushedRefs(ctx context.Context) error {
+	pushedRefs, err := readPushedRefs(s.pushedRefsFile)
+	if err != nil {
+		return err
+	}
+	if len(pushedRefs) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(pushedRefs))
+	for ref := range pushedRefs {
+		names = append(names, ref)
+	}
+	total := len(pushedRefs)
+	dropped := 0
+	corrected := make(map[string]entities.Hash)
+	// The client sends one RPC per GetRefs call, and a project with change refs
+	// can hold many thousands of refs.
+	for chunk := range slices.Chunk(names, pushedRefsCheckChunkSize) {
+		hashes, err := s.abfsClient.GetRefs(ctx, s.config.Server, s.config.Project, chunk)
+		if entities.IsNotExist(err) {
+			clear(pushedRefs)
+			dropped = total
+			clear(corrected)
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to get refs: %w", err)
+		}
+		if len(hashes) != len(chunk) {
+			return fmt.Errorf("expected %d refs from the server, got %d", len(chunk), len(hashes))
+		}
+		for i, ref := range chunk {
+			switch hashes[i] {
+			case pushedRefs[ref]:
+				// The server holds the recorded hash.
+			case entities.ZeroHash:
+				delete(pushedRefs, ref)
+				dropped++
+			default:
+				pushedRefs[ref] = hashes[i]
+				corrected[ref] = hashes[i]
+			}
+		}
+	}
+	if dropped == 0 && len(corrected) == 0 {
+		return nil
+	}
+
+	log.Printf("Corrected %d and dropped %d of %d pushed-refs entries of %s to match the server", len(corrected), dropped, total, s)
+	if err := writePushedRefs(s.pushedRefsFile, pushedRefs); err != nil {
+		return err
+	}
+	s.correctedRefs = corrected
+	return nil
+}
+
+// presentHashes returns the hashes that the local repository has. pushed-refs
+// can name objects the repository lacks, such as a hash taken from the server
+// or a commit removed by git gc, and rev-list fails on such an exclusion.
+func (s *pusher) presentHashes(hashes []entities.Hash) ([]entities.Hash, error) {
+	if len(hashes) == 0 {
+		return hashes, nil
+	}
+	types, err := s.shgit.ObjectTypes(s.dirPath, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up the pushed-refs objects: %w", err)
+	}
+	if len(types) != len(hashes) {
+		return nil, fmt.Errorf("expected %d object types, got %d", len(hashes), len(types))
+	}
+	present := make([]entities.Hash, 0, len(hashes))
+	for i, t := range types {
+		if !strings.HasSuffix(t, " missing") {
+			present = append(present, hashes[i])
+		}
+	}
+	return present, nil
 }
 
 func refsEqual(a, b map[string]entities.Hash) bool {

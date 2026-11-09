@@ -16,9 +16,12 @@ package gitpusher
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +48,11 @@ echo "$@" >> ` + filepath.Join(tempDir, "git_calls.log") + `
 
 if [[ "$1" == "show-ref" ]]; then
 	echo "1234567890abcdef1234567890abcdef12345678 refs/heads/main"
+	exit 0
+fi
+
+if [[ "$*" == *"cat-file"* ]]; then
+	while read -r line; do echo "commit"; done
 	exit 0
 fi
 
@@ -115,6 +123,11 @@ echo "$@" >> ` + filepath.Join(tempDir, "git_calls.log") + `
 
 if [[ "$1" == "show-ref" ]]; then
 	echo "1234567890abcdef1234567890abcdef12345678 refs/heads/main"
+	exit 0
+fi
+
+if [[ "$*" == *"cat-file"* ]]; then
+	while read -r line; do echo "commit"; done
 	exit 0
 fi
 
@@ -524,4 +537,319 @@ func TestPush_CancelledContext(t *testing.T) {
 	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
 	require.NoError(t, err)
 	require.Equal(t, entities.ZeroHash, refs[0])
+}
+
+func TestPush_PushedRefsMissingOnServer(t *testing.T) {
+	upstreamDir, head := newUpstreamRepo(t, []byte("content recorded but never sent"))
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := inmemory.New()
+
+	require.NoError(t, ensureGitRepo(dirPath))
+	require.NoError(t, writePushedRefs(filepath.Join(dirPath, pushedRefsFile), map[string]entities.Hash{"refs/heads/main": head}))
+
+	require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, head, refs[0])
+}
+
+type countingServer struct {
+	*inmemory.InMemoryServer
+	getRefsCalls int
+	maxNames     int
+}
+
+func (s *countingServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]entities.Hash, error) {
+	s.getRefsCalls++
+	s.maxNames = max(s.maxNames, len(refs))
+	return s.InMemoryServer.GetRefs(ctx, server, project, refs)
+}
+
+type refsServer struct {
+	remote.RemoteCloser
+	refs  map[string]entities.Hash
+	err   error
+	short bool
+}
+
+func (s *refsServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]entities.Hash, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	hashes := make([]entities.Hash, len(refs))
+	for i, ref := range refs {
+		hashes[i] = s.refs[ref]
+	}
+	if s.short {
+		hashes = hashes[:len(hashes)-1]
+	}
+	return hashes, nil
+}
+
+func TestCheckPushedRefs(t *testing.T) {
+	hashA := entities.NewHash("1111111111111111111111111111111111111111")
+	hashB := entities.NewHash("2222222222222222222222222222222222222222")
+	hashC := entities.NewHash("3333333333333333333333333333333333333333")
+	recorded := map[string]entities.Hash{
+		"refs/heads/a": hashA,
+		"refs/heads/b": hashB,
+		"refs/tags/c":  hashC,
+	}
+
+	tests := []struct {
+		name          string
+		server        map[string]entities.Hash
+		err           error
+		short         bool
+		wantErr       bool
+		want          map[string]entities.Hash
+		wantCorrected map[string]entities.Hash
+	}{
+		{
+			name:   "AllHeld",
+			server: recorded,
+			want:   recorded,
+		},
+		{
+			name:          "MissingDroppedAndDifferentCorrected",
+			server:        map[string]entities.Hash{"refs/heads/a": hashA, "refs/heads/b": hashC},
+			want:          map[string]entities.Hash{"refs/heads/a": hashA, "refs/heads/b": hashC},
+			wantCorrected: map[string]entities.Hash{"refs/heads/b": hashC},
+		},
+		{
+			name: "NotExistDropsAll",
+			err:  entities.ErrNotExist,
+			want: map[string]entities.Hash{},
+		},
+		{
+			name:    "OtherErrorKeepsFile",
+			err:     errors.New("connection refused"),
+			wantErr: true,
+			want:    recorded,
+		},
+		{
+			name:    "ShortReplyKeepsFile",
+			server:  recorded,
+			short:   true,
+			wantErr: true,
+			want:    recorded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dirPath := filepath.Join(t.TempDir(), "repo.git")
+			require.NoError(t, ensureGitRepo(dirPath))
+			fileName := filepath.Join(dirPath, pushedRefsFile)
+			require.NoError(t, writePushedRefs(fileName, recorded))
+
+			p := newTestPusher(dirPath, "", &refsServer{refs: tt.server, err: tt.err, short: tt.short})
+
+			err := p.checkPushedRefs(context.Background())
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			got, err := readPushedRefs(fileName)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+			if len(tt.wantCorrected) > 0 {
+				require.Equal(t, tt.wantCorrected, p.correctedRefs)
+			}
+		})
+	}
+}
+
+func TestCheckPushedRefs_Chunked(t *testing.T) {
+	dirPath := t.TempDir()
+	fileName := filepath.Join(dirPath, pushedRefsFile)
+	server := &countingServer{InMemoryServer: inmemory.New()}
+
+	hash := objects.HashBlobBytes([]byte("chunked"))
+	require.NoError(t, server.PutObject(context.Background(), hash, remote.ContentReaderFromBytes([]byte("blob 7\x00chunked"))))
+	recorded := make(map[string]entities.Hash)
+	refHashes := make([]entities.RefHash, 0)
+	for i := range 2*pushedRefsCheckChunkSize + 1 {
+		ref := fmt.Sprintf("refs/changes/%d", i)
+		recorded[ref] = hash
+		if i != 0 {
+			refHashes = append(refHashes, entities.RefHash{Ref: ref, Hash: hash})
+		}
+	}
+	require.NoError(t, server.PutRefs(context.Background(), "example.com", "repo", refHashes))
+	require.NoError(t, writePushedRefs(fileName, recorded))
+
+	require.NoError(t, newTestPusher(dirPath, "", server).checkPushedRefs(context.Background()))
+	require.Equal(t, 3, server.getRefsCalls)
+	require.Equal(t, pushedRefsCheckChunkSize, server.maxNames)
+	got, err := readPushedRefs(fileName)
+	require.NoError(t, err)
+	delete(recorded, "refs/changes/0")
+	require.Equal(t, recorded, got)
+}
+
+// failingRefsServer fails GetRefs calls for branches while fail is set.
+type failingRefsServer struct {
+	*inmemory.InMemoryServer
+	fail bool
+}
+
+func (s *failingRefsServer) GetRefs(ctx context.Context, server string, project string, refs []string) ([]entities.Hash, error) {
+	if s.fail && slices.ContainsFunc(refs, func(ref string) bool { return strings.HasPrefix(ref, "refs/heads/") }) {
+		return nil, errors.New("connection refused")
+	}
+	return s.InMemoryServer.GetRefs(ctx, server, project, refs)
+}
+
+func TestPush_PushedRefsCheckRetried(t *testing.T) {
+	upstreamDir, head := newUpstreamRepo(t, []byte("content checked on a later push"))
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := &failingRefsServer{InMemoryServer: inmemory.New(), fail: true}
+
+	require.NoError(t, ensureGitRepo(dirPath))
+	require.NoError(t, writePushedRefs(filepath.Join(dirPath, pushedRefsFile), map[string]entities.Hash{"refs/heads/main": head}))
+
+	p := newTestPusher(dirPath, upstreamDir, server)
+	require.NoError(t, p.Push(context.Background()))
+	require.False(t, p.pushedRefsChecked)
+
+	server.fail = false
+	require.NoError(t, p.Push(context.Background()))
+	require.True(t, p.pushedRefsChecked)
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, head, refs[0])
+}
+
+func TestPush_PushedRefsDifferOnServer(t *testing.T) {
+	// The ref is deleted upstream before the first fetch after the restart, so
+	// only the corrected pushed-refs entry can make the push delete it.
+	tests := []struct {
+		name           string
+		serverHasLocal bool
+	}{
+		{name: "ServerHashKnownLocally", serverHasLocal: true},
+		{name: "ServerHashUnknownLocally"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamDir, head := newUpstreamRepo(t, []byte("content of a deleted branch"))
+			gitCmd := exec.Command("git", "update-ref", "refs/heads/x", head.String())
+			gitCmd.Dir = upstreamDir
+			out, err := gitCmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			dirPath := filepath.Join(t.TempDir(), "repo.git")
+			server := inmemory.New()
+			require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+
+			if !tt.serverHasLocal {
+				content := []byte("not in the local repository")
+				hash := objects.HashBlobBytes(content)
+				require.NoError(t, server.PutObject(context.Background(), hash, remote.ContentReaderFromBytes(fmt.Appendf(nil, "blob %d\x00%s", len(content), content))))
+				require.NoError(t, server.PutRefs(context.Background(), "example.com", "repo", []entities.RefHash{{Ref: "refs/heads/x", Hash: hash}}))
+			}
+			// pushed-refs records a hash the server does not hold for x.
+			require.NoError(t, writePushedRefs(filepath.Join(dirPath, pushedRefsFile), map[string]entities.Hash{
+				"refs/heads/main": head,
+				"refs/heads/x":    entities.NewHash("2222222222222222222222222222222222222222"),
+			}))
+
+			gitCmd = exec.Command("git", "update-ref", "-d", "refs/heads/x")
+			gitCmd.Dir = upstreamDir
+			out, err = gitCmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+			refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main", "refs/heads/x"})
+			require.NoError(t, err)
+			require.Equal(t, []entities.Hash{head, entities.ZeroHash}, refs)
+		})
+	}
+}
+
+func TestPush_PushedRefsUnknownAfterRestart(t *testing.T) {
+	// A previous pusher took x from the server into pushed-refs and stopped
+	// before its next push. The local repository never had the hash, and
+	// upstream no longer has x.
+	upstreamDir, head := newUpstreamRepo(t, []byte("content of a restarted pusher"))
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := inmemory.New()
+	require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+
+	content := []byte("not in the local repository")
+	hash := objects.HashBlobBytes(content)
+	require.NoError(t, server.PutObject(context.Background(), hash, remote.ContentReaderFromBytes(fmt.Appendf(nil, "blob %d\x00%s", len(content), content))))
+	require.NoError(t, server.PutRefs(context.Background(), "example.com", "repo", []entities.RefHash{{Ref: "refs/heads/x", Hash: hash}}))
+	fileName := filepath.Join(dirPath, pushedRefsFile)
+	require.NoError(t, writePushedRefs(fileName, map[string]entities.Hash{
+		"refs/heads/main": head,
+		"refs/heads/x":    hash,
+	}))
+
+	require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main", "refs/heads/x"})
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{head, entities.ZeroHash}, refs)
+	got, err := readPushedRefs(fileName)
+	require.NoError(t, err)
+	require.Equal(t, map[string]entities.Hash{"refs/heads/main": head}, got)
+}
+
+// noMapsServer drops map results, as a push stopped before it saved its tree
+// helper objects leaves them missing.
+type noMapsServer struct {
+	*inmemory.InMemoryServer
+}
+
+func (s *noMapsServer) AddMapResult(ctx context.Context, from entities.Hash, to entities.Hash) error {
+	return nil
+}
+
+func TestPush_CorrectedRefHelperObjects(t *testing.T) {
+	upstreamDir, head := newUpstreamRepo(t, []byte("content of a corrected branch"))
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := inmemory.New()
+	require.NoError(t, newTestPusher(dirPath, upstreamDir, &noMapsServer{InMemoryServer: server}).Push(context.Background()))
+
+	gitCmd := exec.Command("git", "rev-parse", head.String()+"^{tree}")
+	gitCmd.Dir = upstreamDir
+	out, err := gitCmd.Output()
+	require.NoError(t, err)
+	request := &binding.DeepTreeRequest{
+		Version: binding.CurrentDeepTreeRequestVersion,
+		Tree:    entities.NewHash(strings.TrimSpace(string(out))),
+	}
+	require.NoError(t, request.Encode())
+	results, err := server.MapResults(context.Background(), request.Hash)
+	require.NoError(t, err)
+	require.Empty(t, results)
+
+	// pushed-refs records a hash the server does not hold for main.
+	require.NoError(t, writePushedRefs(filepath.Join(dirPath, pushedRefsFile), map[string]entities.Hash{
+		"refs/heads/main": entities.NewHash("2222222222222222222222222222222222222222"),
+	}))
+
+	p := newTestPusher(dirPath, upstreamDir, server)
+	require.NoError(t, p.Push(context.Background()))
+	results, err = server.MapResults(context.Background(), request.Hash)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Nil(t, p.correctedRefs)
+}
+
+func TestPresentHashes_ShortReply(t *testing.T) {
+	tempDir := t.TempDir()
+	fakeGitPath := filepath.Join(tempDir, "fake_git")
+	require.NoError(t, os.WriteFile(fakeGitPath, []byte("#!/bin/bash\ncat >/dev/null\necho commit\n"), 0755))
+
+	p := &pusher{
+		dirPath: tempDir,
+		shgit:   &shellgit.ShellGit{BinPath: fakeGitPath},
+	}
+	_, err := p.presentHashes([]entities.Hash{
+		entities.NewHash("1111111111111111111111111111111111111111"),
+		entities.NewHash("2222222222222222222222222222222222222222"),
+	})
+	require.Error(t, err)
 }
