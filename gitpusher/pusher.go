@@ -299,6 +299,10 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	// A stopped push must not record refs, so the next push sends them again.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.pushedRefs = s.newRefs
 	if err := s.writePushedRefs(); err != nil {
 		return fmt.Errorf("failed to write pushed-refs file: %w", err)

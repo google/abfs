@@ -17,9 +17,11 @@ package gitpusher
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -27,6 +29,9 @@ import (
 	"github.com/google/abfs/binding"
 	shellgit "github.com/google/abfs/git"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects"
+	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
 func TestRefreshRefObjects_RetryOnBadObject(t *testing.T) {
@@ -329,4 +334,194 @@ func TestPusherInit_WithNegativeRefspecs(t *testing.T) {
 	err = p.init()
 	require.NoError(t, err)
 	require.Equal(t, PushStateInitialized, p.state)
+}
+
+// blockingServer blocks the upload of one object until the context of the
+// call is done.
+type blockingServer struct {
+	*inmemory.InMemoryServer
+	block   entities.Hash
+	blocked chan struct{}
+}
+
+func (s *blockingServer) PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error {
+	if key == s.block {
+		close(s.blocked)
+		<-ctx.Done()
+		_ = reader.Close()
+		return ctx.Err()
+	}
+	return s.InMemoryServer.PutObject(ctx, key, reader)
+}
+
+// newUpstreamRepo creates a bare repository with one commit on main that
+// adds a file with the given content, and returns its path and the commit.
+func newUpstreamRepo(t *testing.T, content []byte) (string, entities.Hash) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "safe.bareRepository")
+	t.Setenv("GIT_CONFIG_VALUE_0", "all")
+
+	tempDir := t.TempDir()
+	upstreamDir := filepath.Join(tempDir, "upstream.git")
+	worktreeDir := filepath.Join(tempDir, "worktree")
+
+	runGit := func(dir string, args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "git %v failed: %s", args, string(out))
+		return strings.TrimSpace(string(out))
+	}
+
+	require.NoError(t, os.MkdirAll(upstreamDir, 0755))
+	runGit(upstreamDir, "init", "--bare")
+	require.NoError(t, os.MkdirAll(worktreeDir, 0755))
+	runGit(worktreeDir, "init", "-b", "main")
+	runGit(worktreeDir, "config", "user.name", "Test")
+	runGit(worktreeDir, "config", "user.email", "test@example.com")
+	require.NoError(t, os.WriteFile(filepath.Join(worktreeDir, "file.txt"), content, 0644))
+	runGit(worktreeDir, "add", "file.txt")
+	runGit(worktreeDir, "commit", "-m", "init")
+	runGit(worktreeDir, "push", upstreamDir, "HEAD:refs/heads/main")
+	return upstreamDir, entities.NewHash(runGit(worktreeDir, "rev-parse", "HEAD"))
+}
+
+func newTestPusher(dirPath, url string, client remote.RemoteCloser) *pusher {
+	return &pusher{
+		config: &ProjectConfig{
+			Server:  "example.com",
+			Project: "repo",
+			URL:     url,
+			FetchConfig: FetchConfig{
+				FetchRefSpecs:    []string{"+refs/heads/*:refs/heads/*"},
+				Workers:          2,
+				PackPushInterval: 24 * time.Hour,
+				PackingStrategy:  binding.PackingStrategyCommits,
+			},
+		},
+		remoteName:     defaultRemoteName,
+		abfsClient:     client,
+		store:          remote.NewRemoteStore(client),
+		dirPath:        dirPath,
+		pushedRefsFile: filepath.Join(dirPath, pushedRefsFile),
+		state:          PushStateCreated,
+		shgit:          &shellgit.ShellGit{BinPath: "git"},
+		deepTreeMap:    make(map[entities.Hash]entities.Hash),
+	}
+}
+
+func TestPush_CancelledDuringUpload(t *testing.T) {
+	content := []byte("content blocked during upload")
+	upstreamDir, head := newUpstreamRepo(t, content)
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+
+	server := inmemory.New()
+	blocking := &blockingServer{
+		InMemoryServer: server,
+		block:          objects.HashBlobBytes(content),
+		blocked:        make(chan struct{}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pushErr := make(chan error, 1)
+	go func() {
+		pushErr <- newTestPusher(dirPath, upstreamDir, blocking).Push(ctx)
+	}()
+	select {
+	case <-blocking.blocked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the upload was not attempted")
+	}
+	cancel()
+	require.ErrorIs(t, <-pushErr, context.Canceled)
+
+	pushedRefs, err := readPushedRefs(filepath.Join(dirPath, pushedRefsFile))
+	require.NoError(t, err)
+	require.Empty(t, pushedRefs)
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, entities.ZeroHash, refs[0])
+
+	require.NoError(t, newTestPusher(dirPath, upstreamDir, server).Push(context.Background()))
+	refs, err = server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, head, refs[0])
+}
+
+// blockingRefsServer blocks PutRefs calls for branches until the context of
+// the call is done. Like the server, it first rejects refs to objects it does
+// not hold.
+type blockingRefsServer struct {
+	*inmemory.InMemoryServer
+	blocked chan struct{}
+}
+
+func (s *blockingRefsServer) PutRefs(ctx context.Context, server string, project string, refs []entities.RefHash) error {
+	if len(refs) == 0 || !strings.HasPrefix(refs[0].Ref, "refs/heads/") {
+		return s.InMemoryServer.PutRefs(ctx, server, project, refs)
+	}
+	var misses []entities.Hash
+	for _, ref := range refs {
+		headers, err := s.Headers(ctx, []entities.Hash{ref.Hash})
+		if err != nil {
+			return err
+		}
+		if !ref.Hash.IsZero() && headers[0].IsEmpty() {
+			misses = append(misses, ref.Hash)
+		}
+	}
+	if len(misses) > 0 {
+		return &remote.ErrObjectLinkValidation{MissingLinks: misses}
+	}
+	close(s.blocked)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestPush_CancelledDuringPutRefs(t *testing.T) {
+	content := []byte("content uploaded before the refs")
+	upstreamDir, _ := newUpstreamRepo(t, content)
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := inmemory.New()
+	blocking := &blockingRefsServer{InMemoryServer: server, blocked: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pushErr := make(chan error, 1)
+	go func() {
+		pushErr <- newTestPusher(dirPath, upstreamDir, blocking).Push(ctx)
+	}()
+	select {
+	case <-blocking.blocked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the refs were not sent")
+	}
+	headers, err := server.Headers(context.Background(), []entities.Hash{objects.HashBlobBytes(content)})
+	require.NoError(t, err)
+	require.False(t, headers[0].IsEmpty(), "the blob was not uploaded before the refs")
+	cancel()
+	require.ErrorIs(t, <-pushErr, context.Canceled)
+
+	pushedRefs, err := readPushedRefs(filepath.Join(dirPath, pushedRefsFile))
+	require.NoError(t, err)
+	require.Empty(t, pushedRefs)
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, entities.ZeroHash, refs[0])
+}
+
+func TestPush_CancelledContext(t *testing.T) {
+	upstreamDir, _ := newUpstreamRepo(t, []byte("content of a cancelled push"))
+	dirPath := filepath.Join(t.TempDir(), "repo.git")
+	server := inmemory.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, newTestPusher(dirPath, upstreamDir, server).Push(ctx), context.Canceled)
+
+	pushedRefs, err := readPushedRefs(filepath.Join(dirPath, pushedRefsFile))
+	require.NoError(t, err)
+	require.Empty(t, pushedRefs)
+	refs, err := server.GetRefs(context.Background(), "example.com", "repo", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, entities.ZeroHash, refs[0])
 }
