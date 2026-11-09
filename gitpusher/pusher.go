@@ -552,7 +552,10 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 	}
 
 	if err := ds.Wait(48 * time.Hour); err != nil {
-		return fmt.Errorf("timed out waiting for uploads to complete: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("waiting for uploads to complete: %w", err)
 	}
 
 	s.state = PushStatePushObjects
@@ -568,7 +571,10 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 	ds.PutRefs(s.config.Server, s.config.Project, refHashes)
 
 	if err := ds.Wait(48 * time.Hour); err != nil {
-		return fmt.Errorf("timed out waiting for uploads to complete: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("waiting for uploads to complete: %w", err)
 	}
 	return nil
 }
