@@ -20,7 +20,7 @@ Below is the mean time of 3 Android checkouts and builds on a GCE `n2d-standard-
 | ABFS mount with empty local cache | 7.4s | **294.5x** |
 | ABFS mount with warm local cache | 3.6s | **605.3x** |
 
-The “Traditional” flow used `repo init --partial-clone` and `repo sync -j8` as documented in [the Android docs here](https://source.android.com/docs/setup/start#initialize_and_sync_the_code).
+The “Traditional” flow used `repo init --partial-clone` and `repo sync -j8` as documented in [the Android docs here](https://source.android.com/docs/setup/start#initialize_and_sync_the_code) (higher `-j` values hit Gerrit rate-limiting on `android.googlesource.com`).
 
 #### Build
 
@@ -42,6 +42,8 @@ The “ABFS build with empty local cache but full remote cache” is the common 
 At its core, ABFS has a **Content-Addressable Storage Filesystem (CASFS)** implemented as a kernel module at [github.com/google/abfs-casfs](https://github.com/google/abfs-casfs). This custom filesystem allows the directory structure and file info to be available while the file content is lazy-loaded and streamed on demand. This enables checkouts in seconds because clients only need to download project and directory info.
 
 In addition to the content-addressable storage filesystem, is a **content-addressable build**. Traditional Android builds use Soong to write ninja files, then use Ninja to execute those ninja files. Ninja is similar to Make in that it uses file modified timestamps to determine when to rebuild an output. **Ninja-go** ([github.com/google/ninja-go](https://github.com/google/ninja-go)) is our ninja compatible implementation that supports multiple backends. This repository contains a backend that is content-addressable. Ninja-go can use file content hashes to determine when to rebuild an output. It also works with the shared remote cache to use read and write build steps.
+
+See the [ABFS Architecture](doc/ARCHITECTURE.md) guide for a detailed walkthrough of the client and server components, CASFS tapping, and two-phase build caching.
 
 ### Who will struggle with ABFS?
 
@@ -222,6 +224,7 @@ abfs purge
 
 ## Documentation
 
+* [Architecture](doc/ARCHITECTURE.md)
 * [System Admin](doc/sysadmin/README.md)
 * [ABFS Expert / Build Hygienist](doc/abfs-expert/README.md)
 * [Android Developer](doc/android-dev/README.md)
