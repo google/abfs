@@ -206,7 +206,7 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	}
 
 	if !o.SkipHealthCheck {
-		if err := HealthCheck(conn, o.ServiceName); err != nil {
+		if err := connectHealthCheck(conn, o.ServiceName); err != nil {
 			if err := conn.Close(); err != nil {
 				log.Printf("Failed to close connection manager: %v", err)
 			}
@@ -217,21 +217,62 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-func HealthCheck(conn *grpc.ClientConn, service string) error {
-	cli := grpc_health_v1.NewHealthClient(conn)
+// connectHealthTimeout bounds the health check at connect, including its repeats.
+var connectHealthTimeout = 10 * time.Second
 
+// connectHealthPause is the pause between two health checks at connect.
+const connectHealthPause = time.Second
+
+// connectHealthCheck repeats the health check while the server reports NOT_SERVING, up to
+// connectHealthTimeout. A server can report it, for example while it drains on a stop signal or
+// while a backend check fails. Behind a load balancer the next check can reach another replica
+// before the balancer stops routing to that one, and a single server may serve again.
+func connectHealthCheck(conn *grpc.ClientConn, service string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), connectHealthTimeout)
+	defer cancel()
+	notServing := false
+	for {
+		status, err := checkHealth(ctx, conn, service)
+		if err != nil {
+			// A repeat that runs out of time reports the status the server gave before.
+			if notServing && ctx.Err() != nil {
+				return fmt.Errorf("not healthy, status was %s", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+			}
+			return err
+		}
+		if status == grpc_health_v1.HealthCheckResponse_SERVING {
+			return nil
+		}
+		deadline, _ := ctx.Deadline()
+		if status != grpc_health_v1.HealthCheckResponse_NOT_SERVING || time.Until(deadline) <= connectHealthPause {
+			return fmt.Errorf("not healthy, status was %s", status)
+		}
+		notServing = true
+		time.Sleep(connectHealthPause)
+	}
+}
+
+func HealthCheck(conn *grpc.ClientConn, service string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req := &grpc_health_v1.HealthCheckRequest{Service: service}
-	result, err := cli.Check(ctx, req)
-
+	status, err := checkHealth(ctx, conn, service)
 	if err != nil {
 		return err
 	}
-	if result.Status != grpc_health_v1.HealthCheckResponse_SERVING {
-		return fmt.Errorf("not healthy, status was %s", result.Status)
+	if status != grpc_health_v1.HealthCheckResponse_SERVING {
+		return fmt.Errorf("not healthy, status was %s", status)
 	}
 	return nil
+}
+
+func checkHealth(ctx context.Context, conn *grpc.ClientConn, service string) (grpc_health_v1.HealthCheckResponse_ServingStatus, error) {
+	cli := grpc_health_v1.NewHealthClient(conn)
+	req := &grpc_health_v1.HealthCheckRequest{Service: service}
+	result, err := cli.Check(ctx, req)
+	if err != nil {
+		return grpc_health_v1.HealthCheckResponse_UNKNOWN, err
+	}
+	return result.Status, nil
 }
 
 type BytesStatHandler interface {
