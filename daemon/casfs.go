@@ -270,23 +270,34 @@ func (c *casfs) handleChroot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err := c.mnt.Chroot(ctx, p)
-	if errors.Is(err, os.ErrExist) {
-		_, _ = fmt.Fprintf(w, "chroot already exists\n")
-		return
-	}
-	if err != nil {
+	exists := errors.Is(err, os.ErrExist)
+	if err != nil && !exists {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "error creating chroot %s\n", err)
 		return
 	}
 
-	go func() {
-		err := c.listenUnixSocket(path.Join(c.mountPoint, p, entities.ABFSSocketFileName))
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Print(boostMsg(fmt.Sprintf("ERROR: listenUnixSocket on chroot %q failed: %s", p, err)))
-		}
-	}()
+	// A remounted workspace or a removed socket file leaves a chroot without a listener.
+	socketPath := path.Join(c.mountPoint, p, entities.ABFSSocketFileName)
+	listen, err := NeedListener(socketPath)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "error checking the socket of chroot %s: %s\n", p, err)
+		return
+	}
+	if listen {
+		go func() {
+			err := c.listenUnixSocket(socketPath)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Print(boostMsg(fmt.Sprintf("ERROR: listenUnixSocket on chroot %q failed: %s", p, err)))
+			}
+		}()
+	}
 
+	if exists {
+		_, _ = fmt.Fprintf(w, "chroot already exists\n")
+		return
+	}
 	_, _ = fmt.Fprintf(w, "done\n")
 }
 

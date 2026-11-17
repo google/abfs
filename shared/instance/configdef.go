@@ -84,6 +84,8 @@ type Config struct {
 	SetupStrictTapping        bool    `yaml:"setup.strict-tapping,omitempty" json:",omitempty" desc:"Fail build if tapping encounters unsupported construct"`
 	SetupPrefetchInputs       bool    `yaml:"setup.prefetch-inputs,omitempty" json:",omitempty" desc:"Prefetch action inputs before execution"`
 	SetupSkipTapSoongBuild    bool    `yaml:"setup.skip-tap-soong-build,omitempty" json:",omitempty" desc:"Skip tapping Soong build actions"`
+
+	SetupTops []string `yaml:"setup.tops,omitempty" json:",omitempty" desc:"Soong tops to set up, relative to the mount point (default: found from the projects of the mount)"`
 }
 
 type ConfigOptional struct {
@@ -154,4 +156,6 @@ type ConfigOptional struct {
 	SetupStrictTapping        *bool    `yaml:"setup.strict-tapping,omitempty" json:",omitempty"`
 	SetupPrefetchInputs       *bool    `yaml:"setup.prefetch-inputs,omitempty" json:",omitempty"`
 	SetupSkipTapSoongBuild    *bool    `yaml:"setup.skip-tap-soong-build,omitempty" json:",omitempty"`
+
+	SetupTops *[]string `yaml:"setup.tops,omitempty" json:",omitempty"`
 }

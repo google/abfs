@@ -259,6 +259,10 @@ abfs edit --add --stdin config:clients/configs << 'EOF'
 EOF
 ```
 
+`sync.auto-setup` makes every mount, remount and `repo sync` run `abfs setup`, which installs
+the ABFS build hooks in each Android tree of the workspace. If your manifest puts Android in a
+subdirectory or holds more than one Android tree, read [Tree layouts](LAYOUTS.md).
+
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
 ### Push repo

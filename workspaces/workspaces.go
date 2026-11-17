@@ -49,7 +49,7 @@ func NewWorkspaces(store entities.CASStore, cacheman *client.Client) *Workspaces
 }
 
 func (s *Workspaces) StatusFromPath(path string) (binding.WorkspaceStatus, error) {
-	root, err := binding.FindRootForSocket(path, entities.ABFSSocketFileName)
+	root, err := binding.MountRootForSocket(path, entities.ABFSSocketFileName)
 	if err != nil {
 		return binding.WorkspaceStatus{}, err
 	}

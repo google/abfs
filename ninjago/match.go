@@ -102,6 +102,11 @@ func (c *ABFSBackend) ignoreMatch(ent *entities.PatchEntry) bool {
 		return true
 	}
 
+	// Below a Soong top, the repo workspace's git state is at ../.repo and the like.
+	if c.chroot != "" && filesystem.IsGitPath(path.Join(c.chroot, ent.Path)) {
+		return true
+	}
+
 	return false
 }
 
