@@ -48,6 +48,7 @@ const (
 
 type fileBasedServer struct {
 	localDir      string
+	localDirInfo  os.FileInfo
 	validateLinks bool
 	validateHash  bool
 	objectStore   *localcache.LocalStore
@@ -125,8 +126,14 @@ func New(dir string, opts ...servers.ServerOpt) (*fileBasedServer, error) {
 		return nil, err
 	}
 
+	localDirInfo, err := os.Stat(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &fileBasedServer{
 		localDir:      dir,
+		localDirInfo:  localDirInfo,
 		validateLinks: validateLinks,
 		validateHash:  validateHash,
 		objectStore:   objectStore,
