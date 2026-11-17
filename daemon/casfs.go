@@ -90,8 +90,10 @@ func NewCASFS(opt *CASFSMountOpts) *casfs {
 	}
 }
 
-func (c *casfs) startCleanupWatch(ctx context.Context) {
+func (c *casfs) startCleanupWatch(ctx context.Context) <-chan struct{} {
+	cleaned := make(chan struct{})
 	go func() {
+		defer close(cleaned)
 		<-ctx.Done()
 
 		log.Printf("Stopping...")
@@ -100,6 +102,7 @@ func (c *casfs) startCleanupWatch(ctx context.Context) {
 		}
 		log.Printf("...Stopping Done")
 	}()
+	return cleaned
 }
 
 func (c *casfs) SetInitConfig(cfg *entities.FSConfig) {
@@ -107,7 +110,7 @@ func (c *casfs) SetInitConfig(cfg *entities.FSConfig) {
 }
 
 func (c *casfs) Serve(ctx context.Context) error {
-	c.startCleanupWatch(ctx)
+	cleaned := c.startCleanupWatch(ctx)
 
 	c.workspaces = workspaces.NewWorkspaces(c.store, c.cacheman)
 
@@ -167,7 +170,10 @@ func (c *casfs) Serve(ctx context.Context) error {
 	}
 
 	fmt.Printf("Starting to serve read/write filesystem on %s\n", c.mountPoint)
-	return c.mnt.Serve()
+	err := c.mnt.Serve()
+	// Serve returns once the unmount has started; the unmount runs in the cleanups.
+	<-cleaned
+	return err
 }
 
 func (c *casfs) addCleanup(cleanup func()) {
@@ -270,23 +276,34 @@ func (c *casfs) handleChroot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err := c.mnt.Chroot(ctx, p)
-	if errors.Is(err, os.ErrExist) {
-		_, _ = fmt.Fprintf(w, "chroot already exists\n")
-		return
-	}
-	if err != nil {
+	exists := errors.Is(err, os.ErrExist)
+	if err != nil && !exists {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "error creating chroot %s\n", err)
 		return
 	}
 
-	go func() {
-		err := c.listenUnixSocket(path.Join(c.mountPoint, p, entities.ABFSSocketFileName))
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Print(boostMsg(fmt.Sprintf("ERROR: listenUnixSocket on chroot %q failed: %s", p, err)))
-		}
-	}()
+	// A remounted workspace or a removed socket file leaves a chroot without a listener.
+	socketPath := path.Join(c.mountPoint, p, entities.ABFSSocketFileName)
+	listen, err := NeedListener(socketPath)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "error checking the socket of chroot %s: %s\n", p, err)
+		return
+	}
+	if listen {
+		go func() {
+			err := c.listenUnixSocket(socketPath)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Print(boostMsg(fmt.Sprintf("ERROR: listenUnixSocket on chroot %q failed: %s", p, err)))
+			}
+		}()
+	}
 
+	if exists {
+		_, _ = fmt.Fprintf(w, "chroot already exists\n")
+		return
+	}
 	_, _ = fmt.Fprintf(w, "done\n")
 }
 

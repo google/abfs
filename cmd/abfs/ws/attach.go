@@ -16,7 +16,10 @@ package ws
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
+	"os/exec"
 
 	"github.com/spf13/pflag"
 
@@ -33,6 +36,7 @@ type attachCmd struct {
 	wsName      string
 	strategyStr string
 	newWS       bool
+	fromMount   bool
 }
 
 func newAttachCmd(c *wsCmd) *attachCmd {
@@ -52,6 +56,10 @@ func (c *attachCmd) Spec() cmd.CmdSpec {
 func (c *attachCmd) RegisterFlags(fl *pflag.FlagSet) {
 	args.OptChoice(fl, &c.strategyStr, "strategy", "s", string(binding.PutStrategyExactMatch), []string{"exact-match", "local-wins", "remote-wins"}, "Strategy to use for the workspace (exact-match, local-wins, remote-wins)")
 	fl.BoolVarP(&c.newWS, "new", "n", false, "Create a new workspace")
+	fl.BoolVar(&c.fromMount, "from-mount", false, "Set by the mount that runs attach and unmounts the workspace when attach fails")
+	if err := fl.MarkHidden("from-mount"); err != nil {
+		panic(err)
+	}
 }
 
 func (c *attachCmd) validateArgs(fl *pflag.FlagSet) error {
@@ -92,5 +100,45 @@ func (c *attachCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		}
 	}()
 
-	return abfs.PutWS(c.wsName, c.newWS, binding.PutStrategy(c.strategyStr))
+	strategy := binding.PutStrategy(c.strategyStr)
+	if err := abfs.PutWS(c.wsName, c.newWS, strategy); err != nil {
+		return err
+	}
+
+	// The snapshot does not keep the files setup writes for this client, so a restored
+	// workspace needs them again.
+	if c.Config.SyncAutoSetup && restoresSnapshot(c.newWS, strategy) {
+		return autoSetup(ctx, c.workDir, !c.fromMount, runSetup)
+	}
+	return nil
+}
+
+// autoSetup runs setup in dir and fails like a mount or repo sync whose auto-setup fails. When
+// the workspace stays attached, attaching again is refused, so the error says what to run.
+func autoSetup(ctx context.Context, dir string, staysAttached bool, setup func(context.Context, string) error) error {
+	err := setup(ctx, dir)
+	switch {
+	case err == nil:
+		return nil
+	case staysAttached:
+		return fmt.Errorf("auto-setup failed (the workspace is attached, run abfs setup %s): %w", dir, err)
+	default:
+		return fmt.Errorf("auto-setup failed: %w", err)
+	}
+}
+
+// restoresSnapshot reports whether attaching replaces the tree with the workspace snapshot.
+func restoresSnapshot(isNew bool, strategy binding.PutStrategy) bool {
+	return !isNew && strategy == binding.PutStrategyRemoteWin
+}
+
+func runSetup(ctx context.Context, dir string) error {
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, bin, "setup", dir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

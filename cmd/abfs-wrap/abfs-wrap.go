@@ -279,7 +279,7 @@ func (c *cmd) process() (int, error) {
 	cmd := exec.Command(c.command[0], c.command[1:]...)
 	cmd.Env = filteredEnv
 
-	buildStart, err := binding.ReadBuildStart(c.ninjaConfig.Chroot, entities.OutDir)
+	buildStart, err := readBuildStart()
 	if err != nil && !entities.IsNotExist(err) {
 		return 0, err
 	}
@@ -305,6 +305,13 @@ func (c *cmd) process() (int, error) {
 	_, _ = os.Stderr.WriteString(resp.Stderr)
 	_, _ = os.Stdout.WriteString(resp.Stdout)
 	return resp.ExitCode, nil
+}
+
+// readBuildStart reads the build start that abfsbox wrote. abfs-wrap runs in the Soong top, as
+// ninjago does, so out/ is relative to the working directory; Chroot is the top's place in
+// the mount and is not part of the path.
+func readBuildStart() (*binding.BuildStart, error) {
+	return binding.ReadBuildStart("", entities.OutDir)
 }
 
 func (c *cmd) setupCtrlDirIfMissing() error {
