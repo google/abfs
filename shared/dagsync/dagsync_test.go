@@ -32,6 +32,7 @@ import (
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
+	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
@@ -642,6 +643,93 @@ func TestStateCountsOnTypeResolution(t *testing.T) {
 	for stateName, counts := range stats.States {
 		for typeName, count := range counts {
 			assert.Equalf(t, int64(0), count, "Expected count of %q in %q state to be 0, but got %d", typeName, stateName, count)
+		}
+	}
+}
+
+type slowUpdater struct {
+	*inmemory.InMemoryServer
+	delay time.Duration
+}
+
+func (s *slowUpdater) sleep(ctx context.Context) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *slowUpdater) PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error {
+	if err := s.sleep(ctx); err != nil {
+		return err
+	}
+	return s.InMemoryServer.PutObject(ctx, key, reader)
+}
+
+func (s *slowUpdater) PutRefs(ctx context.Context, server string, project string, refs []entities.RefHash) error {
+	if err := s.sleep(ctx); err != nil {
+		return err
+	}
+	return s.InMemoryServer.PutRefs(ctx, server, project, refs)
+}
+
+func TestWaitAfterStop(t *testing.T) {
+	updater := inmemory.New()
+	accessor := newTestAccessor()
+	accessor.blobs[hash1] = content1
+	d := dagsync.New(&dagsync.DagSyncOpts{Updater: updater, Accessor: accessor, WorkersCount: 1})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d.Start(ctx)
+
+	d.PutBlob(hash1)
+	d.PutRefs("server", "project", []entities.RefHash{{Ref: "refs/heads/main", Hash: hash1}})
+	require.Error(t, d.Wait(time.Second))
+
+	refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/main"})
+	require.NoError(t, err)
+	require.Equal(t, entities.ZeroHash, refs[0])
+}
+
+func TestWaitStopRace(t *testing.T) {
+	for i := range 40 {
+		updater := &slowUpdater{InMemoryServer: inmemory.New(), delay: time.Millisecond}
+		accessor := newTestAccessor()
+		accessor.blobs[hash1] = content1
+		accessor.blobs[hash2] = content2
+		d := dagsync.New(&dagsync.DagSyncOpts{Updater: updater, Accessor: accessor, WorkersCount: 1})
+		d.FailCooldown = time.Microsecond
+
+		ctx, cancel := context.WithCancel(context.Background())
+		stopped := make(chan struct{})
+		go func() {
+			d.Start(ctx)
+			close(stopped)
+		}()
+
+		d.PutBlob(hash1)
+		d.PutBlob(hash2)
+		d.PutRefs("server", "project", []entities.RefHash{
+			{Ref: "refs/heads/a", Hash: hash1},
+			{Ref: "refs/heads/b", Hash: hash2},
+		})
+
+		waitErr := make(chan error, 1)
+		go func() {
+			waitErr <- d.Wait(10 * time.Second)
+		}()
+
+		time.Sleep(time.Duration(i) * 200 * time.Microsecond)
+		cancel()
+		<-stopped
+
+		if err := <-waitErr; err == nil {
+			refs, err := updater.GetRefs(t.Context(), "server", "project", []string{"refs/heads/a", "refs/heads/b"})
+			require.NoError(t, err)
+			require.Equal(t, []entities.Hash{hash1, hash2}, refs, "iteration %d: Wait returned nil but the refs are not stored", i)
 		}
 	}
 }

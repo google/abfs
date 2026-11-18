@@ -597,8 +597,10 @@ func (d *DAGSync) run(ctx context.Context) {
 				time.Sleep(d.MailboxDelay)
 			}
 			debugLog(d.logger, "Received message %T %+v", m, m)
-			d.mailboxLen.Add(-1)
 			d.handle(m)
+			// Decrement only after handle, so that idle cannot see an empty mailbox
+			// while the message's work is not yet in the graph.
+			d.mailboxLen.Add(-1)
 			for d.runNext(ctx) {
 			}
 		}
@@ -952,12 +954,18 @@ func (d *DAGSync) countNodesInState(s NodeState) int64 {
 
 // Wait() returns when dagsync is idle or the timeoutDuration is reached.
 // It returns error if there are any broken entries after the dagsync is idle.
+// It also returns an error once the dagsync is stopped, because a stopped
+// dagsync drops the requests it has not executed yet.
 func (d *DAGSync) Wait(timeoutDuration time.Duration) error {
 	if err := d.waitForIdle(timeoutDuration); err != nil {
 		return err
 	}
 
 	d.lock.Lock()
+	if d.stopped.Load() {
+		d.lock.Unlock()
+		return errors.New("dagsync is stopped")
+	}
 	fails := d.countNodesInState(FailedState)
 	blockeds := d.countNodesInState(BlockedState)
 	d.lock.Unlock()
