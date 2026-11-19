@@ -152,6 +152,9 @@ func (s *PBServer) GetRefs(ctx context.Context, req *pb.GetRefsRequest) (*pb.Get
 // SearchRefs implements ABFSServer.
 func (s *PBServer) SearchRefs(ctx context.Context, req *pb.SearchRefsRequest) (*pb.SearchRefsReply, error) {
 	result, err := s.server.SearchRefs(ctx, req.Server, req.Project, req.RefPrefix, int(req.Limit))
+	if entities.IsNotExist(err) {
+		return nil, status.Errorf(codes.NotFound, "the server %q not found", req.Server)
+	}
 	if err != nil {
 		// Currently, these errors don't need wrapped in a gRPC status because we just log and don't return an error
 		// if there is permission denied.

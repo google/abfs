@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/casgit"
@@ -64,6 +65,7 @@ type Repo struct {
 	groupsExclude  map[string]struct{}
 	projectsByName map[string]*manifest.Project
 	projectsByPath map[string]*manifest.Project
+	resolved       map[string]resolve.Result
 
 	manifestURL     string
 	manifestRemote  string

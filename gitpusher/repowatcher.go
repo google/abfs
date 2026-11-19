@@ -185,26 +185,7 @@ func (m *RepoWatcher) ListProjects(ctx context.Context) (projects []*ProjectConf
 
 	result := make([]*ProjectConfig, 0, len(allProjects)+1)
 	addProject := func(project projectRemoteSchemeURL) error {
-		fetchConfig := m.config.ProjectDefaults
-
-		excluded := false
-
-		for _, override := range m.config.Overrides {
-			matches := false
-			if override.Regex {
-				if override.RegexPattern.MatchString(project.name) {
-					matches = true
-				}
-			} else if override.Name == project.name {
-				matches = true
-			}
-			if matches {
-				if override.Exclude {
-					excluded = true
-				}
-				fetchConfig.Override(&override.FetchConfig)
-			}
-		}
+		fetchConfig, excluded := m.config.ProjectFetchConfig(project.name)
 		if excluded {
 			return nil
 		}
@@ -408,7 +389,7 @@ func (p *projectMappings) updateProjectRemoteURLSet(set map[projectRemoteSchemeU
 
 		pru := projectRemoteSchemeURL{
 			name:   projectRemote.name,
-			server: u.Host,
+			server: instance.Host(resolvedSchemeURL),
 			remote: remote,
 			scheme: u.Scheme,
 			url:    instance.MaybeRemoveScheme(resolvedSchemeURL),

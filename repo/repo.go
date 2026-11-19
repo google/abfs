@@ -31,6 +31,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/entities"
@@ -41,8 +42,6 @@ import (
 const ABFSDirHashTag = "abfs.dir.hash.tag"
 
 type projectRefURLMap map[string]entities.Hash
-type projectRefMap map[string]projectRefURLMap
-type projectMap map[string]projectRefMap
 
 type remoteData struct {
 	fetchSchemeURL string
@@ -68,6 +67,7 @@ type Repo struct {
 	remoteCache           map[string]remoteData
 	defaultSchemeURL      string
 	ignoreMissingProjects bool
+	groups                []string
 
 	manifestSet bool
 	rootHash    entities.Hash
@@ -117,6 +117,11 @@ func (r *Repo) AddURLRemoteCache(remote, schemeURL string) error {
 	maybeExisting.fetchSchemeURL = schemeURL
 	r.remoteCache[remote] = maybeExisting
 	return nil
+}
+
+// SetGroups sets the mount groups; a project outside them does not have to resolve.
+func (r *Repo) SetGroups(groups []string) {
+	r.groups = groups
 }
 
 func (r *Repo) Manifest() *manifest.Manifest {
@@ -216,16 +221,38 @@ func (r *Repo) ManifestFromBranch(ctx context.Context, branch, manifestProjectNa
 	h := refHash[0].Hash
 	log.Printf("Using the manifest from commit %s for %s", h, branch)
 
-	commit, err := r.git.GetCommit(ctx, h)
+	manifestHash, err := r.manifestFileAt(ctx, h, manifestBranchFile)
 	if err != nil {
-		return fmt.Errorf("cannot load manifest commit %s: %w", h, err)
-	}
-	r.rootHash = entities.Hash(commit.TreeHash)
-	manifestHash, err := bindcas.ResolveToHash(r.store, r.rootHash, manifestBranchFile)
-	if err != nil {
-		return fmt.Errorf("cannot get file %q from %s: %s", manifestBranchFile, h, err)
+		return err
 	}
 	return r.manifestFromBlobHash(ctx, manifestHash)
+}
+
+// PinManifestAt pins a manifest file of a manifest project commit as a mount does,
+// returning the selected projects that do not resolve instead of failing.
+func (r *Repo) PinManifestAt(ctx context.Context, commit entities.Hash, manifestFile string) (*manifest.Manifest, []resolve.Request, error) {
+	manifestHash, err := r.manifestFileAt(ctx, commit, manifestFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	man, err := r.readManifest(ctx, manifestHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.pin(ctx, man)
+}
+
+func (r *Repo) manifestFileAt(ctx context.Context, commitHash entities.Hash, manifestFile string) (entities.Hash, error) {
+	commit, err := r.git.GetCommit(ctx, commitHash)
+	if err != nil {
+		return entities.Hash{}, fmt.Errorf("cannot load manifest commit %s: %w", commitHash, err)
+	}
+	r.rootHash = entities.Hash(commit.TreeHash)
+	manifestHash, err := bindcas.ResolveToHash(r.store, r.rootHash, manifestFile)
+	if err != nil {
+		return entities.Hash{}, fmt.Errorf("cannot get file %q from %s: %w", manifestFile, commitHash, err)
+	}
+	return manifestHash, nil
 }
 
 func (r *Repo) manifestProjectFileBytes(ctx context.Context, name string) ([]byte, error) {
@@ -242,17 +269,21 @@ func localManifestFileBytes(path string) ([]byte, error) {
 }
 
 func (r *Repo) manifestFromBlobHash(ctx context.Context, manifestHash entities.Hash) error {
-	manBytes, err := store.ReadAllBlob(ctx, r.store, manifestHash)
-	if err != nil {
-		return fmt.Errorf("cannot read default.xml (blob=%s): %s", manifestHash, err)
-	}
-
-	manifest, err := manifest.Parse(manBytes)
+	manifest, err := r.readManifest(ctx, manifestHash)
 	if err != nil {
 		return err
 	}
 
 	return r.setManifest(ctx, manifest)
+}
+
+func (r *Repo) readManifest(ctx context.Context, manifestHash entities.Hash) (*manifest.Manifest, error) {
+	manBytes, err := store.ReadAllBlob(ctx, r.store, manifestHash)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read default.xml (blob=%s): %w", manifestHash, err)
+	}
+
+	return manifest.Parse(manBytes)
 }
 
 func (r *Repo) ManifestFromBlobHash(ctx context.Context, manifestHash string) error {
@@ -277,18 +308,16 @@ func (r *Repo) updateRemoteCache(man *manifest.Manifest) error {
 
 	remoteCache := make(map[string]remoteData)
 	for _, remote := range man.Remote {
-		fetchSchemeURL, err := url.Parse(remote.Fetch)
+		resolvedSchemeURL, err := resolve.FetchURL(remote.Fetch, baseSchemeURL.String())
 		if err != nil {
 			return err
 		}
-		// This matches the Python urljoin behavior that the repo tool uses.
-		resolvedSchemeURL := baseSchemeURL.ResolveReference(fetchSchemeURL)
 		if curr, found := remoteCache[remote.Name]; found {
-			if curr.fetchSchemeURL != resolvedSchemeURL.String() {
+			if curr.fetchSchemeURL != resolvedSchemeURL {
 				return fmt.Errorf("duplicate remote found with different fetch url. Original: %q, Duplicate: %q", curr.fetchSchemeURL, resolvedSchemeURL)
 			}
 		} else {
-			remoteCache[remote.Name] = remoteData{fetchSchemeURL: resolvedSchemeURL.String(), revision: remote.Revision}
+			remoteCache[remote.Name] = remoteData{fetchSchemeURL: resolvedSchemeURL, revision: remote.Revision}
 		}
 	}
 
@@ -297,9 +326,26 @@ func (r *Repo) updateRemoteCache(man *manifest.Manifest) error {
 }
 
 func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
-	pinned, err := manifest.CloneManifest(man)
+	pinned, missing, err := r.pin(ctx, man)
 	if err != nil {
 		return err
+	}
+	if len(missing) > 0 {
+		return &resolve.UnresolvedError{Requests: missing}
+	}
+
+	r.manifest = man
+	r.pinned = pinned
+	r.manifestSet = true
+	return nil
+}
+
+// pin returns a copy of the manifest with every resolved project pinned to its commit,
+// and the selected projects that do not resolve.
+func (r *Repo) pin(ctx context.Context, man *manifest.Manifest) (*manifest.Manifest, []resolve.Request, error) {
+	pinned, err := manifest.CloneManifest(man)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	manifestBytes := func(ctx context.Context, name string) ([]byte, error) {
@@ -311,24 +357,24 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 
 	if len(pinned.Include) > 0 {
 		if r.rootHash == entities.ZeroHash {
-			return errors.New("cannot include a file from an unknown manifest project revision. Please mount with `-b` or provide a flat manifest file")
+			return nil, nil, errors.New("cannot include a file from an unknown manifest project revision. Please mount with `-b` or provide a flat manifest file")
 		}
 		if err := pinned.FlattenIncludes(ctx, manifestBytes); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
 	if r.localManifestDir != "" {
 		entries, err := os.ReadDir(r.localManifestDir)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 
 		for _, ent := range entries {
 			if strings.HasSuffix(ent.Name(), ".xml") {
 				path := filepath.Join(r.localManifestDir, ent.Name())
 				if err := pinned.IncludeManifestFile(ctx, path, localManifestBytes); err != nil {
-					return err
+					return nil, nil, err
 				}
 			}
 		}
@@ -337,7 +383,7 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 	// Create fast lookup of remote properties.
 	err = r.updateRemoteCache(pinned)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// Resolve the project values that can be inherited.
@@ -352,68 +398,34 @@ func (r *Repo) setManifest(ctx context.Context, man *manifest.Manifest) error {
 		r.defaultSchemeURL = r.remoteCache[pinned.Default.Remote].fetchSchemeURL
 	}
 
-	// Get the set of unique (revision, url) that needs resolving.
-	// [revision][url]
-	toResolve := make(map[string]map[string]struct{})
-	for _, p := range pinned.Project {
-		if entities.IsHash(p.Revision) {
-			continue
-		}
+	reqs := make([]resolve.Request, len(pinned.Project))
+	for i, p := range pinned.Project {
 		if p.Revision == "" {
-			return fmt.Errorf("revision for %s is not specified", p.Name)
+			return nil, nil, fmt.Errorf("revision for %s is not specified", p.Name)
 		}
 		remSchemeURL := r.remoteCache[p.Remote].fetchSchemeURL
 		if remSchemeURL == "" {
 			remSchemeURL = r.defaultSchemeURL
 		}
-		m, exists := toResolve[p.Revision]
-		if !exists {
-			m = make(map[string]struct{})
-			toResolve[p.Revision] = m
-		}
-		m[remSchemeURL] = struct{}{}
+		reqs[i] = resolve.Request{Project: p.Name, FetchURL: remSchemeURL, Revision: p.Revision}
 	}
 
-	// Issue requests to resolve.
-	refs := make(projectMap)
-	for rev := range toResolve {
-		for url := range toResolve[rev] {
-			for _, ref := range resolutionOrder(rev) {
-				if err := r.updateRefs(url, ref, refs); err != nil {
-					return err
-				}
-			}
-		}
+	results, err := resolve.Revisions(r.store, reqs)
+	var unresolved *resolve.UnresolvedError
+	if err != nil && !errors.As(err, &unresolved) {
+		return nil, nil, err
 	}
 
-	// Assign the resolved revision hash to the projects.
-	for _, p := range pinned.Project {
-		if entities.IsHash(p.Revision) {
-			continue
-		}
-		found := false
-		remURL := r.remoteCache[p.Remote].fetchSchemeURL
-		if remURL == "" {
-			remURL = r.defaultSchemeURL
-		}
-
-		for _, ref := range resolutionOrder(p.Revision) {
-			if h, ok := refs[p.Name][ref][remURL]; ok {
-				p.Revision = h.String()
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Scheme will show up here in the error, but this is at the manifest parsing layer, and scheme is needed here to create or edit manifests.
-			return fmt.Errorf("cannot resolve %q for project %q at URL %q", p.Revision, p.Name, remURL)
+	// A project outside the mount groups is pinned when it resolves and never fails the mount.
+	var missing []resolve.Request
+	for i, p := range pinned.Project {
+		if !results[i].Hash.IsZero() {
+			p.Revision = results[i].Hash.String()
+		} else if resolve.MatchGroups(p.Groups, r.groups) {
+			missing = append(missing, reqs[i])
 		}
 	}
-
-	r.manifest = man
-	r.pinned = pinned
-	r.manifestSet = true
-	return nil
+	return pinned, missing, nil
 }
 
 func (r *Repo) applyInheritedProjectValues(def *manifest.Default, project *manifest.Project) {
@@ -451,34 +463,6 @@ func (r *Repo) applyInheritedProjectValues(def *manifest.Default, project *manif
 	if project.SyncS == "" {
 		project.SyncS = def.SyncS
 	}
-}
-
-func resolutionOrder(rev string) []string {
-	if strings.HasPrefix(rev, "refs/") {
-		return []string{rev}
-	}
-	return []string{rev, "refs/tags/" + rev, "refs/heads/" + rev}
-}
-
-func (r *Repo) updateRefs(url, ref string, refs projectMap) error {
-	results, err := r.store.SearchRefs(url, "", ref, 0)
-	if err != nil {
-		return fmt.Errorf("failed to SearchRefs for url: %q and ref: %q err: %w", url, ref, err)
-	}
-	for _, r := range results {
-		m, exists := refs[r.Project]
-		if !exists {
-			m = make(projectRefMap)
-			refs[r.Project] = m
-		}
-		m2, exists := m[r.Ref]
-		if !exists {
-			m2 = make(projectRefURLMap)
-			m[r.Ref] = m2
-		}
-		m2[url] = r.Hash
-	}
-	return nil
 }
 
 func (r *Repo) AddChanges(changeIDs []string) error {
