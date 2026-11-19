@@ -82,6 +82,27 @@ func (t *TestAccessor) OpenBlob(ctx context.Context, key entities.Hash) (dagsync
 	return &blobReadSizeCloser{rc: io.NopCloser(bytes.NewBuffer(buf)), size: int64(len(buf))}, nil
 }
 
+func (t *TestAccessor) ObjectSize(ctx context.Context, key entities.Hash) (int64, error) {
+	t.Lock()
+	defer t.Unlock()
+
+	buf, exists := t.objects[key]
+	if !exists {
+		return 0, entities.ErrNotExist
+	}
+	return int64(len(buf)), nil
+}
+func (t *TestAccessor) BlobSize(ctx context.Context, key entities.Hash) (int64, error) {
+	t.Lock()
+	defer t.Unlock()
+
+	buf, exists := t.blobs[key]
+	if !exists {
+		return 0, entities.ErrNotExist
+	}
+	return int64(len(buf)), nil
+}
+
 type blobReadSizeCloser struct {
 	rc   io.ReadCloser
 	size int64
@@ -99,3 +120,4 @@ func (b blobReadSizeCloser) Size() (int64, error) {
 }
 
 var _ dagsync.ObjectAccessor = (*TestAccessor)(nil)
+var _ dagsync.SizeProvider = (*TestAccessor)(nil)

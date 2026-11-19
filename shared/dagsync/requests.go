@@ -168,7 +168,7 @@ type PutRefsRequest struct {
 }
 
 func (r *PutRefsRequest) Key() entities.Hash {
-	// TODO: Key() is ok being empty for some use cases in dagsync, but not for others (needed for marking skipped nodes)
+	// No key: dagsync marks skipped dependents by node.
 	return entities.Hash{}
 }
 func (r *PutRefsRequest) Links(accessor ObjectAccessor) ([]entities.Hash, error) {
@@ -211,7 +211,7 @@ type PhonyRequest struct {
 }
 
 func (r *PhonyRequest) Key() entities.Hash {
-	// TODO: Key() is ok being empty for some use cases in dagsync, but not for others (needed for marking skipped nodes)
+	// No key: dagsync marks skipped dependents by node.
 	return entities.Hash{}
 }
 func (r *PhonyRequest) Links(_ ObjectAccessor) ([]entities.Hash, error) {
