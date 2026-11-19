@@ -83,8 +83,6 @@ func (c *BuildFinishedCmd) run() error {
 	buildGoal := "unknown"
 	if len(info.NinjaRunInfo) > 0 && len(info.NinjaRunInfo[len(info.NinjaRunInfo)-1].GoalTargets) > 0 {
 		buildGoal = strings.Join(info.NinjaRunInfo[len(info.NinjaRunInfo)-1].GoalTargets, " ")
-	} else if len(info.BuildCommand) > 0 {
-		buildGoal = strings.Join(info.BuildCommand, " ")
 	}
 
 	buildDur := info.End.Sub(info.Start)

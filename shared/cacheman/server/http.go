@@ -20,6 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +36,19 @@ import (
 	rbemodel "github.com/google/abfs/shared/rbe/model"
 	"github.com/google/abfs/shared/version"
 )
+
+// buildGoals are the goals that normalizeBuildGoal reports by name, highest priority first.
+var buildGoals = []string{
+	"dist",
+	"otapackage",
+	"target-files-package",
+	"checkbuild",
+	"droid",
+	"sdk",
+	"platform",
+	"general-tests",
+	"nothing",
+}
 
 func (c *CacheMan) httpHandler() http.Handler {
 	r := mux.NewRouter()
@@ -81,6 +97,7 @@ func (c *CacheMan) handlePushBuildMetrics(w http.ResponseWriter, r *http.Request
 	if !c.ReadJSON(w, r, &req) {
 		return
 	}
+	req.BuildGoal = normalizeBuildGoal(req.BuildGoal)
 
 	c.buildDurationHist.Observe(req.BuildDurationSecs, req.BuildGoal, req.Status, req.AndroidTarget)
 
@@ -95,6 +112,32 @@ func (c *CacheMan) handlePushBuildMetrics(w http.ResponseWriter, r *http.Request
 	}
 
 	c.WriteJSON(w, r, true)
+}
+
+// normalizeBuildGoal maps the goal targets of a build to a short fixed set of values, so
+// that the build_goal metric label stays bounded.
+func normalizeBuildGoal(goal string) string {
+	goal = strings.TrimSpace(goal)
+	if goal == "" || goal == "unknown" {
+		return "unknown"
+	}
+	goals := strings.Fields(goal)
+	for _, g := range buildGoals {
+		if slices.Contains(goals, g) {
+			return g
+		}
+	}
+	for _, g := range goals {
+		// A build that stops before the main ninja run has only the soong bootstrap file
+		// (out/soong/build.<product>.ninja, or build.ninja without a product) as its goal.
+		if path.Base(path.Dir(g)) != "soong" {
+			continue
+		}
+		if matched, _ := path.Match("build.*.ninja", path.Base(g)); matched || path.Base(g) == "build.ninja" {
+			return "soong"
+		}
+	}
+	return "other"
 }
 
 func (c *CacheMan) handleIdentityPut(w http.ResponseWriter, r *http.Request) {
