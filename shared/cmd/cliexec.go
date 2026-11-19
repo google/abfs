@@ -324,7 +324,8 @@ func (c *CliExec) Run(fl *pflag.FlagSet) {
 		metrics.SetProvider(lazyProvider)
 
 		defer func() {
-			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// Up to 5 s of spacing from the last export, plus the export itself.
+			flushCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if err := lazyProvider.Close(flushCtx); err != nil {
 				log.Printf("Failed to flush metrics on exit: %v\n", err)
