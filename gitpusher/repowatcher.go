@@ -287,72 +287,6 @@ type contentor interface {
 	Contents(string) (string, error)
 }
 
-// forAllManifests visits the manifest tree in a DFS pre-order fashion and executes the provided function.
-func forAllManifests(contentor contentor, manifestFile string, onParse func(*manifest.Manifest) error) error {
-	const notParsed = -1
-
-	type stackEntry struct {
-		manifestFile string
-		includes     []*manifest.Include
-		currInc      int
-	}
-
-	stack := []*stackEntry{
-		{
-			manifestFile: manifestFile,
-			currInc:      notParsed,
-		},
-	}
-
-	seen := make(map[string]bool)
-	for len(stack) != 0 {
-		// Peek at top of the stack.
-		entry := stack[len(stack)-1]
-
-		// Parse the node if we haven't yet.
-		if entry.currInc == notParsed {
-			contents, err := contentor.Contents(entry.manifestFile)
-			if err != nil {
-				return err
-			}
-
-			man, err := manifest.Parse([]byte(contents))
-			if err != nil {
-				return fmt.Errorf("failed to parse file %q as a manifest file: %w", entry.manifestFile, err)
-			}
-
-			if err := onParse(man); err != nil {
-				return err
-			}
-
-			entry.includes = man.Include
-			entry.currInc = 0
-		}
-
-		// Pop this entry from the stack if we're on the last child.
-		if len(entry.includes) == 0 || entry.currInc == len(entry.includes)-1 {
-			stack = stack[:len(stack)-1]
-		}
-
-		// Add next child.
-		if entry.currInc < len(entry.includes) {
-			inc := entry.includes[entry.currInc]
-			entry.currInc++
-			if seen[inc.Name] {
-				continue
-			}
-			seen[inc.Name] = true
-
-			stack = append(stack, &stackEntry{
-				manifestFile: inc.Name,
-				currInc:      notParsed,
-			})
-		}
-	}
-
-	return nil
-}
-
 // projectRemote pairs a project name with a remote name.
 type projectRemote struct {
 	// Name of the remote (not the resolved URL)
@@ -432,47 +366,74 @@ func projectMappingsForFile(contentor contentor, manifestURL string, manifestFil
 	if err != nil {
 		return projectMappings, err
 	}
-	numDefaults := 0
 
-	err = forAllManifests(contentor, manifestFile, func(m *manifest.Manifest) error {
-		// Grab all the remotes.
-		for _, remote := range m.Remote {
-			fetchSchemeURL, err := url.Parse(remote.Fetch)
-			if err != nil {
-				return err
-			}
-			// This matches the Python urljoin behavior that the repo tool uses.
-			resolvedSchemeURL := baseSchemeURL.ResolveReference(fetchSchemeURL)
-			if curr, found := remotes[remote.Name]; found {
-				if curr != resolvedSchemeURL.String() {
-					return fmt.Errorf("duplicate remote found with different fetch url. Original: %q, Duplicate: %q", curr, resolvedSchemeURL)
-				}
-			} else {
-				remotes[remote.Name] = resolvedSchemeURL.String()
-			}
+	m, err := effectiveManifest(contentor, manifestFile)
+	if err != nil {
+		return projectMappings, err
+	}
+
+	// Grab all the remotes. A name defined twice maps to its last definition, as in
+	// RemoteFromName. When the file has includes, flattening has already failed on a
+	// second definition with other attributes.
+	for _, remote := range m.Remote {
+		fetchSchemeURL, err := url.Parse(remote.Fetch)
+		if err != nil {
+			return projectMappings, err
 		}
+		// This matches the Python urljoin behavior that the repo tool uses.
+		remotes[remote.Name] = baseSchemeURL.ResolveReference(fetchSchemeURL).String()
+	}
 
-		// Check for default.
-		if m.Default != nil {
-			numDefaults++
-			if numDefaults > 1 {
-				return errors.New("more than one default element found")
-			}
+	if m.Default != nil {
+		projectMappings.defaultRemote = m.Default.Remote
+	}
 
-			projectMappings.defaultRemote = m.Default.Remote
+	for _, project := range m.Project {
+		projectRemotes[projectRemote{
+			name:   project.Name,
+			remote: project.Remote,
+		}] = struct{}{}
+	}
+
+	return projectMappings, nil
+}
+
+// effectiveManifest flattens a manifest tree and applies its remove-project and extend-project
+// elements, as the client does before it looks up the refs of each project. Every file is read
+// once, so a repeated or circular include adds nothing.
+func effectiveManifest(contentor contentor, manifestFile string) (*manifest.Manifest, error) {
+	contents, err := contentor.Contents(manifestFile)
+	if err != nil {
+		return nil, err
+	}
+	m, err := manifest.Parse([]byte(contents))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse file %q as a manifest file: %w", manifestFile, err)
+	}
+
+	seen := map[string]bool{manifestFile: true}
+	includeBytes := func(_ context.Context, name string) ([]byte, error) {
+		if seen[name] {
+			return []byte("<manifest></manifest>"), nil
 		}
-
-		for _, project := range m.Project {
-			projectRemotes[projectRemote{
-				name:   project.Name,
-				remote: project.Remote,
-			}] = struct{}{}
+		seen[name] = true
+		contents, err := contentor.Contents(name)
+		if err != nil {
+			return nil, err
 		}
-
-		return nil
-	})
-
-	return projectMappings, err
+		// FlattenIncludes parses the file again; parse it here so that an error names the file.
+		if _, err := manifest.Parse([]byte(contents)); err != nil {
+			return nil, fmt.Errorf("failed to parse file %q as a manifest file: %w", name, err)
+		}
+		return []byte(contents), nil
+	}
+	if err := m.FlattenIncludes(context.Background(), includeBytes); err != nil {
+		return nil, fmt.Errorf("failed to read the includes of %q: %w", manifestFile, err)
+	}
+	if err := m.Effective(); err != nil {
+		return nil, fmt.Errorf("failed to apply the manifest %q: %w", manifestFile, err)
+	}
+	return m, nil
 }
 
 // objectContentor reads a manifestFile contents at a specific commit.

@@ -21,6 +21,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -172,8 +173,8 @@ func (r *Repo) loadManifest(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var m *manifest.Manifest
-	if err := xml.Unmarshal(masterManBytes, &m); err != nil {
+	m, err := manifest.Parse(masterManBytes)
+	if err != nil {
 		return err
 	}
 
@@ -186,20 +187,50 @@ func (r *Repo) loadManifest(ctx context.Context) error {
 		return err
 	}
 
+	if err := r.mergeLocalManifests(ctx, m); err != nil {
+		return err
+	}
+
+	if err := m.Effective(); err != nil {
+		return err
+	}
+	for _, w := range m.Warnings() {
+		log.Printf("Warning: manifest %s", w)
+	}
+
 	if err := m.Validate(); err != nil {
 		return err
 	}
 
-	// TODO maybe move this to manfiest parser
-	for _, p := range m.Project {
-		if p.GroupsString != "" {
-			p.Groups = strings.Split(p.GroupsString, ",")
-		} else {
-			p.Groups = nil
+	r.flatMan = m
+	return nil
+}
+
+// mergeLocalManifests adds .repo/local_manifests/*.xml in name order, as repo does; includes
+// in them are relative to .repo.
+func (r *Repo) mergeLocalManifests(ctx context.Context, m *manifest.Manifest) error {
+	dir := path.Join(r.dotRepo, "local_manifests")
+	entries, err := os.ReadDir(dir)
+	if entities.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	readFile := func(ctx context.Context, name string) ([]byte, error) {
+		if !filepath.IsAbs(name) {
+			name = filepath.Join(r.dotRepo, name)
+		}
+		return os.ReadFile(name)
+	}
+	for _, ent := range entries {
+		if !strings.HasSuffix(ent.Name(), ".xml") {
+			continue
+		}
+		if err := m.IncludeManifestFile(ctx, path.Join(dir, ent.Name()), readFile); err != nil {
+			return fmt.Errorf("failed to read local manifest %s: %w", ent.Name(), err)
 		}
 	}
-
-	r.flatMan = m
 	return nil
 }
 

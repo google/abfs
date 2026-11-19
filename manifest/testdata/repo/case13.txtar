@@ -1,0 +1,38 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" />
+  <include name="inc1.xml" />
+  <project name="platform/example/p1" path="ex/p1" groups="pdk" />
+  <project name="platform/example/p2" path="ex/p2" />
+  <project name="platform/example/multi" path="ex/multi0" revision="rev-a" groups="c d" />
+  <project name="platform/example/multi" path="ex/multi1" remote="other" groups="c d" />
+  <project name="platform/example/multi" path="ex/multi2" remote="partner" groups="a,b" />
+  <extend-project name="platform/example/p5" revision="v2" base-rev="partner-rev"></extend-project>
+</manifest>
+-- inc1.xml --
+<manifest>
+  <include name="inc2.xml" groups="inc2g,pdk" />
+  <project name="platform/example/p0" path="ex/p0" revision="rev-b" remote="partner" groups="notdefault" />
+  <project name="platform/example/p2" path="ex/multi0" revision="rev-a" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <project name="platform/example/p3" path="ex/p3" groups="notdefault" />
+  <include name="inc3.xml" groups="x y" />
+  <project name="platform/example/p4" path="ex/p4" remote="partner" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p5" path="ex/p5" remote="partner" />
+  <remove-project name="platform/example/p4" path="ex/multi2" optional="true" />
+</manifest>
+-- want-error --
+duplicate path

@@ -34,6 +34,7 @@ func (r *Repo) loadConfig() error {
 	if len(groupsStr) > 0 {
 		groups = strings.Split(groupsStr, ",")
 	}
+	warnLocalGroups(groups)
 	r.groupsInclude, r.groupsExclude = FilterGroups(groups)
 
 	manifestURL, err := r.manifestProject.GetConfig(ConfigSyncRemoteURL, "")

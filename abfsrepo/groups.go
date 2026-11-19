@@ -14,7 +14,10 @@
 
 package abfsrepo
 
-import "strings"
+import (
+	"log"
+	"strings"
+)
 
 const (
 	groupsAll       = "all"
@@ -68,4 +71,14 @@ func FilterGroups(groups []string) (map[string]struct{}, map[string]struct{}) {
 		}
 	}
 	return include, exclude
+}
+
+// warnLocalGroups reports repo's local:<file> groups in a filter: projects from local manifests
+// carry no such group here, so the filter matches none of them.
+func warnLocalGroups(groups []string) {
+	for _, g := range groups {
+		if strings.HasPrefix(strings.TrimPrefix(g, "-"), "local:") {
+			log.Printf("Warning: group %q is not applied: projects from local manifests have no local: groups", g)
+		}
+	}
 }

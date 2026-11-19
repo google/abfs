@@ -1,0 +1,43 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" />
+  <include name="inc1.xml" revision="inc-rev" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <include name="inc2.xml" />
+  <project name="platform/example/p0" path="ex/p0" revision="rev-a" />
+  <project name="platform/example/p1" path="ex/p1" revision="rev-b" />
+  <project name="platform/example/multi" path="ex/multi0" groups="pdk" />
+  <project name="platform/example/multi" path="ex/multi1" remote="other" groups="notdefault" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <project name="platform/example/p4" path="ex/p4" groups="pdk" />
+  <include name="inc3.xml" groups="inc1g" revision="inc-rev" />
+  <project name="platform/example/p5" path="ex/p5" revision="rev-a" groups="pdk" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p2" path="ex/p2" groups="notdefault" />
+  <project name="platform/example/p3" path="ex/p3" remote="partner" />
+  <extend-project name="platform/example/p3" path="ex/multi0" revision="v2" base-rev="v1" dest-branch="main"><copyfile src="a" dest="b-14" /></extend-project>
+  <remove-project name="platform/example/p1" optional="true" />
+</manifest>
+-- want --
+ex/multi0	platform/example/multi	inc-rev	aosp	pdk		
+ex/multi1	platform/example/multi	inc-rev	other	notdefault		
+ex/p0	platform/example/p0	rev-a	aosp			
+ex/p1	platform/example/p1	rev-b	aosp			
+ex/p2	platform/example/p2	inc-rev	aosp	inc1g,notdefault		
+ex/p3	platform/example/p3	inc-rev	partner	inc1g		
+ex/p4	platform/example/p4	inc-rev	aosp	pdk		
+ex/p5	platform/example/p5	rev-a	aosp	pdk		

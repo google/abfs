@@ -1,0 +1,46 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" upstream="main-up" />
+  <include name="inc1.xml" groups="inc1g" />
+  <project name="platform/example/p1" path="ex/p1" remote="other" />
+  <project name="platform/example/p2" path="ex/p2" revision="rev-b" />
+  <project name="platform/example/multi" path="ex/multi0" remote="other" />
+  <extend-project name="platform/example/p3" path="ex/new1" base-rev="inc-rev" groups="pdk z"><copyfile src="a" dest="b-59" /></extend-project>
+  <extend-project name="platform/example/p2" path="ex/p2" revision="v2" upstream="main"></extend-project>
+  <remove-project name="platform/example/multi" path="ex/p0" optional="true" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <include name="inc2.xml" />
+  <project name="platform/example/p0" path="ex/p0" groups="notdefault" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <include name="inc3.xml" groups="inc2g,pdk" />
+  <project name="platform/example/p3" path="ex/p3" revision="rev-a" />
+  <project name="platform/example/p5" path="ex/p5" revision="rev-b" />
+  <project name="platform/example/multi" path="ex/multi1" remote="partner" groups="a,b" />
+  <project name="platform/example/multi" path="ex/multi2" revision="rev-a" groups="c d" />
+</manifest>
+-- inc3.xml --
+<manifest>
+  <project name="platform/example/p4" path="ex/p4" revision="rev-a" />
+</manifest>
+-- want --
+ex/multi0	platform/example/multi	other-rev	other		main-up	
+ex/multi1	platform/example/multi	partner-rev	partner	a,b,inc1g	main-up	
+ex/multi2	platform/example/multi	rev-a	aosp	c,d,inc1g	main-up	
+ex/p0	platform/example/p0	main	aosp	inc1g,notdefault	main-up	
+ex/p1	platform/example/p1	other-rev	other		main-up	
+ex/p2	platform/example/p2	v2	aosp		main	
+ex/p3	platform/example/p3	rev-a	aosp	inc1g	main-up	
+ex/p4	platform/example/p4	rev-a	aosp	inc1g,inc2g,pdk	main-up	
+ex/p5	platform/example/p5	rev-b	aosp	inc1g	main-up	
