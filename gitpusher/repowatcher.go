@@ -22,6 +22,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -43,6 +44,9 @@ type RepoWatcher struct {
 	shgit          *shellgit.ShellGit
 	gitRepo        *git.Repository
 
+	// statMu guards state, listStart, listDuration, lastSuccess and lastErr,
+	// which Stat reads while ListProjects runs.
+	statMu           sync.Mutex
 	state            RepoWatcherState
 	listStart        time.Time
 	listDuration     time.Duration
@@ -92,7 +96,15 @@ func newRepoWatcher(config *RepoConfig, g *GitPusher) ProjectLister {
 }
 
 // Stat implements ProjectLister.
+func (m *RepoWatcher) setState(state RepoWatcherState) {
+	m.statMu.Lock()
+	defer m.statMu.Unlock()
+	m.state = state
+}
+
 func (m *RepoWatcher) Stat() RepoStat {
+	m.statMu.Lock()
+	defer m.statMu.Unlock()
 	lastErr := ""
 	if m.lastErr != nil {
 		lastErr = m.lastErr.Error()
@@ -140,13 +152,15 @@ func (m *RepoWatcher) init() error {
 		return err
 	}
 
-	m.state = RepoWatcherInitialized
+	m.setState(RepoWatcherInitialized)
 	return nil
 }
 
 // ListProjects implements ProjectLister.
 func (m *RepoWatcher) ListProjects(ctx context.Context) (projects []*ProjectConfig, err error) {
 	defer func() {
+		m.statMu.Lock()
+		defer m.statMu.Unlock()
 		m.lastErr = err
 	}()
 
@@ -156,13 +170,17 @@ func (m *RepoWatcher) ListProjects(ctx context.Context) (projects []*ProjectConf
 		}
 	}
 
+	m.statMu.Lock()
 	m.listStart = time.Now()
+	m.statMu.Unlock()
 	defer func() {
+		m.statMu.Lock()
+		defer m.statMu.Unlock()
 		m.listDuration = time.Since(m.listStart)
 		m.state = RepoWatcherSleep
 	}()
 
-	m.state = RepoWatcherFetch
+	m.setState(RepoWatcherFetch)
 	if err := fetchWithRetry(m.shgit, m.dirPath); err != nil {
 		return nil, err
 	}
@@ -237,7 +255,9 @@ func (m *RepoWatcher) ListProjects(ctx context.Context) (projects []*ProjectConf
 		return nil, err
 	}
 
+	m.statMu.Lock()
 	m.lastSuccess = time.Now()
+	m.statMu.Unlock()
 	return result, nil
 }
 
