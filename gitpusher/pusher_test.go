@@ -27,6 +27,8 @@ import (
 	"github.com/google/abfs/binding"
 	shellgit "github.com/google/abfs/git"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
+	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
 func TestRefreshRefObjects_RetryOnBadObject(t *testing.T) {
@@ -329,4 +331,49 @@ func TestPusherInit_WithNegativeRefspecs(t *testing.T) {
 	err = p.init()
 	require.NoError(t, err)
 	require.Equal(t, PushStateInitialized, p.state)
+}
+
+func TestPusher_StatDuringPush(t *testing.T) {
+	repoPath := filepath.Join(t.TempDir(), "repo.git")
+	require.NoError(t, ensureGitRepo(repoPath))
+	configContent := `[core]
+	repositoryformatversion = 0
+	bare = true
+[remote "origin"]
+	url = ` + filepath.Join(t.TempDir(), "missing.git") + `
+	fetch = +refs/heads/*:refs/remotes/origin/*
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "config"), []byte(configContent), 0644))
+
+	p := &pusher{
+		dirPath:    repoPath,
+		shgit:      &shellgit.ShellGit{BinPath: "/usr/bin/git"},
+		abfsClient: inmemory.New(),
+		store:      &fakeCASStore{objects: make(map[entities.Hash][]byte)},
+		config:     &ProjectConfig{Server: "example.com", Project: "repo"},
+		remoteName: "origin",
+		state:      PushStateInitialized,
+		lastStatus: &binding.ProjectStatus{},
+	}
+	b := newRecordingBackend()
+	p.metrics = newPusherMetrics(metrics.WrapBackend(b))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			_ = p.Stat()
+		}
+	}()
+	for range 3 {
+		require.Error(t, p.Push(context.Background()), "push from a missing remote must fail")
+	}
+	cancel()
+	<-done
+	stat := p.Stat()
+	require.NotEmpty(t, stat.LastError)
+	require.Empty(t, stat.LastUpload, "a project that never pushed has no last upload")
+	require.Equal(t, int64(0), stat.MirrorBytes, "an empty mirror has no packs")
+	require.Equal(t, 3.0, b.value("abfs_pusher_pushes_total", "error"))
 }
