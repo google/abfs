@@ -16,7 +16,9 @@ package abfsrepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"maps"
 	"os"
 	"path"
@@ -27,6 +29,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/manifest"
+	"github.com/google/abfs/manifest/resolve"
 
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/entities"
@@ -108,6 +111,8 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 		return err
 	}
 
+	r.resolveRevisions(toSync)
+
 	progress := NewProgress("Syncing:", len(toSync))
 	defer progress.Stop()
 
@@ -167,6 +172,46 @@ func (r *Repo) sync(ctx context.Context, projectsToSync []string, opts SyncOpts)
 	}
 
 	return nil
+}
+
+// resolveRevisions leaves out projects that do not resolve, so their clones can still fall back to git.
+func (r *Repo) resolveRevisions(names map[string]struct{}) {
+	r.resolved = nil
+	var projects []*manifest.Project
+	var reqs []resolve.Request
+	for name := range names {
+		p := r.projectsByName[name]
+		if p == nil {
+			continue
+		}
+		remote, err := r.projectRemote(p)
+		if err != nil {
+			continue
+		}
+		revision, err := r.projectRevision(p)
+		if err != nil || revision == "" {
+			continue
+		}
+		fetchURL, err := resolve.FetchURL(remote.Fetch, r.manifestURL)
+		if err != nil {
+			continue
+		}
+		projects = append(projects, p)
+		reqs = append(reqs, resolve.Request{Project: p.Name, FetchURL: fetchURL, Revision: revision})
+	}
+
+	results, err := resolve.Revisions(r.Store, reqs)
+	var unresolved *resolve.UnresolvedError
+	if err != nil && !errors.As(err, &unresolved) {
+		log.Printf("Warning: cannot resolve project revisions: %v", err)
+		return
+	}
+	r.resolved = make(map[string]resolve.Result, len(results))
+	for i, res := range results {
+		if !res.Hash.IsZero() {
+			r.resolved[projects[i].Name] = res
+		}
+	}
 }
 
 func (r *Repo) syncRemoves() error {

@@ -64,6 +64,7 @@ import (
 	"github.com/google/abfs/cmd/abfs/push"
 	"github.com/google/abfs/cmd/abfs/put"
 	"github.com/google/abfs/cmd/abfs/rbe"
+	"github.com/google/abfs/cmd/abfs/ready"
 	recreatebuild "github.com/google/abfs/cmd/abfs/recreate-build"
 	"github.com/google/abfs/cmd/abfs/remount"
 	"github.com/google/abfs/cmd/abfs/repo"
@@ -165,6 +166,7 @@ func populateRootABFSCommands() *root.RootCmd {
 		importer.NewCmd(r),
 		reposetup.NewCmd(r),
 		ws.NewCmd(r),
+		ready.NewCmd(r),
 	}
 
 	f := instance.DefaultFlavor.Name

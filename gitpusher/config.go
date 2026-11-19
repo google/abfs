@@ -20,11 +20,13 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/google/abfs/binding"
 )
@@ -71,9 +73,24 @@ type GitPusherConfig struct {
 	MaxMemoryUsage   float64 `yaml:"max-memory-usage"`
 }
 type ManifestFile struct {
+	// Branch is a branch name, or a pattern with one "*" as in a git refspec.
 	Branch string `yaml:"branch"`
 	File   string `yaml:"file"`
 }
+
+func (f ManifestFile) refSpec() config.RefSpec {
+	return config.RefSpec(fmt.Sprintf("refs/heads/%s:refs/heads/%s", f.Branch, f.Branch))
+}
+
+func (f ManifestFile) isPattern() bool {
+	return strings.Contains(f.Branch, "*")
+}
+
+// MatchesBranch reports whether branch is the branch of f, or matches it as a pattern.
+func (f ManifestFile) MatchesBranch(branch string) bool {
+	return f.refSpec().Match(plumbing.ReferenceName("refs/heads/" + branch))
+}
+
 type ManifestConfig struct {
 	URL           string         `yaml:"url"`
 	Server        string         `yaml:"server"`
@@ -127,6 +144,76 @@ func (f *FetchConfig) Override(g *FetchConfig) {
 	if g.PackingStrategy != "" {
 		f.PackingStrategy = g.PackingStrategy
 	}
+}
+
+// ValidateRefSpecs checks the fetch ref specs as git would read them.
+func (f *FetchConfig) ValidateRefSpecs() error {
+	for _, spec := range f.FetchRefSpecs {
+		if strings.HasPrefix(spec, "^") {
+			if strings.Contains(spec, ":") {
+				return fmt.Errorf("negative-ref-spec %q must not contain a : character", spec)
+			}
+		} else {
+			newSpec := config.RefSpec(spec)
+			if err := newSpec.Validate(); err != nil {
+				return fmt.Errorf("fetch-ref-spec %q is invalid: %w", spec, err)
+			}
+		}
+	}
+	return nil
+}
+
+// StoresRef reports whether these ref specs map a remote ref to the local name ref, the name the pusher
+// pushes it under. Tags that git fetches because they point into fetched history are not covered.
+func (f *FetchConfig) StoresRef(ref string) bool {
+	specs := f.FetchRefSpecs
+	if len(specs) == 0 {
+		specs = defaultRefSpecs
+	}
+	var negative []config.RefSpec
+	for _, spec := range specs {
+		if pattern, ok := strings.CutPrefix(spec, "^"); ok {
+			negative = append(negative, config.RefSpec(pattern+":"+pattern))
+		}
+	}
+	for _, spec := range specs {
+		if strings.HasPrefix(spec, "^") || !strings.Contains(spec, ":") || config.RefSpec(spec).Validate() != nil {
+			continue
+		}
+		spec = strings.TrimPrefix(spec, "+")
+		reversed := config.RefSpec(spec).Reverse()
+		if !reversed.Match(plumbing.ReferenceName(ref)) {
+			continue
+		}
+		src := reversed.Dst(plumbing.ReferenceName(ref))
+		if !slices.ContainsFunc(negative, func(n config.RefSpec) bool { return n.Match(src) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProjectFetchConfig returns the fetch config of a manifest project and whether an override excludes it.
+func (c *RepoConfig) ProjectFetchConfig(name string) (FetchConfig, bool) {
+	fetchConfig := c.ProjectDefaults
+	excluded := false
+	for _, override := range c.Overrides {
+		matches := false
+		if override.Regex {
+			if override.RegexPattern.MatchString(name) {
+				matches = true
+			}
+		} else if override.Name == name {
+			matches = true
+		}
+		if matches {
+			if override.Exclude {
+				excluded = true
+			}
+			fetchConfig.Override(&override.FetchConfig)
+		}
+	}
+	return fetchConfig, excluded
 }
 
 func (c *GitPusherPoolConfig) Instance(name string) (*GitPusherConfig, error) {
@@ -241,9 +328,16 @@ func (c *RepoConfig) Validate() error {
 		c.Manifest.Files = []ManifestFile{{File: defaultManifestFile, Branch: defaultManifestBranch}}
 	}
 
-	for _, f := range c.Manifest.Files {
+	for i := range c.Manifest.Files {
+		f := &c.Manifest.Files[i]
 		if f.Branch == "" {
-			f.Branch = "main"
+			f.Branch = defaultManifestBranch
+		}
+		if f.File == "" {
+			f.File = defaultManifestFile
+		}
+		if err := f.refSpec().Validate(); err != nil {
+			return fmt.Errorf("invalid manifest branch %q: %w", f.Branch, err)
 		}
 	}
 
@@ -260,6 +354,13 @@ func (c *RepoConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ListsManifestFile reports whether the git-pusher reads file on branch to find the projects of this repo.
+func (c *RepoConfig) ListsManifestFile(branch, file string) bool {
+	return slices.ContainsFunc(c.Manifest.Files, func(f ManifestFile) bool {
+		return f.File == file && f.MatchesBranch(branch)
+	})
 }
 
 func (c *RepoConfig) Name() RepoName {
@@ -324,17 +425,8 @@ func (c *ProjectConfig) Validate() error {
 		c.FetchRefSpecs = defaultRefSpecs
 	}
 
-	for _, spec := range c.FetchRefSpecs {
-		if strings.HasPrefix(spec, "^") {
-			if strings.Contains(spec, ":") {
-				return fmt.Errorf("negative-ref-spec %q must not contain a : character", spec)
-			}
-		} else {
-			newSpec := config.RefSpec(spec)
-			if err := newSpec.Validate(); err != nil {
-				return fmt.Errorf("fetch-ref-spec %q is invalid: %w", spec, err)
-			}
-		}
+	if err := c.ValidateRefSpecs(); err != nil {
+		return err
 	}
 
 	if c.PackingStrategy == "" {

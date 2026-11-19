@@ -15,11 +15,19 @@
 package gitpusher
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
-	"github.com/google/abfs/manifest"
 	"github.com/stretchr/testify/require"
+
+	shellgit "github.com/google/abfs/git"
+	"github.com/google/abfs/manifest"
 )
 
 func TestForAllManifests(t *testing.T) {
@@ -246,4 +254,249 @@ func TestForAllManifests_CycleInfiniteLoop(t *testing.T) {
 		return nil
 	})
 	require.NoError(err)
+}
+
+type testContentorRemotesWithPath struct {
+}
+
+func (t *testContentorRemotesWithPath) Contents(manifestFile string) (string, error) {
+	switch manifestFile {
+	case "default.xml":
+		return `<manifest>
+  <remote fetch="https://gerrit.example.com/a/" name="gerrit" />
+  <remote fetch="https://github.com/google/" name="github" />
+  <default dest-branch="main" remote="gerrit" revision="main" />
+  <project name="platform/foo" />
+  <project name="uuid" remote="github" />
+</manifest>`, nil
+	default:
+		return "", fmt.Errorf("unsupported file %q", manifestFile)
+	}
+}
+
+func TestProjectRemoteURLSet_RemotesWithPath(t *testing.T) {
+	require := require.New(t)
+
+	mappings, err := projectMappingsForFile(&testContentorRemotesWithPath{}, "https://gerrit.example.com/a/platform/manifest", "default.xml")
+	require.NoError(err)
+	set := make(map[projectRemoteSchemeURL]struct{})
+	require.NoError(mappings.updateProjectRemoteURLSet(set))
+
+	// Clients look refs up under the host of the remote and the manifest name, so the
+	// path of the remote stays in the fetch URL only.
+	want := map[projectRemoteSchemeURL]struct{}{
+		{name: "platform/foo", server: "gerrit.example.com", remote: "gerrit", scheme: "https", url: "gerrit.example.com/a/platform/foo"}: {},
+		{name: "uuid", server: "github.com", remote: "github", scheme: "https", url: "github.com/google/uuid"}:                            {},
+	}
+	require.Equal(want, set)
+}
+
+// manifestUpstream is a manifest repository that a test changes between listings.
+type manifestUpstream struct {
+	t        *testing.T
+	dir      string
+	worktree string
+}
+
+func newManifestUpstream(t *testing.T) *manifestUpstream {
+	u := &manifestUpstream{t: t, dir: filepath.Join(t.TempDir(), "manifest.git"), worktree: t.TempDir()}
+	u.git(t.TempDir(), "init", "-q", "--bare", u.dir)
+	u.git(u.worktree, "init", "-q")
+	return u
+}
+
+func (u *manifestUpstream) git(dir string, args ...string) {
+	cmd := exec.Command("git", append([]string{"-c", "safe.bareRepository=all", "-c", "user.name=Test", "-c", "user.email=test@example.com"}, args...)...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(u.t, err, "git %v failed: %s", args, out)
+}
+
+// commit sets branch to a commit that holds exactly files.
+func (u *manifestUpstream) commit(branch string, files map[string]string) {
+	entries, err := os.ReadDir(u.worktree)
+	require.NoError(u.t, err)
+	for _, e := range entries {
+		if e.Name() != ".git" {
+			require.NoError(u.t, os.RemoveAll(filepath.Join(u.worktree, e.Name())))
+		}
+	}
+	for name, content := range files {
+		require.NoError(u.t, os.WriteFile(filepath.Join(u.worktree, name), []byte(content), 0644))
+	}
+	u.git(u.worktree, "add", "-A")
+	u.git(u.worktree, "commit", "-q", "--allow-empty", "-m", branch)
+	u.git(u.worktree, "push", "-q", "-f", u.dir, "HEAD:refs/heads/"+branch)
+}
+
+func (u *manifestUpstream) deleteBranch(branch string) {
+	u.git(u.worktree, "push", "-q", u.dir, ":refs/heads/"+branch)
+}
+
+func manifestXML(fetch string, projects ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<manifest>\n  <remote name=\"aosp\" fetch=%q />\n  <default remote=\"aosp\" revision=\"main\" />\n", fetch)
+	for _, p := range projects {
+		fmt.Fprintf(&b, "  <project name=%q />\n", p)
+	}
+	b.WriteString("</manifest>\n")
+	return b.String()
+}
+
+// newTestRepoWatcher watches u. git reads file://localhost/<path> as a local path, and the host
+// lets the URL pass the same validation as a real manifest URL.
+func newTestRepoWatcher(t *testing.T, u *manifestUpstream, files ...ManifestFile) *RepoWatcher {
+	config := &RepoConfig{Manifest: ManifestConfig{
+		URL:     "file://localhost" + u.dir,
+		Server:  "example.com",
+		Project: "platform/manifest",
+		Files:   files,
+	}}
+	require.NoError(t, config.Validate())
+	g := &GitPusher{projectStoragePath: t.TempDir(), shgit: shellgit.NewShellGit("/usr/bin/git")}
+	return newRepoWatcher(config, g).(*RepoWatcher)
+}
+
+func projectURLs(projects []*ProjectConfig) []string {
+	var urls []string
+	for _, p := range projects {
+		urls = append(urls, p.URL)
+	}
+	slices.Sort(urls)
+	return urls
+}
+
+const manifestProjectURL = "file://localhost"
+
+func listProjectURLs(t *testing.T, w *RepoWatcher) []string {
+	projects, err := w.ListProjects(context.Background())
+	require.NoError(t, err)
+	var urls []string
+	for _, url := range projectURLs(projects) {
+		if !strings.HasPrefix(url, manifestProjectURL) {
+			urls = append(urls, url)
+		}
+	}
+	return urls
+}
+
+func TestListProjects_BranchPattern(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	u.commit("release/a", map[string]string{"default.xml": manifestXML("https://example.com", "a-only")})
+	w := newTestRepoWatcher(t, u, ManifestFile{Branch: "release/*", File: "default.xml"})
+
+	require.Equal(t, []string{"https://example.com/a-only"}, listProjectURLs(t, w))
+
+	// A new branch is found by the next listing, without a config change.
+	u.commit("release/b/1", map[string]string{"default.xml": manifestXML("https://example.com", "b-only")})
+	require.Equal(t, []string{"https://example.com/a-only", "https://example.com/b-only"}, listProjectURLs(t, w))
+}
+
+func TestListProjects_MissingBranch(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	u.commit("old", map[string]string{"default.xml": manifestXML("https://example.com", "old-only")})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "main", File: "default.xml"},
+		ManifestFile{Branch: "old", File: "default.xml"},
+		ManifestFile{Branch: "next", File: "default.xml"})
+
+	// next does not exist yet; the other branches are still listed.
+	require.Equal(t, []string{"https://example.com/main-only", "https://example.com/old-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"next: no such branch"}, w.Stat().Skipped)
+
+	// A deleted branch drops its projects, and changes on the other branches still arrive.
+	u.deleteBranch("old")
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only", "main-new")})
+	require.Equal(t, []string{"https://example.com/main-new", "https://example.com/main-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"main:default.xml"}, w.Stat().ManifestFiles)
+	require.Equal(t, []string{"old: no such branch", "next: no such branch"}, w.Stat().Skipped)
+}
+
+func TestListProjects_FileNamePerBranch(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("release/a", map[string]string{"default.xml": manifestXML("https://example.com", "a-only")})
+	u.commit("release/x", map[string]string{"other.xml": manifestXML("https://example.com", "x-only")})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "release/*", File: "default.xml"},
+		ManifestFile{Branch: "release/*", File: "other.xml"})
+
+	require.Equal(t, []string{"https://example.com/a-only", "https://example.com/x-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"release/a:default.xml", "release/x:other.xml"}, w.lastReport.Load().read)
+	require.Equal(t, []string{"release/x:default.xml: no such file", "release/a:other.xml: no such file"}, w.lastReport.Load().skipped)
+
+	w = newTestRepoWatcher(t, u, ManifestFile{Branch: "next/*", File: "default.xml"})
+	require.Empty(t, listProjectURLs(t, w))
+	require.Equal(t, []string{"next/*: no matching branch"}, w.Stat().Skipped)
+}
+
+func TestListProjects_SameProjectFromTwoBranches(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("b", map[string]string{"default.xml": manifestXML("https://example.com/mirror", "shared")})
+	u.commit("a", map[string]string{"default.xml": manifestXML("https://example.com", "shared")})
+	u.commit("c", map[string]string{"default.xml": strings.Replace(manifestXML("https://example.com", "shared"), `"aosp"`, `"other"`, 2)})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "a", File: "default.xml"},
+		ManifestFile{Branch: "b", File: "default.xml"},
+		ManifestFile{Branch: "c", File: "default.xml"})
+
+	// One config per project name, from the first manifest file entry, on every listing.
+	for range 3 {
+		require.Equal(t, []string{"https://example.com/shared"}, listProjectURLs(t, w))
+	}
+	require.Equal(t, []string{"b:default.xml: project example.com/shared also listed as https://example.com/mirror/shared"}, w.lastReport.Load().skipped)
+}
+
+func TestListProjects_BrokenManifest(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	u.commit("broken", map[string]string{"default.xml": "<manifest><project"})
+	u.commit("bad-url", map[string]string{"default.xml": `<manifest>
+  <remote name="aosp" fetch="https://example.com" />
+  <remote name="nohost" fetch="file:///nohost" />
+  <default remote="aosp" revision="main" />
+  <project name="good" />
+  <project name="no-host" remote="nohost" />
+</manifest>`})
+	w := newTestRepoWatcher(t, u,
+		ManifestFile{Branch: "main", File: "default.xml"},
+		ManifestFile{Branch: "broken", File: "default.xml"},
+		ManifestFile{Branch: "bad-url", File: "default.xml"})
+
+	// A broken manifest skips its branch; a project URL without a host skips that project only.
+	require.Equal(t, []string{"https://example.com/good", "https://example.com/main-only"}, listProjectURLs(t, w))
+	skipped := w.Stat().Skipped
+	require.Len(t, skipped, 2)
+	require.True(t, strings.HasPrefix(skipped[0], "broken:default.xml: failed to parse"), skipped[0])
+	require.True(t, strings.HasPrefix(skipped[1], "bad-url:default.xml: project no-host:"), skipped[1])
+}
+
+func TestListProjects_UnreadableClone(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "main-only")})
+	w := newTestRepoWatcher(t, u, ManifestFile{Branch: "main", File: "default.xml"})
+	require.Equal(t, []string{"https://example.com/main-only"}, listProjectURLs(t, w))
+
+	// Remove the branch's tree object from the clone: the read fails, and the listing keeps the previous list.
+	cmd := exec.Command("git", "-C", u.worktree, "rev-parse", "HEAD^{tree}")
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	tree := strings.TrimSpace(string(out))
+	object := filepath.Join(w.dirPath, "objects", tree[:2], tree[2:])
+	require.FileExists(t, object)
+	require.NoError(t, os.Remove(object))
+
+	_, err = w.ListProjects(context.Background())
+	require.Error(t, err)
+}
+
+func TestListProjects_ManifestListsItself(t *testing.T) {
+	u := newManifestUpstream(t)
+	u.commit("main", map[string]string{"default.xml": manifestXML("https://example.com", "platform/manifest", "main-only")})
+	w := newTestRepoWatcher(t, u, ManifestFile{Branch: "main", File: "default.xml"})
+
+	// The configured manifest URL wins over the manifest's own entry for its repository.
+	require.Equal(t, []string{"https://example.com/main-only"}, listProjectURLs(t, w))
+	require.Equal(t, []string{"main:default.xml: project example.com/platform/manifest also listed as https://example.com/platform/manifest"}, w.lastReport.Load().skipped)
 }

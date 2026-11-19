@@ -24,6 +24,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/iotest"
 
@@ -557,6 +558,22 @@ func TestPutRefsPermissionDenied(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, codes.PermissionDenied, st.Code())
 	require.Contains(t, st.Message(), `"refs/heads/main"`)
+}
+
+func TestSearchRefsNotFound(t *testing.T) {
+	server := &ServerImpl{
+		SearchRefsImpl: func(ctx context.Context, server string, project string, refPrefix string, limit int) ([]remote.ProjectRefHash, error) {
+			assert.Equal(t, "myserver", server)
+
+			return nil, syscall.ENOENT
+		},
+	}
+
+	client, stop := grpcPipe(t, server)
+	defer stop()
+
+	_, err := client.SearchRefs(context.Background(), "myserver", "", "refs/heads/main", 0)
+	require.True(t, entities.IsNotExist(err))
 }
 
 func TestSHA256Simple(t *testing.T) {
