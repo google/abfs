@@ -88,14 +88,14 @@ func (c *RepoSetupCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 		return getOrder(entries[i].Name()) < getOrder(entries[j].Name())
 	})
 
-	// git am and git rebase create commits, which fails without a committer
-	// identity (common on a fresh server). Fall back to a generic one.
+	// git am creates commits, which fails without a committer identity (common
+	// on a fresh server). Fall back to a generic one.
 	if err := exec.Command("git", "-C", repoDir, "var", "GIT_COMMITTER_IDENT").Run(); err != nil {
 		_ = os.Setenv("GIT_COMMITTER_NAME", "ABFS repo-setup")
 		_ = os.Setenv("GIT_COMMITTER_EMAIL", "abfs-repo-setup@localhost")
 	}
 
-	if err := c.applyAndRebase(repoDir, entries); err != nil {
+	if err := c.applyPatches(repoDir, entries); err != nil {
 		return err
 	}
 
@@ -125,13 +125,11 @@ func getOrder(name string) int {
 	}
 	return 0
 }
-func (c *RepoSetupCmd) applyAndRebase(repoDir string, entries []fs.DirEntry) error {
-	// Capture current HEAD to rebase onto it later.
-	originalHead, err := c.shgit.RevParse(repoDir, "HEAD")
-	if err != nil {
-		return fmt.Errorf("failed to get current HEAD: %w", err)
-	}
 
+// applyPatches applies the patches on top of PatchedVersion. They are not
+// rebased onto git-repo main, where they can conflict; PatchedVersion moves
+// only together with refreshed patches.
+func (c *RepoSetupCmd) applyPatches(repoDir string, entries []fs.DirEntry) error {
 	if err := c.shgit.Checkout(repoDir, PatchedVersion); err != nil {
 		return err
 	}
@@ -149,7 +147,7 @@ func (c *RepoSetupCmd) applyAndRebase(repoDir string, entries []fs.DirEntry) err
 		}
 	}
 
-	return c.shgit.Rebase(repoDir, originalHead)
+	return nil
 }
 
 func (c *RepoSetupCmd) am(repoDir, patch string) error {
