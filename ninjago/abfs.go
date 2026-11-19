@@ -85,6 +85,7 @@ type ABFSBackend struct {
 	evals           xxmap.ObjectsMap[graph.Node, *Eval]
 	failedsLock     sync.Mutex
 	faileds         []*FailedStep
+	steps           stepCounter
 	ninjaEntryFile  string
 	ninjaFiles      []string
 	hashFetchC      chan HashFetchReq
@@ -119,6 +120,9 @@ type Eval struct {
 	step          *build.Step
 	req           *binding.EvalRequest
 	triedResps    map[entities.Hash]struct{}
+	skipped       int
+	mismatched    int
+	applyFailed   int
 	triedRemote   bool
 	lastRefresh   time.Time
 	cacheStart    time.Time
@@ -562,6 +566,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 			if len(targetsMap) > 0 {
 				c.log.Tracef("Skipping response %s for %s because WritePatch does not contain %v (chroot is %q)", hash, eval.req.Hash, targetsMap, c.chroot)
 				eval.triedResps[resp.Hash] = struct{}{}
+				c.steps.rejectResponse(eval, binding.CacheReasonSkipped)
 				continue
 			}
 			err = c.cacheMatch(resp, eval)
@@ -571,6 +576,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 					return false, err
 				}
+				c.steps.addStep(runType, "", resp)
 				return true, nil
 			}
 			if !binding.IsMatchError(err) {
@@ -582,6 +588,11 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				}
 			}
 			eval.triedResps[resp.Hash] = struct{}{}
+			if binding.IsMatchError(err) {
+				c.steps.rejectResponse(eval, binding.CacheReasonMismatch)
+			} else {
+				c.steps.rejectResponse(eval, binding.CacheReasonApplyFailed)
+			}
 		}
 	}
 	return false, nil
@@ -844,6 +855,7 @@ func (c *ABFSBackend) postExec(eval *Eval, resp *binding.EvalResponse, runType n
 		if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 			return err
 		}
+		c.steps.addStep(runType, missReason(c.config.EvalNoCache, eval), resp)
 	}
 
 	return err

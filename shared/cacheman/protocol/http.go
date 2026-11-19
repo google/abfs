@@ -110,6 +110,18 @@ type PushBuildMetricsReq struct {
 	CacheHitCount     uint32
 	CacheMissCount    uint32
 	Phases            map[string]float64
+	// Steps is nil when the client sends no step counts.
+	Steps *BuildStepStats `json:",omitempty"`
+}
+
+// BuildStepStats holds the step counts and run times of a build's last ninja run.
+type BuildStepStats struct {
+	RunTypes          map[string]uint32 `json:",omitempty"`
+	MissReasons       map[string]uint32 `json:",omitempty"`
+	RejectedResponses map[string]uint32 `json:",omitempty"`
+	CacheHitRunSecs   float64
+	CacheHitCPUSecs   float64
+	ExecutedRunSecs   float64
 }
 
 type HTTP interface {

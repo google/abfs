@@ -50,6 +50,7 @@ func stats(c *ABFSBackend, err error) binding.NinjaStats {
 
 	total := s.CacheMissCount + s.CacheHitCount + s.CacheForceCount
 	s.CacheHitPercent = 100.0 * float64(s.CacheHitCount) / float64(max(total, 1))
+	s.Steps = c.steps.snapshot()
 
 	s.Failures = make([]binding.NinjaFailure, len(c.faileds))
 	for i, failed := range c.faileds {

@@ -243,6 +243,18 @@ type CacheMan struct {
 	buildPhaseDurationHist metrics.Histogram
 	buildCacheHitsTotal    metrics.Counter
 	buildCacheMissesTotal  metrics.Counter
+
+	buildStepsTotal                metrics.Counter
+	buildMissReasonsTotal          metrics.Counter
+	buildRejectedResponsesTotal    metrics.Counter
+	buildStepRunSecondsTotal       metrics.Counter
+	buildCacheSavedCPUSecondsTotal metrics.Counter
+	buildCacheTimeHitRatioHist     metrics.Histogram
+
+	fetchQueueWaitHist metrics.Histogram
+	fetchDurationHist  metrics.Histogram
+	serverRPCs         inFlightRPCs
+	serverRPCAgeGauge  metrics.Gauge
 }
 
 func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
@@ -327,6 +339,54 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 			"abfs_build_cache_misses_total",
 			"Total number of cache misses in builds.",
 			[]string{"build_goal", "status", "android_target"},
+		),
+		buildStepsTotal: provider.NewCounter(
+			"abfs_build_steps_total",
+			"Total number of build steps that completed, by run type.",
+			[]string{"build_goal", "status", "android_target", "run_type"},
+		),
+		buildMissReasonsTotal: provider.NewCounter(
+			"abfs_build_cache_miss_reasons_total",
+			"Total number of build steps executed because the cache had no usable response, by reason.",
+			[]string{"build_goal", "status", "android_target", "reason"},
+		),
+		buildRejectedResponsesTotal: provider.NewCounter(
+			"abfs_build_cache_rejected_responses_total",
+			"Total number of cached responses that builds did not use, by reason.",
+			[]string{"build_goal", "status", "android_target", "reason"},
+		),
+		buildStepRunSecondsTotal: provider.NewCounter(
+			"abfs_build_step_run_seconds_total",
+			"Total run time of build steps: source=cache is the time measured by the builds that produced the cached steps, source=executed is the time of the steps executed.",
+			[]string{"build_goal", "status", "android_target", "source"},
+		),
+		buildCacheSavedCPUSecondsTotal: provider.NewCounter(
+			"abfs_build_cache_saved_cpu_seconds_total",
+			"Total user and system CPU time of the build steps taken from the cache, as measured by the builds that produced them.",
+			[]string{"build_goal", "status", "android_target"},
+		),
+		buildCacheTimeHitRatioHist: provider.NewHistogram(
+			"abfs_build_cache_time_hit_ratio",
+			"Ratio (0.0 to 1.0) of step run time taken from the cache in the build, each step weighted by its run time.",
+			[]float64{0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0},
+			[]string{"build_goal", "status", "android_target"},
+		),
+		fetchQueueWaitHist: provider.NewHistogram(
+			"abfs_cacheman_fetch_queue_wait_seconds",
+			"Time a fetch request waited in the cacheman queue before a worker took it.",
+			fetchDurationBuckets,
+			[]string{"type"},
+		),
+		fetchDurationHist: provider.NewHistogram(
+			"abfs_cacheman_fetch_duration_seconds",
+			"Time a cacheman worker took to fetch a requested item from the server and store it.",
+			fetchDurationBuckets,
+			[]string{"type", "result"},
+		),
+		serverRPCAgeGauge: provider.NewGauge(
+			"abfs_cacheman_server_rpc_oldest_age_seconds",
+			"Age of the oldest RPC that cacheman has open to the ABFS server, 0 when none is open.",
+			nil,
 		),
 	}
 	inst.RegisterConfigChange(func(config *instance.Config) {
@@ -1065,7 +1125,7 @@ func (c *CacheMan) setupABFSClient(config *instance.Config, force bool) error {
 		return err
 	}
 
-	c.abfsClient = abfsClient
+	c.abfsClient = c.trackServerRPCs(config, abfsClient)
 
 	return nil
 }
@@ -1437,6 +1497,8 @@ func (c *CacheMan) handleFetchReq(ctx context.Context, req FetchReq) {
 	reqStat.Active.Add(1)
 	defer reqStat.Active.Add(-1)
 	reqStat.Output.Add(1)
+	typeLabel := fetchTypeLabel(req.ObjType)
+	c.fetchQueueWaitHist.Observe(time.Since(req.Time).Seconds(), typeLabel)
 
 	// Synchronously track this hash in pendingAdd before writing the file to disk or
 	// unblocking CASFS callbacks. This ensures neither maintenanceWalkDir nor NewObject
@@ -1451,7 +1513,9 @@ func (c *CacheMan) handleFetchReq(ctx context.Context, req FetchReq) {
 		c.pendingAdd.Add(req.Hash)
 	}
 
+	fetchStart := time.Now()
 	t, sz, err := c.doFetch(ctx, req)
+	c.fetchDurationHist.Observe(time.Since(fetchStart).Seconds(), typeLabel, fetchResultLabel(err))
 	if err != nil {
 		if c.pendingAdd != nil {
 			c.pendingAdd.Remove(req.Hash)
@@ -1896,9 +1960,12 @@ func (c *CacheMan) fetchMaps(ctx context.Context) {
 			break
 		}
 		c.fetchMapsStat.Output.Add(1)
+		c.fetchQueueWaitHist.Observe(time.Since(req.Time).Seconds(), fetchTypeMap)
+		fetchStart := time.Now()
 		func() {
 			var err error
 			defer func() {
+				c.fetchDurationHist.Observe(time.Since(fetchStart).Seconds(), fetchTypeMap, fetchResultLabel(err))
 				if err != nil {
 					c.fetchMapsStat.Errors.Add(1)
 				}
@@ -1951,6 +2018,7 @@ func (c *CacheMan) periodicPushMetrics(ctx context.Context) {
 			c.memGauge.Set(float64(rssBytes))
 			c.cacheSizeGauge.Set(float64(c.index.TotalSize()))
 			c.evictionGauge.Set(float64(c.index.EvictCount()))
+			c.serverRPCAgeGauge.Set(c.serverRPCs.oldestAge(time.Now()).Seconds())
 
 			pushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			if err := c.provider.Push(pushCtx); err != nil {
@@ -2348,7 +2416,7 @@ func (c *CacheMan) Stats() protocol.CacheManStats {
 		},
 	}
 
-	if cli, ok := c.abfsClient.(*client.ABFSClient); ok {
+	if cli, ok := unwrapABFSClient(c.abfsClient).(*client.ABFSClient); ok {
 		stat.ClientStat = cli.Stat()
 	}
 

@@ -83,8 +83,6 @@ func (c *BuildFinishedCmd) run() error {
 	buildGoal := "unknown"
 	if len(info.NinjaRunInfo) > 0 && len(info.NinjaRunInfo[len(info.NinjaRunInfo)-1].GoalTargets) > 0 {
 		buildGoal = strings.Join(info.NinjaRunInfo[len(info.NinjaRunInfo)-1].GoalTargets, " ")
-	} else if len(info.BuildCommand) > 0 {
-		buildGoal = strings.Join(info.BuildCommand, " ")
 	}
 
 	buildDur := info.End.Sub(info.Start)
@@ -93,6 +91,7 @@ func (c *BuildFinishedCmd) run() error {
 	var cacheHitRatio float64
 	var cacheHitCount uint32
 	var cacheMissCount uint32
+	var steps *protocol.BuildStepStats
 	// skipMetrics is set to true for successful zero-work builds (e.g., no-op builds with hot cache)
 	// to prevent reporting a misleading 0% cache hit rate and polluting telemetry.
 	// We still want to report metrics for failed builds even if they did zero work.
@@ -120,6 +119,7 @@ func (c *BuildFinishedCmd) run() error {
 		cacheHitRatio = lastRun.CacheHitPercent / 100.0
 		cacheHitCount = lastRun.CacheHitCount
 		cacheMissCount = lastRun.CacheMissCount
+		steps = buildStepStats(lastRun.Steps)
 
 		if lastRun.CacheHitCount+lastRun.CacheMissCount == 0 && status == "success" {
 			skipMetrics = true
@@ -162,6 +162,7 @@ func (c *BuildFinishedCmd) run() error {
 				CacheHitCount:     cacheHitCount,
 				CacheMissCount:    cacheMissCount,
 				Phases:            phases,
+				Steps:             steps,
 			}
 			log.Printf("Forward build metrics to Cacheman\n")
 			if err := c.store.CachemanClient().PushBuildMetrics(metricsReq); err != nil {
@@ -172,6 +173,22 @@ func (c *BuildFinishedCmd) run() error {
 		}
 	}
 	return nil
+}
+
+// buildStepStats converts the step counts of a ninja run for cacheman. It returns nil when
+// the run did not count steps.
+func buildStepStats(s *binding.StepStats) *protocol.BuildStepStats {
+	if s == nil {
+		return nil
+	}
+	return &protocol.BuildStepStats{
+		RunTypes:          s.RunTypes,
+		MissReasons:       s.MissReasons,
+		RejectedResponses: s.RejectedResponses,
+		CacheHitRunSecs:   s.CacheHitRunSecs,
+		CacheHitCPUSecs:   s.CacheHitCPUSecs,
+		ExecutedRunSecs:   s.ExecutedRunSecs,
+	}
 }
 
 func writeBuildInfo(info *binding.BuildInfo) error {
