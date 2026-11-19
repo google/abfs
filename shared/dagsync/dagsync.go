@@ -32,6 +32,9 @@ import (
 
 var Debug = false
 
+// ErrOfflineDependency is the callback error of a request that depends on an object kept offline.
+var ErrOfflineDependency = errors.New("dependency is kept offline")
+
 func debugLog(logger *log.Logger, format string, v ...any) {
 	if Debug {
 		logger.Printf(format, v...)
@@ -106,6 +109,8 @@ type node struct {
 	request   Request
 	priority  QueuePriority
 	callbacks []Callback
+	// offlineDep is set when a dependency of this node was skipped and names the object kept offline.
+	offlineDep entities.Hash
 }
 
 func (n *node) String() string {
@@ -514,14 +519,14 @@ func (d *DAGSync) runNext(ctx context.Context) bool {
 	}
 
 	d.transit(n, RunningState)
-	go d.execute(ctx, n)
+	go d.execute(ctx, n, n.offlineDep)
 	return true
 }
 
-func (d *DAGSync) execute(ctx context.Context, n *node) {
+func (d *DAGSync) execute(ctx context.Context, n *node, offlineDep entities.Hash) {
 	debugLog(d.logger, "execute node %q", n)
 
-	skipped := d.shouldSkip(n)
+	skipped := d.shouldSkip(n, offlineDep)
 	var err error
 	if !skipped {
 		err = try(func() error { return n.request.Execute(ctx, d.updater, d.accessor) })
@@ -725,10 +730,18 @@ func (d *DAGSync) handleExecuted(e *executed) {
 	n, skipped, err := e.node, e.skipped, e.err
 
 	// If we are skipped, then all of our reverse dependencies also need to be
-	// skipped.
+	// skipped. They are marked by node, because the key of a map is not its object
+	// and refs have no key. Only objects go into the skip set.
 	if skipped {
+		offlineDep := n.offlineDep
+		if offlineDep.IsZero() {
+			offlineDep = n.request.Key()
+		}
 		for m := range n.revDeps {
-			d.skip(m.request.Key())
+			m.offlineDep = offlineDep
+			if _, isObject := m.request.(*PutObjectRequest); isObject {
+				d.skip(m.request.Key())
+			}
 		}
 	}
 
@@ -775,7 +788,17 @@ func (d *DAGSync) handleExecuted(e *executed) {
 		}
 	}
 	d.delete(n)
-	d.executedCallback(n, nil)
+
+	var cbErr error
+	// A phony request is a barrier for uploads, and its callers wait for a nil result. An object kept
+	// offline is never uploaded, so it does not fail the barrier.
+	if _, isPhony := n.request.(*PhonyRequest); skipped && !isPhony && !n.offlineDep.IsZero() {
+		cbErr = fmt.Errorf("%w: %s", ErrOfflineDependency, n.offlineDep)
+		if _, isRefs := n.request.(*PutRefsRequest); isRefs && len(n.callbacks) == 0 {
+			d.logger.Printf("Skipped push of %s: %v", n, cbErr)
+		}
+	}
+	d.executedCallback(n, cbErr)
 }
 
 func (d *DAGSync) handleFailedExec(n *node, err error) {
@@ -1037,12 +1060,21 @@ func (d *DAGSync) objectSize(n *node) (int64, error) {
 	return sz, err
 }
 
-func (d *DAGSync) shouldSkip(n *node) bool {
+// shouldSkip reports whether n is kept offline. runNext reads offlineDep under the lock.
+func (d *DAGSync) shouldSkip(n *node, offlineDep entities.Hash) bool {
 	// Bail early if we have an unconfigured size threshold.
 	if d.offlineThreshold == 0 {
 		return false
 	}
 
+	if !offlineDep.IsZero() {
+		return true
+	}
+
+	// Requests other than objects (maps, refs, phony) are skipped only for their dependencies.
+	if _, isObject := n.request.(*PutObjectRequest); !isObject {
+		return false
+	}
 	hash := n.request.Key()
 
 	// Do we already have it marked skipped?
