@@ -28,6 +28,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -421,4 +424,74 @@ func TestTokenValidator_SingleflightStampede(t *testing.T) {
 
 	// Verify the underlying validator was executed EXACTLY once
 	assert.Equal(t, 1, callCount)
+}
+
+// idleWatch opens a health Watch on addr with a client that pings every 10 s, the most often a
+// grpc-go client can, and waits up to wait for the call to end while the server writes nothing.
+// It returns the error that ended the call, or nil if the call was still open.
+func idleWatch(t *testing.T, addr, service string, wait time.Duration) error {
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 10 * time.Second, Timeout: 5 * time.Second}),
+	)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Watch sends the current status, then nothing until it changes.
+	stream, err := grpc_health_v1.NewHealthClient(conn).Watch(ctx, &grpc_health_v1.HealthCheckRequest{Service: service})
+	require.NoError(t, err)
+	resp, err := stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, grpc_health_v1.HealthCheckResponse_SERVING, resp.Status)
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := stream.Recv()
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(wait):
+		return nil
+	}
+}
+
+func TestNewGRPCServer_KeepalivePings(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s, err := NewGRPCServer(&GRPCServerOpts{Server: &mockRemoteCloser{}})
+	require.NoError(t, err)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	err = idleWatch(t, lis.Addr().String(), pb.ABFS_ServiceDesc.ServiceName, 45*time.Second)
+	require.NoError(t, err, "call ended while the server was idle")
+}
+
+// TestDefaultKeepalivePolicy shows what a client that pings every 10 s gets from a server
+// with grpc-go's default policy, as servers built before NewGRPCServer set one: after
+// about 30 to 40 s of server silence on an open call, too_many_pings closes the connection.
+func TestDefaultKeepalivePolicy(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s := grpc.NewServer()
+	hs := health.NewServer()
+	hs.SetServingStatus(pb.ABFS_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	grpc_health_v1.RegisterHealthServer(s, hs)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	start := time.Now()
+	err = idleWatch(t, lis.Addr().String(), pb.ABFS_ServiceDesc.ServiceName, 45*time.Second)
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Contains(t, err.Error(), "too_many_pings")
+	require.Greater(t, time.Since(start), 25*time.Second)
 }

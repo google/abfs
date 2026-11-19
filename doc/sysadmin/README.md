@@ -261,6 +261,19 @@ EOF
 
 This can always be changed later interactively with `abfs edit config:clients/configs`.
 
+### When the server stops answering
+
+Clients send gRPC keepalive pings, so they notice a server that stops answering without closing its connections, for example when its machine crashes, is reset or loses its network, or when the server process hangs. A client closes such a connection about 20 seconds after the server goes silent when it has sent data the server has not acknowledged, and within about 50 seconds otherwise. Calls on it then fail or are retried as they are when the server is stopped; each attempt to reconnect to an address that does not answer takes up to 20 seconds, so calls fail about 20 to 80 seconds after the server stopped answering (uploads after about 20 seconds). Without pings, such calls waited about 15 minutes for the operating system to give up on the connection, or up to the 1 hour call deadline for a hung server process.
+
+* A call that is waiting when the server comes back at the same address after more than about 50 seconds, for example after its machine restarted, now fails. Without pings it waited until the restarted server reset the old connection, often several minutes, and then completed.
+* A client pings only while a call is open and nothing has arrived from the server for 30 seconds, so a healthy server receives few pings.
+* The 20 second limit uses a Linux socket option on the client's connection. On other systems, and with `--tunnel-ports`, where that connection goes to a local SSH tunnel that always acknowledges data, a silent server is noticed by the pings, within about 50 seconds.
+* A client whose own address changes, for example a laptop that moves to another network, also closes its connection after about 20 seconds and connects again from the new address.
+* A network stall of more than 20 seconds with data in flight closes the connection instead of waiting for the network to recover.
+* Upgrade servers before clients. The server accepts pings as often as every 10 seconds; older servers accept one every 5 minutes. When such a server writes nothing on an open call for about 1.5 to 2 minutes, it closes the connection with `too_many_pings` and the call fails or is sent again (with ARES, a long proxied `Execute` up to 5 times), and each time the client halves how often it pings that server, until the client restarts.
+* A server whose process runs but whose request handlers are stuck still answers pings, so calls to it are not ended early.
+* With `--ares-enabled`, the connections from the CAS server to ARES send no pings.
+
 ### Push repo
 
 This is run on the client you set up above.

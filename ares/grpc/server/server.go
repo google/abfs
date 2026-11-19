@@ -34,6 +34,7 @@ import (
 func NewGRPCServer(server *servers.ARESServer, maxConnectionAge time.Duration) *grpc.Server {
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(abfsgrpc.ServerVersionMetadataInterceptor(pb.ARES_ServiceDesc.ServiceName, servers.ClientMinVersion, servers.ServerVersion)),
+		abfsgrpc.ServerKeepalivePolicy(),
 	}
 	if maxConnectionAge > 0 {
 		opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{

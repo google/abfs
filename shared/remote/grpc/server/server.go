@@ -231,6 +231,8 @@ func NewGRPCServer(o *GRPCServerOpts) (*grpc.Server, error) {
 	unaryInterceptors = append(unaryInterceptors, abfsgrpc.ServerVersionMetadataInterceptor(pb.ABFS_ServiceDesc.ServiceName, servers.ClientMinVersion, servers.ServerVersion))
 	streamInterceptors = append(streamInterceptors, abfsgrpc.ServerVersionMetadataStreamInterceptor(pb.ABFS_ServiceDesc.ServiceName, servers.ClientMinVersion, servers.ServerVersion))
 
+	// Before ExtraServerOpts, so that a caller's own keepalive policy wins.
+	serverOpts = append(serverOpts, abfsgrpc.ServerKeepalivePolicy())
 	serverOpts = append(serverOpts, o.ExtraServerOpts...)
 
 	needTLS := o.CertFile != "" && o.KeyFile != ""
