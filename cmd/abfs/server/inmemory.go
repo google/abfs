@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"log"
 
 	"github.com/spf13/pflag"
 
@@ -47,5 +48,10 @@ func (c *inMemoryCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 
 func (c *inMemoryCmd) run(ctx context.Context) error {
 	server := inmemory.New()
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Printf("WARNING: error closing ABFS server: %v", err)
+		}
+	}()
 	return c.Serve(ctx, server)
 }

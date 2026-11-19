@@ -201,6 +201,8 @@ type GRPCServerOpts struct {
 	Server                   remote.RemoteCloser
 	ProxyPrefixToConnManager map[string]abfsgrpc.ConnectionManager
 	MaxConnectionAge         time.Duration
+	// Health is the health service to register. A new one is created if it is nil.
+	Health *health.Server
 
 	// The server will setup TLS credentials
 	// and authentication interceptors if these
@@ -265,7 +267,10 @@ func NewGRPCServer(o *GRPCServerOpts) (*grpc.Server, error) {
 		}))
 	}
 
-	hs := health.NewServer()
+	hs := o.Health
+	if hs == nil {
+		hs = health.NewServer()
+	}
 	if len(o.ProxyPrefixToConnManager) > 0 {
 		serverOpts = append(serverOpts, grpc.UnknownServiceHandler(proxy.TransparentHandler(abfsgrpc.ProxyDirector(pb.ABFS_ServiceDesc.ServiceName, o.ProxyPrefixToConnManager))))
 		for serv := range o.ProxyPrefixToConnManager {

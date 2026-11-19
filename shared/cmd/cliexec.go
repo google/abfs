@@ -153,15 +153,23 @@ func (c *CliExec) signalWrap(ctx context.Context, f func(ctx context.Context) er
 	closed := false
 
 	go func() {
-		// On the first Interrupt (Ctrl+C) try a clean exit
+		// On the first Interrupt (Ctrl+C) or SIGTERM try a clean exit
 		select {
-		case <-sigChan:
-			log.Println("Received a shutdown signal, attempting to cleanly exit...")
+		case sig := <-sigChan:
+			log.Printf("Received a shutdown signal (%s), attempting to cleanly exit...", unix.SignalName(sig.(syscall.Signal)))
 			go func() {
-				// On the second Interrupt (Ctrl+C) try os.Exit()
-				<-sigChan
-				fmt.Fprintf(os.Stderr, "Process didn't exit, trying to exit forcefully\n")
-				os.Exit(1)
+				// On the second Interrupt (Ctrl+C) try os.Exit(). Process managers
+				// escalate with SIGKILL, not with another SIGTERM, so a repeated
+				// SIGTERM must not cut the clean exit short.
+				for sig := range sigChan {
+					name := unix.SignalName(sig.(syscall.Signal))
+					if sig == syscall.SIGTERM {
+						log.Printf("Received another shutdown signal (%s), still exiting cleanly", name)
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "Process didn't exit, trying to exit forcefully after %s\n", name)
+					os.Exit(1)
+				}
 			}()
 			closed = true
 			cancel()
