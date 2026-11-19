@@ -105,6 +105,18 @@ abfs server --port 50051 --log-sample-rate $LOG_SAMPLE_RATE file-based --local-d
 
 </details>
 
+#### Server metrics
+
+The server records the metrics below through the metrics provider that the `metrics-provider` config key selects, when `record-client-metrics` is `true`. Without a provider it records none of them.
+
+* `abfs_server_requests_total{method,result}` counts requests by method and result.
+* `abfs_server_requests_in_flight{method}` is the number of requests in progress.
+* `abfs_server_headers_keys_total{result}` counts the keys that `Headers` looked up, with `result` `found` or `not_found`.
+* `abfs_server_headers_batch_keys` is a histogram of the number of keys in each `Headers` call.
+* `abfs_server_object_bytes_total{direction}` counts encoded object bytes, `in` for `PutObject` and `out` for `GetObject`.
+
+The `result` of a request is `ok`, `not_found` (the object does not exist, or the ref's server is unknown), `missing_links` (the server does not have every object the request links to), `permission_denied`, `canceled` (the client canceled the request or its deadline passed) or `error` (any other error).
+
 ### Configuration
 
 Some configuration of ABFS is still done through command-line flags, but we are trying to move everything to use configuration stored in the CAS itself for dynamic update purposes. We call this feature Hashpaths and you can read more in the [Hashpath code comments](../../shared/hashpath/README.md).
@@ -290,6 +302,93 @@ To enable faster source control operations, ABFS requires a slightly patched ver
     ```
 
 To update `repo` later, repeat these steps.
+
+### Metrics
+
+Commands of the `abfs` binary that record metrics, such as cacheman and `abfs mount`, export them with OpenTelemetry. So does the standalone `cacheman` binary that `make cacheman` and `make cacheman-static` build. Export is off by default. Two config keys turn it on:
+
+* `metrics-provider: otel` selects the OpenTelemetry backend.
+* `record-client-metrics: true` turns recording on for every command. Without it nothing is exported.
+
+Set them for one command with `--kv`, a global flag that goes before the subcommand, or write them to the instance config file with `abfs config -w`:
+
+```sh
+abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+abfs --kv metrics-provider=otel --kv record-client-metrics=true config -w
+```
+
+`OTEL_METRICS_EXPORTER` chooses the exporter:
+
+* `otlp` (the default) sends OTLP to a collector. `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL` sets the protocol, `http/protobuf` (the default) or `grpc`.
+* `prometheus` serves `/metrics` for scraping on `OTEL_EXPORTER_PROMETHEUS_HOST` (default `localhost`) and `OTEL_EXPORTER_PROMETHEUS_PORT` (default `9464`). It serves values only while the process runs.
+* `console` writes JSON to standard output, which is useful to check the setup.
+* `none` exports nothing.
+
+A comma-separated list combines them, for example `OTEL_METRICS_EXPORTER=otlp,prometheus` to push to a collector and serve `/metrics` at once. In a list, `OTEL_METRICS_PRODUCERS` does not apply, and a name listed twice or a name other than these four turns export off with a warning.
+
+The other standard `OTEL_*` variables apply as well, for example `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds, 60000 by default), `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`:
+
+```sh
+OTEL_METRICS_EXPORTER=console OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  abfs --kv metrics-provider=otel --kv record-client-metrics=true cacheman run
+```
+
+Each process describes itself with the resource attributes `service.name` (`abfs`), `service.version`, `service.instance.id` (the host name and the ABFS instance name, for example `buildhost/default`), `abfs.instance` (the ABFS instance name), `abfs.runID` (new for each process) and `abfs.username` (a hash of the user name), plus the SDK's `telemetry.sdk.name`, `telemetry.sdk.language` and `telemetry.sdk.version`. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override any of ours and add others, such as `cloud.region`. A collector can also add the attributes of the platform it runs on.
+
+Things to know:
+
+* Each command waits up to 15 seconds at exit for its final export. With `otlp`, that export comes at least 5 seconds after the previous export, since some backends reject a point less than 5 seconds after the previous point of the same series. A command can take up to 5 seconds longer to exit. If an export still in flight leaves too little time, the final export is skipped with a warning.
+* `OTEL_METRICS_PRODUCERS` does not apply to `otlp`.
+* The server records `rpc.server.call.duration` for each gRPC method and status code, in the gRPC handler that also traces its calls. Its buckets run from 50 microseconds to 1 hour. gRPC health checks and reflection are not recorded.
+* A backend that identifies a series by `service.name`, `service.instance.id` and the metric labels keeps one series per ABFS instance on a host, and an instance keeps its series across restarts. Two commands of one instance that run at the same time and write the same metric with the same labels share a series; `abfs.runID` is not part of that key. To report under another identity, set `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES`.
+
+The cacheman service that `abfs init` or `cacheman init` sets up runs under `systemd` and does not see `OTEL_*` variables set in a shell. Without them it exports with the defaults: OTLP over HTTP with TLS to `https://localhost:4318`. Set them for the service in a drop-in, then restart it (replace `default` with the instance name). The drop-in survives a later `abfs init`, which rewrites only the unit file:
+
+```sh
+systemctl --user edit cacheman@default
+abfs cacheman restart
+```
+
+```ini
+[Service]
+Environment=OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+`systemctl --user edit` needs a terminal. A script writes the same lines to `~/.config/systemd/user/cacheman@default.service.d/override.conf`; `abfs cacheman restart` reloads the unit files itself.
+
+### Traces
+
+Commands of the `abfs` binary trace with OpenTelemetry when `OTEL_TRACES_EXPORTER` is set to an exporter other than `none`. Without it no tracer is set up and nothing changes. Tracing does not depend on `metrics-provider` or `record-client-metrics`. Set the variables for each process that should trace: a server records spans only for the calls of a client that traces too. cacheman started by `systemd` does not see variables set in a shell, so set them in its drop-in (see Metrics above).
+
+`OTEL_TRACES_EXPORTER` chooses the exporter:
+
+* `otlp` sends OTLP to a collector. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL` sets the protocol, `http/protobuf` (the default) or `grpc`, and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` the address.
+* `console` writes spans as JSON to standard output, which is useful to check the setup.
+
+```sh
+OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  abfs git-pusher
+```
+
+Sampling follows the caller. When `OTEL_TRACES_SAMPLER` is empty:
+
+* git-pusher starts a trace for the first push of each project after it starts, and for the later pushes at the ratio in `OTEL_TRACES_SAMPLER_ARG` (`0.01` by default). With the default push interval of 60 seconds every project is pushed again each minute, so a ratio of `1` makes a trace per project per minute.
+* All other processes, the server included, start no traces. They record a call only when the caller sent a sampled W3C `traceparent` header.
+
+`OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` replace this default with a standard sampler. A server with `parentbased_always_on` records every call of every client that does not trace. An `OTEL_TRACES_SAMPLER` value that is not a standard sampler name logs a warning and keeps the default.
+
+Only git-pusher starts traces, so set the variables for git-pusher and the server. On cacheman and the CLI they cost a little on every call and record nothing.
+
+A push trace has a `push` span with the `abfs.project` and `abfs.push.first` attributes. Its children are one span per push state, named like the state: `created` (the first push only), `fetch`, `diff`, `push-blobs`, `push-objects` and `push-packs`, with the child spans `missing-hashes`, `lfs` and `tree-helpers`. The calls `Headers`, `GetRefs` and `PutRefs` have a client span and a server span. The per-object calls `PutObject`, `GetObject`, `AddMapResult` and `MapResults` have no span and send no `traceparent`, so a push of millions of objects stays a trace of tens of spans. The state spans carry the object, blob and ref counts, plus `abfs.process.remote_wait_seconds` (time waited for `max-remote-pushes`) and `abfs.process.remote_bytes_sent`; these two count all pushes that run in the process at the same time.
+
+Things to know:
+
+* Spans carry the same resource attributes as metrics.
+* gRPC health checks and reflection are not traced.
+* At exit, spans flush in parallel with metrics, within the same 15 seconds. A push that is still running at exit loses its spans.
+* Spans are dropped without a log when the export queue is full (`OTEL_BSP_MAX_QUEUE_SIZE`, 2048 by default).
+* With a sampler that records cacheman's calls, a successful `GetObject` client span ends with status `CANCELLED` and lasts until the reader is closed.
 
 ## First Mount
 

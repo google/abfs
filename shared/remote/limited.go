@@ -19,6 +19,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/abfs/shared/entities"
 )
@@ -29,6 +30,7 @@ type LimitedRemoteProvider struct {
 	c          RemoteCloser
 	sem        chan token
 	blockedCnt atomic.Int32
+	waitTime   atomic.Int64
 }
 
 var _ RemoteCloser = (*LimitedRemoteProvider)(nil)
@@ -43,24 +45,40 @@ func NewLimitedRemote(c RemoteCloser, concurrencyLimit int) *LimitedRemoteProvid
 type concurrencyLimitedFunc func(ctx context.Context) error
 type concurrencyLimitedFuncWithReturn[T any] func(ctx context.Context) (T, error)
 
-func withConcurrencyLimit(ctx context.Context, sem chan token, fn concurrencyLimitedFunc) error {
-	select {
-	case sem <- token{}:
-		defer func() { <-sem }()
-		return fn(ctx)
-	case <-ctx.Done():
-		return ctx.Err()
+func withConcurrencyLimit(ctx context.Context, sem chan token, waitTime *atomic.Int64, fn concurrencyLimitedFunc) error {
+	if err := acquire(ctx, sem, waitTime); err != nil {
+		return err
 	}
+	defer func() { <-sem }()
+	return fn(ctx)
 }
 
-func withConcurrencyLimitWithReturn[T any](ctx context.Context, sem chan token, fn concurrencyLimitedFuncWithReturn[T]) (T, error) {
+func withConcurrencyLimitWithReturn[T any](ctx context.Context, sem chan token, waitTime *atomic.Int64, fn concurrencyLimitedFuncWithReturn[T]) (T, error) {
 	var zero T // zero value of type T
+	if err := acquire(ctx, sem, waitTime); err != nil {
+		return zero, err
+	}
+	defer func() { <-sem }()
+	return fn(ctx)
+}
+
+// acquire takes a token and adds the time it blocked to waitTime. The clock
+// is read only when no token is free.
+func acquire(ctx context.Context, sem chan token, waitTime *atomic.Int64) error {
 	select {
 	case sem <- token{}:
-		defer func() { <-sem }()
-		return fn(ctx)
+		return nil
 	case <-ctx.Done():
-		return zero, ctx.Err()
+		return ctx.Err()
+	default:
+	}
+	start := time.Now()
+	defer func() { waitTime.Add(int64(time.Since(start))) }()
+	select {
+	case sem <- token{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -94,7 +112,7 @@ func (r *LimitedRemoteProvider) getSem() chan token {
 func (r *LimitedRemoteProvider) Headers(ctx context.Context, keys []Hash) ([]entities.ObjectHeader, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) ([]entities.ObjectHeader, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) ([]entities.ObjectHeader, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.Headers(ctx, keys)
@@ -105,7 +123,7 @@ func (r *LimitedRemoteProvider) Headers(ctx context.Context, keys []Hash) ([]ent
 func (r *LimitedRemoteProvider) SHA256(ctx context.Context, keys []Hash) ([]entities.SHA256, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) ([]entities.SHA256, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) ([]entities.SHA256, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.SHA256(ctx, keys)
@@ -116,7 +134,7 @@ func (r *LimitedRemoteProvider) SHA256(ctx context.Context, keys []Hash) ([]enti
 func (r *LimitedRemoteProvider) GetObject(ctx context.Context, key Hash) (ContentReadCloser, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) (ContentReadCloser, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) (ContentReadCloser, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.GetObject(ctx, key)
@@ -127,7 +145,7 @@ func (r *LimitedRemoteProvider) GetObject(ctx context.Context, key Hash) (Conten
 func (r *LimitedRemoteProvider) PutObject(ctx context.Context, key Hash, reader ContentReadCloser) error {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimit(ctx, r.getSem(), func(ctx context.Context) error {
+	return withConcurrencyLimit(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) error {
 		r.blockedCnt.Add(-1)
 
 		return r.c.PutObject(ctx, key, reader)
@@ -138,7 +156,7 @@ func (r *LimitedRemoteProvider) PutObject(ctx context.Context, key Hash, reader 
 func (r *LimitedRemoteProvider) AddMapResult(ctx context.Context, from entities.Hash, to entities.Hash) error {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimit(ctx, r.getSem(), func(ctx context.Context) error {
+	return withConcurrencyLimit(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) error {
 		r.blockedCnt.Add(-1)
 
 		return r.c.AddMapResult(ctx, from, to)
@@ -149,7 +167,7 @@ func (r *LimitedRemoteProvider) AddMapResult(ctx context.Context, from entities.
 func (r *LimitedRemoteProvider) MapResults(ctx context.Context, hash entities.Hash) ([]entities.Hash, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) ([]entities.Hash, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) ([]entities.Hash, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.MapResults(ctx, hash)
@@ -160,7 +178,7 @@ func (r *LimitedRemoteProvider) MapResults(ctx context.Context, hash entities.Ha
 func (r *LimitedRemoteProvider) Mark(ctx context.Context, hash entities.Hash, key string, value string) (int64, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) (int64, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) (int64, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.Mark(ctx, hash, key, value)
@@ -171,7 +189,7 @@ func (r *LimitedRemoteProvider) Mark(ctx context.Context, hash entities.Hash, ke
 func (r *LimitedRemoteProvider) GetRefs(ctx context.Context, server string, project string, refs []string) ([]Hash, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) ([]entities.Hash, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) ([]entities.Hash, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.GetRefs(ctx, server, project, refs)
@@ -182,7 +200,7 @@ func (r *LimitedRemoteProvider) GetRefs(ctx context.Context, server string, proj
 func (r *LimitedRemoteProvider) PutRefs(ctx context.Context, server string, project string, refs []entities.RefHash) error {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimit(ctx, r.getSem(), func(ctx context.Context) error {
+	return withConcurrencyLimit(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) error {
 		r.blockedCnt.Add(-1)
 
 		return r.c.PutRefs(ctx, server, project, refs)
@@ -193,7 +211,7 @@ func (r *LimitedRemoteProvider) PutRefs(ctx context.Context, server string, proj
 func (r *LimitedRemoteProvider) SearchRefs(ctx context.Context, server string, project string, refPrefix string, limit int) ([]entities.ProjectRefHash, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) ([]entities.ProjectRefHash, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) ([]entities.ProjectRefHash, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.SearchRefs(ctx, server, project, refPrefix, limit)
@@ -204,7 +222,7 @@ func (r *LimitedRemoteProvider) SearchRefs(ctx context.Context, server string, p
 func (r *LimitedRemoteProvider) Version(ctx context.Context) (string, error) {
 	r.blockedCnt.Add(1)
 
-	return withConcurrencyLimitWithReturn(ctx, r.getSem(), func(ctx context.Context) (string, error) {
+	return withConcurrencyLimitWithReturn(ctx, r.getSem(), &r.waitTime, func(ctx context.Context) (string, error) {
 		r.blockedCnt.Add(-1)
 
 		return r.c.Version(ctx)
@@ -235,4 +253,9 @@ func (r *LimitedRemoteProvider) ActiveRequests() int {
 
 func (r *LimitedRemoteProvider) BlockedRequests() int {
 	return int(r.blockedCnt.Load())
+}
+
+// WaitTime returns the total time calls have waited for a free slot.
+func (r *LimitedRemoteProvider) WaitTime() time.Duration {
+	return time.Duration(r.waitTime.Load())
 }

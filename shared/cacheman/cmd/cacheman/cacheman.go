@@ -26,6 +26,7 @@ import (
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/instance"
+	_ "github.com/google/abfs/shared/metrics/otelmetrics"
 	"github.com/google/abfs/shared/systemd"
 )
 

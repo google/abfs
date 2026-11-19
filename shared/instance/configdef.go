@@ -31,8 +31,8 @@ type Config struct {
 	FetchTimeout        time.Duration `yaml:"fetch-timeout,omitempty" json:",omitempty" desc:"Timeout for fetching remote objects (e.g. 5m)"`
 	FSType              CASFSType     `yaml:"fs,omitempty" json:",omitempty" desc:"Filesystem type"`
 	ManifestProjectName string        `yaml:"manifest-project-name,omitempty" json:",omitempty" desc:"Manifest project name on server"`
-	RecordClientMetrics bool          `yaml:"record-client-metrics,omitempty" json:",omitempty" desc:"Record client telemetry metrics (requires a metrics provider)"`
-	MetricsProvider     string        `yaml:"metrics-provider,omitempty" json:",omitempty" desc:"Telemetry metrics provider registered with metrics.Register (none are built in)"`
+	RecordClientMetrics bool          `yaml:"record-client-metrics,omitempty" json:",omitempty" desc:"Record and export telemetry metrics in every command (requires metrics-provider)"`
+	MetricsProvider     string        `yaml:"metrics-provider,omitempty" json:",omitempty" desc:"Telemetry metrics provider registered with metrics.Register, for example otel"`
 	LFS                 bool          `yaml:"lfs,omitempty" json:",omitempty" desc:"Enable Git LFS support"`
 	NoLocalCache        bool          `yaml:"no-local-cache,omitempty" json:",omitempty" desc:"Bypass local cache and connect directly to server"`
 	AuthType            AuthType      `yaml:"auth-type,omitempty" json:",omitempty" desc:"Authentication type"`

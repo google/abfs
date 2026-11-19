@@ -25,6 +25,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/spf13/pflag"
+	"google.golang.org/grpc"
 
 	aresgrpc "github.com/google/abfs/ares/grpc"
 	arespb "github.com/google/abfs/ares/grpc/proto"
@@ -32,10 +33,12 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/metrics"
 	"github.com/google/abfs/shared/remote"
 	abfsgrpc "github.com/google/abfs/shared/remote/grpc"
 	"github.com/google/abfs/shared/remote/grpc/server"
 	"github.com/google/abfs/shared/remote/servers"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 type serverCmd struct {
@@ -129,6 +132,13 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 	if !c.noLogging {
 		composedServer = servers.NewLoggingServer(composedServer, log.Default(), 3, c.logSampleRate)
 	}
+	composedServer = servers.NewMetricsServer(composedServer, metrics.GetProvider())
+	// The gRPC handler records into the metrics backend, so build it first.
+	metrics.Init()
+	var extraOpts []grpc.ServerOption
+	if h := telemetry.ServerHandler(); h != nil {
+		extraOpts = append(extraOpts, grpc.StatsHandler(h))
+	}
 	s, err := server.NewGRPCServer(&server.GRPCServerOpts{
 		Server:                   composedServer,
 		ProxyPrefixToConnManager: proxyMap,
@@ -136,6 +146,7 @@ func (c *serverCmd) Serve(ctx context.Context, abfsServer remote.RemoteCloser) e
 		CertFile:                 c.tlsCertFile,
 		KeyFile:                  c.tlsKeyFile,
 		AuthEnabled:              c.authEnabled,
+		ExtraServerOpts:          extraOpts,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create gprc server: %w", err)

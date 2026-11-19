@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/abfs/binding"
@@ -40,6 +42,7 @@ import (
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 const (
@@ -120,6 +123,11 @@ type pusher struct {
 	// On process restart, already pushed LFS objects will get retried but the
 	// server will short circuit.
 	pushedLFSRefs map[string]struct{}
+
+	remoteStats func() (wait time.Duration, bytesSent int64)
+	phaseSpan   trace.Span
+	phaseWait   time.Duration
+	phaseSent   int64
 }
 
 func newPusher(config *ProjectConfig, g *GitPusher, pusherName string) *pusher {
@@ -136,6 +144,7 @@ func newPusher(config *ProjectConfig, g *GitPusher, pusherName string) *pusher {
 		shgit:          g.shgit,
 		pusherName:     pusherName,
 		deepTreeMap:    make(map[entities.Hash]entities.Hash),
+		remoteStats:    g.remoteStats,
 	}
 	return p
 }
@@ -224,6 +233,14 @@ func (s *pusher) writeGitConfig() error {
 }
 
 func (s *pusher) Push(ctx context.Context) (returnErr error) {
+	ctx, span := telemetry.Tracer(tracerName).Start(ctx, "push", trace.WithAttributes(
+		telemetry.FirstPushKey.Bool(s.state == PushStateCreated),
+		attribute.String("abfs.project", s.config.Name().String()),
+	))
+	defer func() {
+		s.endStateSpan(returnErr)
+		endSpan(span, returnErr)
+	}()
 	defer func() {
 		s.lastErr = returnErr
 		if err := s.putProjectStatus(ctx); err != nil {
@@ -236,6 +253,7 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	}()
 
 	if s.state == PushStateCreated {
+		s.setState(ctx, PushStateCreated)
 		if err := s.init(); err != nil {
 			return err
 		}
@@ -244,15 +262,16 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 	s.pushStart = time.Now()
 	defer func() {
 		s.syncDuration = time.Since(s.pushStart)
-		s.state = PushStateSleep
+		s.endStateSpan(returnErr)
+		s.setState(ctx, PushStateSleep)
 	}()
 
-	s.state = PushStateFetch
+	s.setState(ctx, PushStateFetch)
 	if err := fetchWithRetry(s.shgit, s.dirPath); err != nil {
 		return fmt.Errorf("failed to fetch: %w", err)
 	}
 
-	s.state = PushStateDiff
+	s.setState(ctx, PushStateDiff)
 	if err := s.refreshRefObjects(); err != nil {
 		return err
 	}
@@ -261,12 +280,14 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	blobsToPush, err := missingHashes(ctx, s.abfsClient, s.newBlobs)
-	if err != nil {
+	var blobsToPush, objectsToPush []entities.Hash
+	if err := s.inSpan(ctx, "missing-hashes", func(ctx context.Context) (err error) {
+		if blobsToPush, err = missingHashes(ctx, s.abfsClient, s.newBlobs); err != nil {
+			return err
+		}
+		objectsToPush, err = missingHashes(ctx, s.abfsClient, s.newObjects)
 		return err
-	}
-	objectsToPush, err := missingHashes(ctx, s.abfsClient, s.newObjects)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 
@@ -281,6 +302,13 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 			refHashes = append(refHashes, entities.RefHash{Ref: r, Hash: entities.ZeroHash})
 		}
 	}
+	s.setStateAttributes(
+		attribute.Int("abfs.blobs.found", len(s.newBlobs)),
+		attribute.Int("abfs.blobs.missing", len(blobsToPush)),
+		attribute.Int("abfs.objects.found", len(s.newObjects)),
+		attribute.Int("abfs.objects.missing", len(objectsToPush)),
+		attribute.Int("abfs.refs.changed", len(refHashes)),
+	)
 
 	// getting a new repo now so it gets the updated git data on disk
 	repo, err := fastgit.Open(s.dirPath)
@@ -304,12 +332,12 @@ func (s *pusher) Push(ctx context.Context) (returnErr error) {
 		return fmt.Errorf("failed to write pushed-refs file: %w", err)
 	}
 
-	if err := s.saveTreeHelperObjects(ctx); err != nil {
+	if err := s.inSpan(ctx, "tree-helpers", s.saveTreeHelperObjects); err != nil {
 		return err
 	}
 
 	if time.Since(s.lastPackPushed) > s.config.PackPushInterval {
-		s.state = PushStatePushPacks
+		s.setState(ctx, PushStatePushPacks)
 		if err := s.packPusher.Push(ctx); err != nil {
 			return err
 		}
@@ -502,7 +530,8 @@ func (s *pusher) pushLFSObjects(ctx context.Context, client remote.RemoteProvide
 }
 
 func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []entities.Hash, refHashes []entities.RefHash) error {
-	s.state = PushStatePushBlobs
+	s.setState(ctx, PushStatePushBlobs)
+	s.setStateAttributes(attribute.Int("abfs.blobs", len(newBlobs)))
 	ds := dagsync.New(&dagsync.DagSyncOpts{
 		Updater:      s.abfsClient,
 		Accessor:     s.objAccesser,
@@ -535,7 +564,7 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 	go ds.Start(dagsyncCtx)
 
 	if s.config.LFS {
-		if err := s.pushLFSObjects(ctx, s.abfsClient); err != nil {
+		if err := s.inSpan(ctx, "lfs", func(ctx context.Context) error { return s.pushLFSObjects(ctx, s.abfsClient) }); err != nil {
 			// We only make best effort to push LFS objects. Errors are logged but
 			// we continue.
 			log.Printf("could not push LFS objects: %v", err)
@@ -555,7 +584,8 @@ func (s *pusher) pushObjectRefs(ctx context.Context, newBlobs, newObjects []enti
 		return fmt.Errorf("timed out waiting for uploads to complete: %w", err)
 	}
 
-	s.state = PushStatePushObjects
+	s.setState(ctx, PushStatePushObjects)
+	s.setStateAttributes(attribute.Int("abfs.objects", len(newObjects)), attribute.Int("abfs.refs", len(refHashes)))
 	log.Printf("%s objects: %d found, %d needed upload", s, len(s.newObjects), len(newObjects))
 	for i, h := range newObjects {
 		ds.PutObject(h)

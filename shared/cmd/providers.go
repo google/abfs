@@ -29,6 +29,7 @@ import (
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote"
 	"github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 	"github.com/google/abfs/store"
 )
 
@@ -238,8 +239,9 @@ func newABFSClientProvider(c *CliExec) (*ABFSClientProvider, error) {
 		return nil, errors.New("remote address is required")
 	}
 	client, err := client.NewABFSClient(&client.ABFSClientOpts{
-		Servers:  servers,
-		AuthInfo: config.GetAuthInfo(),
+		Servers:      servers,
+		AuthInfo:     config.GetAuthInfo(),
+		StatsHandler: telemetry.ClientHandler(),
 	})
 	if err != nil {
 		return nil, err

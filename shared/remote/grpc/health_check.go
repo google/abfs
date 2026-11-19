@@ -132,6 +132,7 @@ type GrpcDialOpts struct {
 	RetryPolicy      string
 	DisableTLS       bool
 	SkipHealthCheck  bool
+	StatsHandler     stats.Handler
 }
 
 type tokenSourceCreds struct {
@@ -163,6 +164,9 @@ func GrpcDialHealthy(o *GrpcDialOpts) (*grpc.ClientConn, error) {
 		),
 		grpc.WithStreamInterceptor(clientMetaStreamInterceptor(o.ServiceName, o.ClientVersion, o.ServerMinVersion)),
 		grpc.WithStatsHandler(byteCounter),
+	}
+	if o.StatsHandler != nil {
+		opts = append(opts, grpc.WithStatsHandler(o.StatsHandler))
 	}
 
 	if o.RetryPolicy != "" {

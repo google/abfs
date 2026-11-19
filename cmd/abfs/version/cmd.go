@@ -32,6 +32,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	abfsclient "github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 	"github.com/google/abfs/shared/version"
 )
 
@@ -170,8 +171,9 @@ func (c *versionCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 				return
 			}
 			client, err := abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
-				Servers:  servers,
-				AuthInfo: c.Config.GetAuthInfo(),
+				Servers:      servers,
+				AuthInfo:     c.Config.GetAuthInfo(),
+				StatsHandler: telemetry.ClientHandler(),
 			})
 			if err != nil {
 				fail = true

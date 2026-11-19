@@ -28,6 +28,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/ssgelm/cookiejarparser"
+	"google.golang.org/grpc/stats"
 
 	shellgit "github.com/google/abfs/git"
 	"github.com/google/abfs/remoteconfig"
@@ -36,6 +37,7 @@ import (
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/remote"
 	abfsclient "github.com/google/abfs/shared/remote/grpc/client"
+	"github.com/google/abfs/shared/telemetry"
 )
 
 const repoForStandalones = ""
@@ -83,9 +85,14 @@ func NewGitPusher(args *NewGitPusherArgs) *GitPusher {
 func (g *GitPusher) Run(ctx context.Context) error {
 	g.startTime = time.Now()
 
+	var statsHandler stats.Handler
+	if h := telemetry.ClientHandler(); h != nil {
+		statsHandler = newSkipHandler(h)
+	}
 	client, err := abfsclient.NewABFSClient(&abfsclient.ABFSClientOpts{
-		Servers:  g.servers,
-		AuthInfo: g.authInfo,
+		Servers:      g.servers,
+		AuthInfo:     g.authInfo,
+		StatsHandler: statsHandler,
 	})
 	if err != nil {
 		return err
