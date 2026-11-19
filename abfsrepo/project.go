@@ -30,6 +30,7 @@ import (
 	"github.com/google/abfs/casgit"
 	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/instance"
 )
 
 const (
@@ -106,6 +107,9 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 		return err
 	}
 	projectURL.Path = path.Join(projectURL.Path, project.Name)
+	// The git-pusher stores a manifest project under the host of its remote and
+	// its manifest name, not under the path of its URL.
+	refServer := instance.Host(remoteURL)
 
 	gitDir := r.projectDotGitPath(project)
 	objDir := path.Join(r.projectObjectsPath(project), "objects")
@@ -113,7 +117,7 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 	// If the project's git directory already exists, this is a re-sync; update
 	// the existing project rather than re-cloning it.
 	if _, err := os.Stat(gitDir); err == nil {
-		return r.updateProject(ctx, project, projectPath, gitDir, objDir, remoteName, revision, opts)
+		return r.updateProject(ctx, project, projectPath, gitDir, objDir, remoteName, revision, refServer, opts)
 	} else if !entities.IsNotExist(err) {
 		return fmt.Errorf("cannot stat git dir %s: %w", gitDir, err)
 	}
@@ -127,6 +131,8 @@ func (r *Repo) cloneProject(ctx context.Context, project *manifest.Project, opts
 	}
 	err = r.Git.Clone(ctx, casgit.CloneOptions{
 		RemoteRepo:       projectURL.String(),
+		RefServer:        refServer,
+		RefProject:       project.Name,
 		Directory:        projectPath,
 		GitDir:           gitDir,
 		ObjectsDir:       objDir,
@@ -238,6 +244,8 @@ func (r *Repo) tryOptimizedFallback(ctx context.Context, project *manifest.Proje
 
 	if err := r.Git.Clone(ctx, casgit.CloneOptions{
 		RemoteRepo:       projectURL.String(),
+		RefServer:        instance.Host(projectURL.String()),
+		RefProject:       project.Name,
 		Directory:        projectPath,
 		GitDir:           gitDir,
 		ObjectsDir:       objDir,
@@ -302,7 +310,7 @@ func (r *Repo) updateManifest(ctx context.Context, fallbackToGit bool) error {
 	objDir := path.Join(gitDir, "objects")
 	// origin should be the remote name because manifest itself couldn't specify remote name
 	gitRepo := casgit.NewGitRepo(r.Git, r.manifestsDir, gitDir, objDir)
-	err := r.updateGitRepo(ctx, gitRepo, "manifests", r.manifestsDir, gitDir, objDir, "origin", r.manifestBranch, SyncOpts{})
+	err := r.updateGitRepo(ctx, gitRepo, "manifests", r.manifestsDir, gitDir, objDir, "origin", r.manifestBranch, "", "", SyncOpts{})
 	if err != nil && fallbackToGit {
 		log.Printf("ABFS update for manifests failed (%v), falling back to git...", err)
 		if fetchErr := r.shellGit.Fetch(gitDir); fetchErr != nil {
@@ -313,9 +321,9 @@ func (r *Repo) updateManifest(ctx context.Context, fallbackToGit bool) error {
 	return err
 }
 
-func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision string, opts SyncOpts) error {
+func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, workDir, gitDir, objDir, remoteName, revision, refServer string, opts SyncOpts) error {
 	gitRepo := casgit.NewGitRepo(r.Git, workDir, gitDir, objDir)
-	err := r.updateGitRepo(ctx, gitRepo, project.Name, workDir, gitDir, objDir, remoteName, revision, opts)
+	err := r.updateGitRepo(ctx, gitRepo, project.Name, workDir, gitDir, objDir, remoteName, revision, refServer, project.Name, opts)
 	if err != nil && opts.FallbackToGit {
 		log.Printf("ABFS update for %s failed (%v), falling back to git...", project.Name, err)
 		if fetchErr := r.shellGit.Fetch(gitDir); fetchErr != nil {
@@ -326,18 +334,20 @@ func (r *Repo) updateProject(ctx context.Context, project *manifest.Project, wor
 	return err
 }
 
-func (r *Repo) updateGitRepo(ctx context.Context, gitRepo *casgit.GitRepo, projectName, workDir, gitDir, objDir, remoteName, revision string, opts SyncOpts) error {
+func (r *Repo) updateGitRepo(ctx context.Context, gitRepo *casgit.GitRepo, projectName, workDir, gitDir, objDir, remoteName, revision, refServer, refProject string, opts SyncOpts) error {
 	if err := gitRepo.Load(); err != nil {
 		return fmt.Errorf("failed to load git repo: %w", err)
 	}
 
 	fetch := &casgit.GitFetch{
 		FetchOptions: casgit.FetchOptions{
-			Remote:    remoteName,
-			GitDir:    gitDir,
-			ObjectDir: objDir,
-			NoTags:    true,
-			Quiet:     true,
+			Remote:     remoteName,
+			RefServer:  refServer,
+			RefProject: refProject,
+			GitDir:     gitDir,
+			ObjectDir:  objDir,
+			NoTags:     true,
+			Quiet:      true,
 		},
 		GitRepo: gitRepo,
 	}

@@ -111,6 +111,8 @@ Defines a repository to watch, typically a manifest repository that points to ot
 | `files` | list of [`ManifestFile`](#manifestfile) | - | List of manifest files to include. |
 | `check-interval` | duration | 60s | Interval to check for manifest updates. |
 
+Projects listed in the manifest are stored under the host of their URL and their manifest name. The manifest repository itself is stored under `server` and `project`, which default to the host and the full path of `url`. Clients look the manifest up under their `manifest-project-name` (default `platform/manifest`), so set `project` when `url` has a path prefix, such as the `/a/` of an authenticated Gerrit URL.
+
 ### `ManifestFile`
 
 | Field | Type | Description |
@@ -128,6 +130,8 @@ Defines an individual project to sync.
 | `project` | string | Project path. |
 | `url` | string | Full URL (alternative to server/project). |
 | *(inline)* | [`FetchConfig`](#fetchconfig) | Inherits all fields from FetchConfig. |
+
+`server` and `project` default to the host and the path of `url`. Clients look a project from a manifest up under the host of its remote and its manifest name, so when a manifest lists this project under a remote with a path, such as `https://github.com/google/` with name `uuid`, set `project` to the manifest name.
 
 ### `OverrideFetchConfig`
 
