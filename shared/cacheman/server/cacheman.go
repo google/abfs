@@ -1195,10 +1195,20 @@ func (c *CacheMan) logPanic() {
 func (c *CacheMan) registerCallback(req FetchReq) (isFirst bool) {
 	c.requestCallbacksLock.Lock()
 	defer c.requestCallbacksLock.Unlock()
+	return c.registerCallbackLocked(req)
+}
 
+// registerCallbackLocked adds the callback of req. When a request for the same hash is
+// already queued, it is raised to the priority of req, so a caller never waits behind queued
+// work of lower priority than its own. A request a worker has already taken cannot be raised.
+// The caller holds requestCallbacksLock.
+func (c *CacheMan) registerCallbackLocked(req FetchReq) (isFirst bool) {
 	callbacks, exists := c.requestCallbacks[req.Hash]
 	callbacks = append(callbacks, req.Callback)
 	c.requestCallbacks[req.Hash] = callbacks
+	if exists {
+		c.fetchObjReqs.Raise(req.Hash, req.Priority)
+	}
 	return !exists
 }
 
@@ -2482,9 +2492,12 @@ func (c *CacheMan) queueFetchReq(req FetchReq) {
 	}
 
 	// Ingress deduplication: if this hash is already queued or actively being fetched,
-	// registerCallback coalesces this callback into the existing in-flight request
+	// registerCallbackLocked coalesces this callback into the existing in-flight request
 	// and returns isFirst = false. We avoid pushing redundant requests into the heap.
-	if isFirst := c.registerCallback(req); !isFirst {
+	// The request is pushed under the same lock, so a caller that joins it can always raise it.
+	c.requestCallbacksLock.Lock()
+	defer c.requestCallbacksLock.Unlock()
+	if isFirst := c.registerCallbackLocked(req); !isFirst {
 		return
 	}
 
