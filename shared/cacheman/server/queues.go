@@ -35,9 +35,10 @@ type FetchReq struct {
 	Time      time.Time
 	ObjType   protocol.RequestObjectType
 	callback  func(error)
+	index     int // position in fetchReqHeap while queued, -1 once popped
 }
 
-type fetchReqHeap []FetchReq
+type fetchReqHeap []*FetchReq
 
 func (h fetchReqHeap) Len() int { return len(h) }
 func (h fetchReqHeap) Less(i, j int) bool {
@@ -48,14 +49,20 @@ func (h fetchReqHeap) Less(i, j int) bool {
 }
 func (h fetchReqHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
 }
 func (h *fetchReqHeap) Push(x any) {
-	*h = append(*h, x.(FetchReq))
+	req := x.(*FetchReq)
+	req.index = len(*h)
+	*h = append(*h, req)
 }
 func (h *fetchReqHeap) Pop() any {
 	old := *h
 	n := len(old)
 	x := old[n-1]
+	old[n-1] = nil
+	x.index = -1
 	*h = old[0 : n-1]
 	return x
 }
@@ -64,11 +71,12 @@ type FetchReqQueue struct {
 	cond   *sync.Cond
 	mu     sync.Mutex
 	heap   fetchReqHeap
+	queued map[entities.Hash]*FetchReq
 	closed bool
 }
 
 func NewFetchReqQueue() *FetchReqQueue {
-	q := &FetchReqQueue{}
+	q := &FetchReqQueue{queued: make(map[entities.Hash]*FetchReq)}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
@@ -79,8 +87,27 @@ func (q *FetchReqQueue) Push(req FetchReq) {
 	if req.Time.IsZero() {
 		req.Time = time.Now()
 	}
-	heap.Push(&q.heap, req)
+	r := &req
+	heap.Push(&q.heap, r)
+	if _, ok := q.queued[r.Hash]; !ok {
+		q.queued[r.Hash] = r
+	}
 	q.cond.Signal()
+}
+
+// Raise sets the priority of the queued request for hash to priority if that is higher.
+// The request keeps its queue time. It returns false when no request for hash is queued:
+// a request a worker has already taken is in flight and cannot be raised.
+func (q *FetchReqQueue) Raise(hash entities.Hash, priority float64) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, ok := q.queued[hash]
+	if !ok || r.Priority >= priority {
+		return false
+	}
+	r.Priority = priority
+	heap.Fix(&q.heap, r.index)
+	return true
 }
 
 func (q *FetchReqQueue) Pop() (FetchReq, bool) {
@@ -92,7 +119,11 @@ func (q *FetchReqQueue) Pop() (FetchReq, bool) {
 	if q.closed && q.heap.Len() == 0 {
 		return FetchReq{}, false
 	}
-	return heap.Pop(&q.heap).(FetchReq), true
+	r := heap.Pop(&q.heap).(*FetchReq)
+	if q.queued[r.Hash] == r {
+		delete(q.queued, r.Hash)
+	}
+	return *r, true
 }
 
 func (q *FetchReqQueue) Close() {

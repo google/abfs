@@ -2134,3 +2134,217 @@ func TestMaintenanceAndEvictionRace(t *testing.T) {
 	require.NoError(t, c.maintenanceWork())
 	require.Nil(t, c.index.Get(keptHash), "cleaned hash must not be resurrected by subsequent maintenance")
 }
+
+// orderRemote serves blobs from memory and records the order of GetObject calls.
+type orderRemote struct {
+	ABFSClient
+	data map[entities.Hash][]byte
+
+	mu    sync.Mutex
+	order []entities.Hash
+}
+
+func (r *orderRemote) GetObject(ctx context.Context, hash entities.Hash) (remote.ContentReadCloser, error) {
+	r.mu.Lock()
+	r.order = append(r.order, hash)
+	d, ok := r.data[hash]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown hash %s", hash)
+	}
+	raw := append([]byte(fmt.Sprintf("blob %d\x00", len(d))), d...)
+	return remote.NewContentReader(io.NopCloser(bytes.NewReader(raw)), ""), nil
+}
+
+func (r *orderRemote) Close() error { return nil }
+
+func (r *orderRemote) position(h entities.Hash) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, o := range r.order {
+		if o == h {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func (r *orderRemote) addBlobs(prefix string, n int) []entities.Hash {
+	hashes := make([]entities.Hash, n)
+	for i := range n {
+		b := []byte(fmt.Sprintf("%s-%d", prefix, i))
+		hashes[i] = objects.HashBlobBytes(b)
+		r.data[hashes[i]] = b
+	}
+	return hashes
+}
+
+func newOrderTestCacheMan(t *testing.T) (*CacheMan, *orderRemote) {
+	t.Helper()
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	logDir := filepath.Join(tempDir, "log")
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+	require.NoError(t, os.MkdirAll(logDir, 0755))
+
+	trueVal := true
+	flagsConfig := &instance.ConfigOptional{
+		CacheDir:    &cacheDir,
+		LogDir:      &logDir,
+		LocalOnly:   &trueVal,
+		EnableIndex: &trueVal,
+	}
+	inst := instance.NewInstance("default", tempDir, tempDir, "abfs", flagsConfig, instance.DefaultFlavor)
+	t.Cleanup(func() { require.NoError(t, inst.Close()) })
+
+	c, err := New(inst, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Stop()) })
+
+	r := &orderRemote{data: map[entities.Hash][]byte{}}
+	c.abfsClient = r
+	return c, r
+}
+
+func queuedPriority(q *FetchReqQueue, hash entities.Hash) (float64, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, ok := q.queued[hash]
+	if !ok {
+		return 0, false
+	}
+	return r.Priority, true
+}
+
+func waitGroupTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for callbacks")
+	}
+}
+
+func TestFetchObject_JoinRaisesQueuedPriority(t *testing.T) {
+	c, r := newOrderTestCacheMan(t)
+	prefetch := r.addBlobs("prefetch", 1000)
+	demand := r.addBlobs("demand", 50)
+
+	for _, h := range prefetch {
+		c.FetchObject(h, protocol.TypeBlob, 0.3, nil)
+	}
+	for _, h := range demand {
+		c.FetchObject(h, protocol.TypeBlob, defaultFetchPriority, func(error) {})
+	}
+	// A read miss for a blob that is already queued for prefetch.
+	joined := prefetch[900]
+	var wg sync.WaitGroup
+	var fetchErr error
+	wg.Add(1)
+	c.FetchObject(joined, protocol.TypeBlob, defaultFetchPriority, func(err error) {
+		fetchErr = err
+		wg.Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.fetchObjectsWorker(ctx)
+	waitGroupTimeout(t, &wg, 10*time.Second)
+	require.NoError(t, fetchErr)
+
+	// The joined request was queued before the demand requests, so it is served first.
+	require.Equal(t, 1, r.position(joined))
+	require.Equal(t, int64(len(prefetch)+len(demand)), c.fetchBlobsStat.Input.Load())
+}
+
+func TestPrefetchGitObject_RaisesRelativeChild(t *testing.T) {
+	c, r := newOrderTestCacheMan(t)
+	prefetch := r.addBlobs("prefetch", 500)
+	child := r.addBlobs("child", 1)[0]
+
+	// Relative children are queued without a priority.
+	c.queueFetchReq(FetchReq{Hash: child, ObjType: protocol.TypeObject})
+	for _, h := range prefetch {
+		c.FetchObject(h, protocol.TypeBlob, 0.3, nil)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.prefetchGitObject(ctx)
+	done := make(chan struct{})
+	c.PrefetchGitObject(child, func(error) { close(done) })
+	require.Eventually(t, func() bool {
+		p, ok := queuedPriority(c.fetchObjReqs, child)
+		return ok && p == gitPrefetchPriority
+	}, 5*time.Second, time.Millisecond)
+
+	go c.fetchObjectsWorker(ctx)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for git object")
+	}
+	require.Equal(t, 1, r.position(child))
+}
+
+func TestFetchObject_ConcurrentJoins(t *testing.T) {
+	c, r := newOrderTestCacheMan(t)
+	keys := r.addBlobs("key", 20)
+	priorities := []float64{0, 0.2, 0.3, 0.5, 0.8, 1.0}
+	const callers = 600
+
+	var calls [2 * callers]atomic.Int32
+	var callbacks sync.WaitGroup
+	callbacks.Add(2 * callers)
+	fetchAll := func(from, to int) {
+		var wg sync.WaitGroup
+		for i := from; i < to; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				h := keys[i%len(keys)]
+				p := priorities[(i/len(keys))%len(priorities)]
+				c.FetchObject(h, protocol.TypeBlob, p, func(error) {
+					calls[i].Add(1)
+					callbacks.Done()
+				})
+			}()
+		}
+		wg.Wait()
+	}
+
+	// Many callers per key before any worker runs: each queued entry ends at the
+	// highest priority of its callers.
+	fetchAll(0, callers)
+	for _, h := range keys {
+		p, ok := queuedPriority(c.fetchObjReqs, h)
+		require.True(t, ok)
+		require.Equal(t, 1.0, p)
+	}
+	require.Equal(t, int64(len(keys)), c.fetchBlobsStat.Input.Load())
+
+	// More callers join and raise while workers pop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for range 4 {
+		go c.fetchObjectsWorker(ctx)
+	}
+	fetchAll(callers, 2*callers)
+	waitGroupTimeout(t, &callbacks, 10*time.Second)
+
+	for i := range calls {
+		require.Equal(t, int32(1), calls[i].Load(), "callbacks of caller %d", i)
+	}
+	c.requestCallbacksLock.Lock()
+	require.Empty(t, c.requestCallbacks)
+	c.requestCallbacksLock.Unlock()
+	c.fetchObjReqs.mu.Lock()
+	require.Empty(t, c.fetchObjReqs.queued)
+	require.Zero(t, c.fetchObjReqs.heap.Len())
+	c.fetchObjReqs.mu.Unlock()
+}
