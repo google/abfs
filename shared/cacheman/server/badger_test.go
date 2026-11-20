@@ -15,6 +15,7 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -76,6 +77,80 @@ func TestBadgerMapsStore(t *testing.T) {
 	require.NoError(t, err)
 	sortHashSlice(got)
 	require.Equal(t, nilIfZeroSize(want), nilIfZeroSize(got))
+}
+
+func mapExpiries(t *testing.T, mapStore *BadgerMapsStore) []time.Time {
+	var expiries []time.Time
+	require.NoError(t, mapStore.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(keyOnlyIterationOpts())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			expiries = append(expiries, time.Unix(int64(it.Item().ExpiresAt()), 0))
+		}
+		return nil
+	}))
+	return expiries
+}
+
+func TestBadgerMapsStore_ExpirySpread(t *testing.T) {
+	mapStore := NewBadgerMapStore(t.TempDir(), nil, DefaultTTLHours)
+	require.NoError(t, mapStore.Open())
+	defer func() {
+		require.NoError(t, mapStore.Close())
+	}()
+
+	const n = 1000
+	start := time.Now().Truncate(time.Second)
+	for i := range n {
+		require.NoError(t, mapStore.Put(entities.NewHash(fmt.Sprintf("%040x", i)), entities.NewHash("facecafe")))
+	}
+	end := time.Now()
+
+	expiries := mapExpiries(t, mapStore)
+	require.Len(t, expiries, n)
+	first, last := expiries[0], expiries[0]
+	for _, e := range expiries {
+		first = minTime(first, e)
+		last = maxTime(last, e)
+		require.False(t, e.After(end.Add(DefaultTTLHours*time.Hour)), "expiry %v is past the TTL", e)
+		require.False(t, e.Before(start.Add(DefaultTTLHours*time.Hour*3/4)), "expiry %v is below the spread", e)
+	}
+	t.Logf("%d maps written in %v expire between %v and %v after the first write (%v apart)",
+		n, end.Sub(start), first.Sub(start), last.Sub(start), last.Sub(first))
+	require.Greater(t, last.Sub(first), time.Hour, "maps written together expire together")
+}
+
+func TestBadgerMapsStore_EntryTTLBounds(t *testing.T) {
+	ttl := DefaultTTLHours * time.Hour
+	tests := []struct {
+		name string
+		pick func(n int64) int64
+		want time.Duration
+	}{
+		{"upper bound", func(int64) int64 { return 0 }, ttl},
+		{"lower bound", func(n int64) int64 { return n - 1 }, ttl - ttl/mapTTLSpread},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapStore := NewBadgerMapStore(t.TempDir(), nil, DefaultTTLHours)
+			mapStore.randInt64N = tt.pick
+			require.Equal(t, tt.want, mapStore.entryTTL())
+		})
+	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 func TestBadgerIndexStore(t *testing.T) {
