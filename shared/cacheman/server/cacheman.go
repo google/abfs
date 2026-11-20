@@ -201,6 +201,8 @@ type CacheMan struct {
 	fetchCASBlobsStat    *protocol.QueueStat
 	fetchMapsReqs        *FetchReqQueue
 	fetchMapsStat        *protocol.QueueStat
+	queuedMapsLock       sync.Mutex
+	queuedMaps           map[entities.Hash][]FetchReq // callers of a map fetch no worker has started
 	indexObjReqs         *IndexReqQueue
 	newObjReqs           *NewObjectReqQueue
 	pendingAdd           *PendingAddTracker
@@ -265,6 +267,7 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 		fetchCASBlobsStat:  new(protocol.QueueStat),
 		fetchMapsReqs:      NewFetchReqQueue(),
 		fetchMapsStat:      new(protocol.QueueStat),
+		queuedMaps:         make(map[entities.Hash][]FetchReq),
 		indexObjReqs:       NewIndexReqQueue(),
 		newObjReqs:         NewNewObjectReqQueue(),
 		pendingAdd:         NewPendingAddTracker(),
@@ -1895,14 +1898,17 @@ func (c *CacheMan) fetchMaps(ctx context.Context) {
 		if !ok || c.isStopped(ctx) {
 			break
 		}
-		c.fetchMapsStat.Output.Add(1)
+		waiters := c.takeQueuedMap(req.Hash)
+		c.fetchMapsStat.Output.Add(int64(len(waiters)))
 		func() {
 			var err error
 			defer func() {
 				if err != nil {
-					c.fetchMapsStat.Errors.Add(1)
+					c.fetchMapsStat.Errors.Add(int64(len(waiters)))
 				}
-				req.Callback(err)
+				for _, w := range waiters {
+					w.Callback(err)
+				}
 			}()
 
 			remotes, err := c.abfsClient.MapResults(ctx, req.Hash)
@@ -2557,11 +2563,29 @@ func (c *CacheMan) Phony(priority dagsync.RequestPriority, objects []entities.Ha
 	}
 }
 
+// FetchMap merges the server's map results for hash into the local map store and then
+// calls callback. A request joins a queued fetch of the same hash only while no worker has
+// started it, so the RPC that answers a caller always starts after the caller asked.
 func (c *CacheMan) FetchMap(hash entities.Hash, priority float64, callback func(error)) {
-	req := FetchReq{Hash: hash, Priority: priority, callback: callback}
+	req := FetchReq{Hash: hash, Priority: priority, Time: time.Now(), callback: callback}
 
 	c.fetchMapsStat.Input.Add(1)
-	c.fetchMapsReqs.Push(req)
+	c.queuedMapsLock.Lock()
+	defer c.queuedMapsLock.Unlock()
+	waiters, queued := c.queuedMaps[hash]
+	c.queuedMaps[hash] = append(waiters, req)
+	if !queued {
+		c.fetchMapsReqs.Push(req)
+	}
+}
+
+// takeQueuedMap removes and returns the callers of the queued map fetch for hash.
+func (c *CacheMan) takeQueuedMap(hash entities.Hash) []FetchReq {
+	c.queuedMapsLock.Lock()
+	defer c.queuedMapsLock.Unlock()
+	waiters := c.queuedMaps[hash]
+	delete(c.queuedMaps, hash)
+	return waiters
 }
 
 func (c *CacheMan) MapResults(hash entities.Hash) []entities.Hash {
