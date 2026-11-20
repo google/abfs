@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/google/abfs/shared/cacheman/protocol"
 	"github.com/google/abfs/shared/entities"
@@ -2133,4 +2135,222 @@ func TestMaintenanceAndEvictionRace(t *testing.T) {
 	require.False(t, hasKept, "clean must remove blob file from disk when EnableIndex is true")
 	require.NoError(t, c.maintenanceWork())
 	require.Nil(t, c.index.Get(keptHash), "cleaned hash must not be resurrected by subsequent maintenance")
+}
+
+// mockMapsABFSClient answers MapResults for key. Each call reads the results, then waits
+// on gate (if set) before it answers.
+type mockMapsABFSClient struct {
+	ABFSClient
+	key      entities.Hash
+	mu       sync.Mutex
+	results  []entities.Hash
+	err      error
+	gate     chan struct{}
+	calls    atomic.Int32
+	inFlight atomic.Int32
+}
+
+func (m *mockMapsABFSClient) add(h entities.Hash) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.results = append(m.results, h)
+}
+
+func (m *mockMapsABFSClient) MapResults(ctx context.Context, id entities.Hash) ([]entities.Hash, error) {
+	m.calls.Add(1)
+	if id != m.key {
+		return nil, nil
+	}
+	m.inFlight.Add(1)
+	defer m.inFlight.Add(-1)
+	m.mu.Lock()
+	results := append([]entities.Hash(nil), m.results...)
+	err := m.err
+	m.mu.Unlock()
+	if m.gate != nil {
+		<-m.gate
+	}
+	return results, err
+}
+
+func (m *mockMapsABFSClient) Close() error {
+	return nil
+}
+
+var (
+	testMapKey  = entities.NewHash("7878787878787878787878787878787878787878")
+	testMapRes1 = entities.NewHash("1111111111111111111111111111111111111111")
+	testMapRes2 = entities.NewHash("2222222222222222222222222222222222222222")
+)
+
+func newMapsTestCacheman(t *testing.T, client ABFSClient) *CacheMan {
+	t.Helper()
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	logDir := filepath.Join(tempDir, "log")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+	require.NoError(t, os.MkdirAll(logDir, 0755))
+
+	falseVal := false
+	flagsConfig := &instance.ConfigOptional{
+		CacheDir:  &cacheDir,
+		LogDir:    &logDir,
+		LocalOnly: &falseVal,
+	}
+
+	inst := instance.NewInstance("default", tempDir, tempDir, "abfs", flagsConfig, instance.DefaultFlavor)
+	t.Cleanup(func() {
+		require.NoError(t, inst.Close())
+	})
+
+	c, err := New(inst, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Stop())
+	})
+	c.abfsClient = client
+	return c
+}
+
+func startFetchMapsWorkers(c *CacheMan, n int) {
+	for range n {
+		go c.fetchMaps(context.Background())
+	}
+}
+
+func TestFetchMap_CoalescesQueuedRequests(t *testing.T) {
+	client := &mockMapsABFSClient{key: testMapKey, results: []entities.Hash{testMapRes1}}
+	c := newMapsTestCacheman(t, client)
+
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := range callers {
+		wg.Add(1)
+		c.FetchMap(testMapKey, defaultFetchPriority, func(err error) {
+			errs[i] = err
+			wg.Done()
+		})
+	}
+	// No worker has started, so all requests are still queued.
+	startFetchMapsWorkers(c, 4)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(1), client.calls.Load())
+	require.Equal(t, int64(callers), c.fetchMapsStat.Input.Load())
+	require.Equal(t, int64(callers), c.fetchMapsStat.Output.Load())
+	require.Equal(t, int64(0), c.fetchMapsStat.Errors.Load())
+	got, err := c.maps.Get(testMapKey)
+	require.NoError(t, err)
+	require.Equal(t, []entities.Hash{testMapRes1}, got)
+}
+
+func TestFetchMap_RequestAfterStartGetsNewRPC(t *testing.T) {
+	client := &mockMapsABFSClient{key: testMapKey, results: []entities.Hash{testMapRes1}, gate: make(chan struct{})}
+	c := newMapsTestCacheman(t, client)
+	startFetchMapsWorkers(c, 4)
+	// Cleanups run last first, so a failed assertion releases the worker before Stop waits for it.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(client.gate) }) }
+	t.Cleanup(release)
+
+	first := make(chan error, 1)
+	c.FetchMap(testMapKey, defaultFetchPriority, func(err error) { first <- err })
+	require.Eventually(t, func() bool { return client.inFlight.Load() == 1 }, 5*time.Second, time.Millisecond)
+
+	// A result stored on the server after the first RPC read its results must reach a
+	// caller that asked after that RPC started.
+	client.add(testMapRes2)
+	second := make(chan error, 1)
+	c.FetchMap(testMapKey, defaultFetchPriority, func(err error) { second <- err })
+	require.Eventually(t, func() bool { return client.calls.Load() == 2 }, 5*time.Second, time.Millisecond)
+	release()
+
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+	got, err := c.maps.Get(testMapKey)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []entities.Hash{testMapRes1, testMapRes2}, got)
+}
+
+func TestFetchMap_ErrorReachesEveryCaller(t *testing.T) {
+	client := &mockMapsABFSClient{key: testMapKey, err: status.Error(codes.NotFound, "no map")}
+	c := newMapsTestCacheman(t, client)
+
+	const callers = 5
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := range callers {
+		wg.Add(1)
+		c.FetchMap(testMapKey, defaultFetchPriority, func(err error) {
+			errs[i] = err
+			wg.Done()
+		})
+	}
+	startFetchMapsWorkers(c, 2)
+	wg.Wait()
+
+	for _, err := range errs {
+		require.Equal(t, codes.NotFound, status.Code(err))
+	}
+	require.Equal(t, int32(1), client.calls.Load())
+	require.Equal(t, int64(callers), c.fetchMapsStat.Output.Load())
+	require.Equal(t, int64(callers), c.fetchMapsStat.Errors.Load())
+}
+
+func TestFetchMap_DistinctKeysNotMerged(t *testing.T) {
+	client := &mockMapsABFSClient{key: testMapKey}
+	c := newMapsTestCacheman(t, client)
+
+	keys := []entities.Hash{testMapKey, testMapRes1, testMapRes2}
+	var wg sync.WaitGroup
+	for _, k := range keys {
+		for range 3 {
+			wg.Add(1)
+			c.FetchMap(k, defaultFetchPriority, func(error) { wg.Done() })
+		}
+	}
+	startFetchMapsWorkers(c, 2)
+	wg.Wait()
+
+	require.Equal(t, int32(len(keys)), client.calls.Load())
+}
+
+func TestFetchMap_HTTPConcurrentCallers(t *testing.T) {
+	client := &mockMapsABFSClient{key: testMapKey, results: []entities.Hash{testMapRes1}}
+	c := newMapsTestCacheman(t, client)
+	startFetchMapsWorkers(c, 4)
+
+	body, err := json.Marshal(testMapKey)
+	require.NoError(t, err)
+	const callers = 64
+	var wg sync.WaitGroup
+	codesSeen := make([]int, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			c.handleFetchMap(w, httptest.NewRequest(http.MethodPost, "/fetch-map", bytes.NewReader(body)))
+			codesSeen[i] = w.Code
+		}()
+	}
+	wg.Wait()
+
+	for _, code := range codesSeen {
+		require.Equal(t, http.StatusOK, code)
+	}
+	require.Equal(t, int64(callers), c.fetchMapsStat.Input.Load())
+	require.Equal(t, int64(callers), c.fetchMapsStat.Output.Load())
+
+	// No caller is left queued: the next request gets an RPC of its own.
+	calls := client.calls.Load()
+	done := make(chan error, 1)
+	c.FetchMap(testMapKey, defaultFetchPriority, func(err error) { done <- err })
+	require.NoError(t, <-done)
+	require.Equal(t, calls+1, client.calls.Load())
 }
