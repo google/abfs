@@ -33,6 +33,7 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects"
 )
 
 const tapNoCGo = "tap-no-cgo"
@@ -284,6 +285,46 @@ func (c *rerunCmd) printOutput(content string) {
 		c.Println("| ", line)
 	}
 	c.Println()
+}
+
+// addUnwrittenTargets adds the targets that the rerun left on disk to the reads of resp when the
+// command wrote nothing, as ninjago records them, so both responses are compared alike. Paths are
+// relative to the current directory.
+func (c *rerunCmd) addUnwrittenTargets(resp *binding.EvalResponse) error {
+	if err := binding.AddUnwrittenTargets(resp, c.req.Targets, hashTarget); err != nil {
+		return fmt.Errorf("failed to hash the targets: %w", err)
+	}
+	return nil
+}
+
+// hashTarget returns the entry of the file at p, hashed from its content, or nil when p does not
+// exist.
+func hashTarget(p string) (*entities.PatchEntry, error) {
+	info, err := os.Lstat(p)
+	if entities.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ent := &entities.PatchEntry{Path: p, Mode: entities.ModeToFileMode(info.Mode())}
+	switch ent.Mode {
+	case entities.FileModeDir:
+		// AddUnwrittenTargets skips directories.
+	case entities.FileModeSymlink:
+		target, err := os.Readlink(p)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read symlink %s: %w", p, err)
+		}
+		ent.Hash = objects.HashBlobBytes([]byte(target))
+		ent.Size = int64(len(target))
+	default:
+		ent.Hash, ent.Size, err = objects.HashFileBlob(p)
+		if err != nil {
+			return nil, fmt.Errorf("cannot hash file %s: %w", p, err)
+		}
+	}
+	return ent, nil
 }
 
 func (c *rerunCmd) writePatchDiff(name string, a, b entities.Patch) bool {

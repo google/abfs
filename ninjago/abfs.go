@@ -544,22 +544,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				return false, err
 			}
 
-			targetsMap := make(map[string]struct{}, len(eval.step.Node.Targets))
-			for _, t := range eval.step.Node.Targets {
-				targetsMap[t] = struct{}{}
-			}
-			for _, ent := range resp.WritePatch {
-				delete(targetsMap, ent.Path)
-			}
-			if len(targetsMap) > 0 {
-				for _, ent := range resp.ReadPatch {
-					delete(targetsMap, ent.Path)
-					if len(targetsMap) == 0 {
-						break
-					}
-				}
-			}
-			if len(targetsMap) > 0 {
+			if targetsMap := missingTargets(resp, eval.step.Node.Targets); len(targetsMap) > 0 {
 				c.log.Tracef("Skipping response %s for %s because WritePatch does not contain %v (chroot is %q)", hash, eval.req.Hash, targetsMap, c.chroot)
 				eval.triedResps[resp.Hash] = struct{}{}
 				continue
@@ -924,6 +909,9 @@ func (c *ABFSBackend) execTapLocal(ctx context.Context, eval *Eval) (*binding.Ev
 		Req:           eval.req,
 		ChrootToStrip: c.chroot,
 	})
+	if err := readUnwrittenTargets(resp, eval.step.Node.Targets); err != nil {
+		c.log.Warnf("failed to hash the targets of %s req=%s: %v", eval.step, eval.req.Hash, err)
+	}
 
 	if err := c.StoreResults(ctx, eval, resp); err != nil {
 		return resp, err

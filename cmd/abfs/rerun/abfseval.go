@@ -190,7 +190,9 @@ func (c *rerunCmd) evalABFS() (*binding.EvalResponse, error) {
 		Resp: resp,
 		Req:  c.req,
 	})
-
+	if err := c.addUnwrittenTargets(resp); err != nil {
+		return nil, err
+	}
 	return resp, nil
 }
 
