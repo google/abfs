@@ -16,11 +16,16 @@ package rerun
 
 import (
 	"bytes"
+	"os"
+	"path"
 	"testing"
 
+	"github.com/google/abfs/binding"
 	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWritePatchDiff(t *testing.T) {
@@ -96,4 +101,37 @@ func TestWriteListDiff(t *testing.T) {
   + a/b/c
 `
 	assert.Equal(t, expected, w.String())
+}
+
+func TestRespDiff_UnwrittenTarget(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const target = "out/soong/build_number.txt"
+	require.NoError(t, os.MkdirAll(path.Dir(target), 0755))
+	require.NoError(t, os.WriteFile(target, []byte("1\n"), 0644))
+
+	recorded := &entities.PatchEntry{
+		Path:  target,
+		Mode:  entities.FileModeRegular,
+		Hash:  objects.HashBlobBytes([]byte("1\n")),
+		Size:  2,
+		State: entities.PatchEntryStateExtraRead,
+	}
+	w := bytes.NewBuffer(nil)
+	c := &rerunCmd{
+		out:  w,
+		req:  &binding.EvalRequest{Targets: []string{target}},
+		resp: &binding.EvalResponse{ReadPatch: entities.Patch{recorded}},
+	}
+
+	// The rerun wrote nothing and left the target as recorded.
+	newResp := &binding.EvalResponse{}
+	require.NoError(t, c.addUnwrittenTargets(newResp))
+	assert.False(t, c.respDiff(newResp), w.String())
+
+	// The rerun read the target with other content.
+	other := *recorded
+	other.Hash = objects.HashBlobBytes([]byte("2\n"))
+	newResp = &binding.EvalResponse{ReadPatch: entities.Patch{&other}}
+	require.NoError(t, c.addUnwrittenTargets(newResp))
+	assert.True(t, c.respDiff(newResp))
 }

@@ -302,3 +302,33 @@ func ResponseFromRun(r run.RunResult) *EvalResponse {
 	}
 	return resp
 }
+
+// AddUnwrittenTargets adds the targets that a successful step which wrote nothing left on disk to
+// the reads of resp, as for a step that reads its targets. stat returns the entry of a path, or nil
+// when the path does not exist. Directories are not added. On an error resp is left unchanged.
+func AddUnwrittenTargets(resp *EvalResponse, targets []string, stat func(path string) (*entities.PatchEntry, error)) error {
+	if resp.ExitCode != 0 || len(resp.WritePatch) > 0 || len(resp.Deletes) > 0 {
+		return nil
+	}
+	reads := make(map[string]struct{}, len(resp.ReadPatch))
+	for _, ent := range resp.ReadPatch {
+		reads[ent.Path] = struct{}{}
+	}
+	var added entities.Patch
+	for _, t := range targets {
+		if _, found := reads[t]; found {
+			continue
+		}
+		ent, err := stat(t)
+		if err != nil {
+			return err
+		}
+		if ent == nil || ent.Mode == entities.FileModeDir {
+			continue
+		}
+		ent.State = entities.PatchEntryStateExtraRead
+		added = append(added, ent)
+	}
+	resp.ReadPatch = append(resp.ReadPatch, added...)
+	return nil
+}
