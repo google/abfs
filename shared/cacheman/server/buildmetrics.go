@@ -33,14 +33,19 @@ var buildRunTypes = []string{
 	"delayed-cached",
 }
 
-// buildMissReasons are the reasons a step was executed (binding.CacheReason*) that are
-// reported by name in the reason label.
+// buildMissReasons are the reasons a step was executed after a cache lookup
+// (binding.CacheReason*) that are reported by name in the reason label.
 var buildMissReasons = []string{
-	"cache_off",
 	"no_result",
 	"skipped",
 	"mismatch",
 	"apply_failed",
+}
+
+// buildNotLookedUpReasons are the reasons a step was executed without a cache lookup that
+// are reported by name in the reason label.
+var buildNotLookedUpReasons = []string{
+	"cache_off",
 }
 
 // buildRejectReasons are the reasons a cached response was not used that are reported by
@@ -75,15 +80,19 @@ func (c *CacheMan) recordBuildSteps(req *protocol.PushBuildMetricsReq) {
 	for reason, n := range steps.MissReasons {
 		c.buildMissReasonsTotal.Add(float64(n), append(labels, boundedLabel(reason, buildMissReasons))...)
 	}
+	for reason, n := range steps.NotLookedUp {
+		c.buildNotLookedUpTotal.Add(float64(n), append(labels, boundedLabel(reason, buildNotLookedUpReasons))...)
+	}
 	for reason, n := range steps.RejectedResponses {
 		c.buildRejectedResponsesTotal.Add(float64(n), append(labels, boundedLabel(reason, buildRejectReasons))...)
 	}
 
-	if !validSeconds(steps.CacheHitRunSecs) || !validSeconds(steps.CacheHitCPUSecs) || !validSeconds(steps.ExecutedRunSecs) {
+	if !validSeconds(steps.CacheHitRunSecs) || !validSeconds(steps.CacheHitCPUSecs) || !validSeconds(steps.ExecutedRunSecs) || !validSeconds(steps.NotLookedUpRunSecs) {
 		return
 	}
 	c.buildStepRunSecondsTotal.Add(steps.CacheHitRunSecs, append(labels, "cache")...)
 	c.buildStepRunSecondsTotal.Add(steps.ExecutedRunSecs, append(labels, "executed")...)
+	c.buildStepRunSecondsTotal.Add(steps.NotLookedUpRunSecs, append(labels, "not_looked_up")...)
 	c.buildCacheSavedCPUSecondsTotal.Add(steps.CacheHitCPUSecs, labels...)
 	if total := steps.CacheHitRunSecs + steps.ExecutedRunSecs; total > 0 {
 		c.buildCacheTimeHitRatioHist.Observe(steps.CacheHitRunSecs/total, labels...)

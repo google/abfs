@@ -39,8 +39,6 @@ func stats(c *ABFSBackend, err error) binding.NinjaStats {
 		NodesCount:      uint32(c.graph.Nodes.Len()),
 		DoneCount:       uint32(states[build.StateDone] + states[build.StateCached]),
 		FailCount:       uint32(states[build.StateFailed]),
-		CacheHitCount:   uint32(states[build.StateCached]),
-		CacheMissCount:  uint32(states[build.StateDone]),
 		NinjaEntryFile:  c.ninjaEntryFile,
 		BuildFiles:      c.ninjaFiles,
 	}
@@ -48,9 +46,10 @@ func stats(c *ABFSBackend, err error) binding.NinjaStats {
 		s.Error = err.Error()
 	}
 
+	s.Steps = c.steps.snapshot()
+	s.CacheHitCount, s.CacheMissCount, _ = c.cacheCounts(s.Steps)
 	total := s.CacheMissCount + s.CacheHitCount + s.CacheForceCount
 	s.CacheHitPercent = 100.0 * float64(s.CacheHitCount) / float64(max(total, 1))
-	s.Steps = c.steps.snapshot()
 
 	s.Failures = make([]binding.NinjaFailure, len(c.faileds))
 	for i, failed := range c.faileds {

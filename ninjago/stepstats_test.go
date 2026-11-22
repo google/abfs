@@ -26,13 +26,14 @@ import (
 
 func TestMissReason(t *testing.T) {
 	tests := []struct {
-		name     string
-		cacheOff bool
-		eval     Eval
-		want     string
+		name        string
+		cacheOff    bool
+		eval        Eval
+		want        string
+		notLookedUp bool
 	}{
 		{name: "no response", want: binding.CacheReasonNoResult},
-		{name: "cache off", cacheOff: true, eval: Eval{mismatched: 1}, want: binding.CacheReasonOff},
+		{name: "cache off", cacheOff: true, eval: Eval{mismatched: 1}, want: binding.CacheReasonOff, notLookedUp: true},
 		{name: "skipped", eval: Eval{skipped: 2}, want: binding.CacheReasonSkipped},
 		{name: "mismatch", eval: Eval{mismatched: 1}, want: binding.CacheReasonMismatch},
 		{name: "apply failed", eval: Eval{applyFailed: 1}, want: binding.CacheReasonApplyFailed},
@@ -42,7 +43,9 @@ func TestMissReason(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, missReason(tt.cacheOff, &tt.eval))
+			reason, lookedUp := missReason(tt.cacheOff, &tt.eval)
+			require.Equal(t, tt.want, reason)
+			require.Equal(t, !tt.notLookedUp, lookedUp)
 		})
 	}
 }
@@ -68,31 +71,53 @@ func TestStepCounter(t *testing.T) {
 	require.Equal(t, 1, eval.mismatched)
 	require.Equal(t, 1, eval.applyFailed)
 
-	s.addStep(ninjalog.RunTypeCached, "", evalResponse(10, 6, 2))
-	s.addStep(ninjalog.RunTypeDelayedCached, "", evalResponse(5, 3, 1))
-	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonMismatch, evalResponse(4, 1, 1))
-	s.addStep(ninjalog.RunTypeRemote, binding.CacheReasonNoResult, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeCached, "", true, evalResponse(10, 6, 2))
+	s.addStep(ninjalog.RunTypeDelayedCached, "", true, evalResponse(5, 3, 1))
+	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonMismatch, true, evalResponse(4, 1, 1))
+	s.addStep(ninjalog.RunTypeRemote, binding.CacheReasonNoResult, true, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonOff, false, evalResponse(2, 1, 0))
 
 	got := s.snapshot()
 	require.Equal(t, &binding.StepStats{
-		RunTypes: map[string]uint32{"cached": 1, "delayed-cached": 1, "local": 1, "remote": 1},
+		RunTypes: map[string]uint32{"cached": 1, "delayed-cached": 1, "local": 2, "remote": 1},
 		MissReasons: map[string]uint32{
 			binding.CacheReasonMismatch: 1,
 			binding.CacheReasonNoResult: 1,
 		},
+		NotLookedUp: map[string]uint32{binding.CacheReasonOff: 1},
 		RejectedResponses: map[string]uint32{
 			binding.CacheReasonSkipped:     2,
 			binding.CacheReasonMismatch:    1,
 			binding.CacheReasonApplyFailed: 1,
 		},
-		CacheHitRunSecs: 15,
-		CacheHitCPUSecs: 12,
-		ExecutedRunSecs: 5,
+		CacheHitRunSecs:    15,
+		CacheHitCPUSecs:    12,
+		ExecutedRunSecs:    5,
+		NotLookedUpRunSecs: 2,
 	}, got)
 
 	// The snapshot does not share maps with the counter.
-	s.addStep(ninjalog.RunTypeCached, "", evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeCached, "", true, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonOff, false, evalResponse(1, 0, 0))
 	require.Equal(t, uint32(1), got.RunTypes["cached"])
+	require.Equal(t, uint32(1), got.NotLookedUp[binding.CacheReasonOff])
+}
+
+func TestStepStatsCacheCounts(t *testing.T) {
+	s := new(stepCounter)
+	for range 3 {
+		s.addStep(ninjalog.RunTypeCached, "", true, evalResponse(1, 0, 0))
+	}
+	s.addStep(ninjalog.RunTypeDelayedCached, "", true, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonNoResult, true, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeRemote, binding.CacheReasonSkipped, true, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeLocal, binding.CacheReasonOff, false, evalResponse(1, 0, 0))
+	s.addStep(ninjalog.RunTypeLocalNoTap, binding.CacheReasonOff, false, evalResponse(1, 0, 0))
+	hits, misses, notLookedUp := s.snapshot().CacheCounts()
+	require.Equal(t, []uint32{4, 2, 2}, []uint32{hits, misses, notLookedUp})
+
+	hits, misses, notLookedUp = new(binding.StepStats).CacheCounts()
+	require.Equal(t, []uint32{0, 0, 0}, []uint32{hits, misses, notLookedUp})
 }
 
 func TestNinjaStatsSteps_JSON(t *testing.T) {

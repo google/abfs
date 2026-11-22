@@ -121,7 +121,7 @@ func (c *BuildFinishedCmd) run() error {
 		cacheMissCount = lastRun.CacheMissCount
 		steps = buildStepStats(lastRun.Steps)
 
-		if lastRun.CacheHitCount+lastRun.CacheMissCount == 0 && status == "success" {
+		if isZeroWork(lastRun.NinjaStats) && status == "success" {
 			skipMetrics = true
 		}
 	}
@@ -175,6 +175,16 @@ func (c *BuildFinishedCmd) run() error {
 	return nil
 }
 
+// isZeroWork reports whether a ninja run neither took a step from the cache nor executed
+// one. Steps executed without a cache lookup count as work.
+func isZeroWork(s *binding.NinjaStats) bool {
+	var notLookedUp uint32
+	if s.Steps != nil {
+		_, _, notLookedUp = s.Steps.CacheCounts()
+	}
+	return s.CacheHitCount+s.CacheMissCount+notLookedUp == 0
+}
+
 // buildStepStats converts the step counts of a ninja run for cacheman. It returns nil when
 // the run did not count steps.
 func buildStepStats(s *binding.StepStats) *protocol.BuildStepStats {
@@ -182,12 +192,14 @@ func buildStepStats(s *binding.StepStats) *protocol.BuildStepStats {
 		return nil
 	}
 	return &protocol.BuildStepStats{
-		RunTypes:          s.RunTypes,
-		MissReasons:       s.MissReasons,
-		RejectedResponses: s.RejectedResponses,
-		CacheHitRunSecs:   s.CacheHitRunSecs,
-		CacheHitCPUSecs:   s.CacheHitCPUSecs,
-		ExecutedRunSecs:   s.ExecutedRunSecs,
+		RunTypes:           s.RunTypes,
+		MissReasons:        s.MissReasons,
+		NotLookedUp:        s.NotLookedUp,
+		RejectedResponses:  s.RejectedResponses,
+		CacheHitRunSecs:    s.CacheHitRunSecs,
+		CacheHitCPUSecs:    s.CacheHitCPUSecs,
+		ExecutedRunSecs:    s.ExecutedRunSecs,
+		NotLookedUpRunSecs: s.NotLookedUpRunSecs,
 	}
 }
 

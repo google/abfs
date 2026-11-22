@@ -18,6 +18,8 @@ import (
 	"maps"
 	"sync"
 
+	"github.com/google/ninja-go/build"
+
 	"github.com/google/abfs/binding"
 	"github.com/google/abfs/ninjago/ninjalog"
 )
@@ -49,8 +51,8 @@ func (s *stepCounter) rejectResponse(eval *Eval, reason string) {
 	s.stats.RejectedResponses[reason]++
 }
 
-// addStep counts a completed step. missReason is ignored for cache hits.
-func (s *stepCounter) addStep(runType ninjalog.RunType, missReason string, resp *binding.EvalResponse) {
+// addStep counts a completed step. missReason and lookedUp are ignored for cache hits.
+func (s *stepCounter) addStep(runType ninjalog.RunType, missReason string, lookedUp bool, resp *binding.EvalResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stats.RunTypes == nil {
@@ -60,6 +62,14 @@ func (s *stepCounter) addStep(runType ninjalog.RunType, missReason string, resp 
 	if runType.IsCacheHit() {
 		s.stats.CacheHitRunSecs += resp.RunInfo.RunDuration
 		s.stats.CacheHitCPUSecs += resp.RunInfo.UserTime + resp.RunInfo.SysTime
+		return
+	}
+	if !lookedUp {
+		if s.stats.NotLookedUp == nil {
+			s.stats.NotLookedUp = make(map[string]uint32)
+		}
+		s.stats.NotLookedUp[missReason]++
+		s.stats.NotLookedUpRunSecs += resp.RunInfo.RunDuration
 		return
 	}
 	if s.stats.MissReasons == nil {
@@ -75,23 +85,34 @@ func (s *stepCounter) snapshot() *binding.StepStats {
 	stats := s.stats
 	stats.RunTypes = maps.Clone(s.stats.RunTypes)
 	stats.MissReasons = maps.Clone(s.stats.MissReasons)
+	stats.NotLookedUp = maps.Clone(s.stats.NotLookedUp)
 	stats.RejectedResponses = maps.Clone(s.stats.RejectedResponses)
 	return &stats
 }
 
-// missReason tells why a step whose cache lookup found no usable response is executed.
-// A mismatch outranks an apply failure, which outranks a skipped response.
-func missReason(cacheOff bool, eval *Eval) string {
+// missReason tells why a step is executed instead of taken from the cache, and whether
+// the step was looked up. A mismatch outranks an apply failure, which outranks a skipped
+// response.
+func missReason(cacheOff bool, eval *Eval) (reason string, lookedUp bool) {
 	switch {
 	case cacheOff:
-		return binding.CacheReasonOff
+		return binding.CacheReasonOff, false
 	case eval.mismatched > 0:
-		return binding.CacheReasonMismatch
+		return binding.CacheReasonMismatch, true
 	case eval.applyFailed > 0:
-		return binding.CacheReasonApplyFailed
+		return binding.CacheReasonApplyFailed, true
 	case eval.skipped > 0:
-		return binding.CacheReasonSkipped
+		return binding.CacheReasonSkipped, true
 	default:
-		return binding.CacheReasonNoResult
+		return binding.CacheReasonNoResult, true
 	}
+}
+
+// cacheCounts returns the cache hits, misses and steps not looked up of the run. A dry run
+// looks up no step, so every step it would run counts as not looked up.
+func (c *ABFSBackend) cacheCounts(steps *binding.StepStats) (hits, misses, notLookedUp uint32) {
+	if c.dryRun {
+		return 0, 0, uint32(c.engine.StateCounts()[build.StateDone])
+	}
+	return steps.CacheCounts()
 }

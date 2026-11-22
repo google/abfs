@@ -116,7 +116,7 @@ If your target has been built before, you should have some cache hits and see a 
 ```
 # example `m` output
 ...
-warning: ninja: Evaluation took 1m25.840705899s, fail: 0, cache: hits: 192249, misses: 0, ratio: 100.000
+warning: ninja: Evaluation took 1m25.840705899s, fail: 0, cache: hits: 192249, misses: 0, ratio: 100.000, not looked up: 0
 ...
 ```
 

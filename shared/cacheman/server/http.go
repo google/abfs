@@ -102,7 +102,10 @@ func (c *CacheMan) handlePushBuildMetrics(w http.ResponseWriter, r *http.Request
 	c.buildDurationHist.Observe(req.BuildDurationSecs, req.BuildGoal, req.Status, req.AndroidTarget)
 
 	if req.HasNinjaRun {
-		c.buildCacheHitRatioHist.Observe(req.CacheHitRatio, req.BuildGoal, req.Status, req.AndroidTarget)
+		// A build that made no cache lookup has no hit ratio, and a 0 would skew the histogram.
+		if req.CacheHitCount+req.CacheMissCount > 0 {
+			c.buildCacheHitRatioHist.Observe(req.CacheHitRatio, req.BuildGoal, req.Status, req.AndroidTarget)
+		}
 		c.buildCacheHitsTotal.Add(float64(req.CacheHitCount), req.BuildGoal, req.Status, req.AndroidTarget)
 		c.buildCacheMissesTotal.Add(float64(req.CacheMissCount), req.BuildGoal, req.Status, req.AndroidTarget)
 		if req.Steps != nil {

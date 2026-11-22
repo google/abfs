@@ -66,9 +66,9 @@ func (f *fakeMetric) get() map[string][]float64 {
 }
 
 type buildMetricsFakes struct {
-	duration, hitRatio, phases, hits, misses       *fakeMetric
-	steps, missReasons, rejected, runSecs, cpuSecs *fakeMetric
-	timeHitRatio                                   *fakeMetric
+	duration, hitRatio, phases, hits, misses                    *fakeMetric
+	steps, missReasons, notLookedUp, rejected, runSecs, cpuSecs *fakeMetric
+	timeHitRatio                                                *fakeMetric
 }
 
 func newBuildMetricsCacheMan() (*CacheMan, *buildMetricsFakes) {
@@ -80,6 +80,7 @@ func newBuildMetricsCacheMan() (*CacheMan, *buildMetricsFakes) {
 		misses:       newFakeMetric(),
 		steps:        newFakeMetric(),
 		missReasons:  newFakeMetric(),
+		notLookedUp:  newFakeMetric(),
 		rejected:     newFakeMetric(),
 		runSecs:      newFakeMetric(),
 		cpuSecs:      newFakeMetric(),
@@ -94,6 +95,7 @@ func newBuildMetricsCacheMan() (*CacheMan, *buildMetricsFakes) {
 		buildCacheMissesTotal:          f.misses,
 		buildStepsTotal:                f.steps,
 		buildMissReasonsTotal:          f.missReasons,
+		buildNotLookedUpTotal:          f.notLookedUp,
 		buildRejectedResponsesTotal:    f.rejected,
 		buildStepRunSecondsTotal:       f.runSecs,
 		buildCacheSavedCPUSecondsTotal: f.cpuSecs,
@@ -134,7 +136,7 @@ func TestPushBuildMetrics_OldRequest(t *testing.T) {
 	require.Equal(t, map[string][]float64{labels: {1}}, f.misses.get())
 	require.Equal(t, map[string][]float64{labels + ",run": {100}}, f.phases.get())
 
-	for _, m := range []*fakeMetric{f.steps, f.missReasons, f.rejected, f.runSecs, f.cpuSecs, f.timeHitRatio} {
+	for _, m := range []*fakeMetric{f.steps, f.missReasons, f.notLookedUp, f.rejected, f.runSecs, f.cpuSecs, f.timeHitRatio} {
 		require.Empty(t, m.get())
 	}
 }
@@ -178,8 +180,9 @@ func TestPushBuildMetrics_Steps(t *testing.T) {
 		labels + ",apply_failed": {1},
 	}, f.rejected.get())
 	require.Equal(t, map[string][]float64{
-		labels + ",cache":    {30},
-		labels + ",executed": {10},
+		labels + ",cache":         {30},
+		labels + ",executed":      {10},
+		labels + ",not_looked_up": {0},
 	}, f.runSecs.get())
 	require.Equal(t, map[string][]float64{labels: {50}}, f.cpuSecs.get())
 	require.Equal(t, map[string][]float64{labels: {0.75}}, f.timeHitRatio.get())
@@ -190,10 +193,44 @@ func TestPushBuildMetrics_StepsWithoutRunTime(t *testing.T) {
 	pushBuildMetrics(t, c, `{"BuildGoal": "droid", "Status": "success", "HasNinjaRun": true, "Steps": {}}`)
 
 	require.Equal(t, map[string][]float64{
-		"droid,success,,cache":    {0},
-		"droid,success,,executed": {0},
+		"droid,success,,cache":         {0},
+		"droid,success,,executed":      {0},
+		"droid,success,,not_looked_up": {0},
 	}, f.runSecs.get())
 	require.Empty(t, f.timeHitRatio.get())
+}
+
+func TestPushBuildMetrics_NotLookedUp(t *testing.T) {
+	c, f := newBuildMetricsCacheMan()
+	pushBuildMetrics(t, c, `{"BuildGoal": "droid", "Status": "success", "AndroidTarget": "t", "HasNinjaRun": true,
+		"CacheHitRatio": 0.75, "CacheHitCount": 3, "CacheMissCount": 1,
+		"Steps": {"RunTypes": {"cached": 3, "local": 3}, "MissReasons": {"no_result": 1},
+		"NotLookedUp": {"cache_off": 2, "free text": 1}, "CacheHitRunSecs": 6, "ExecutedRunSecs": 2, "NotLookedUpRunSecs": 5}}`)
+
+	labels := "droid,success,t"
+	require.Equal(t, map[string][]float64{labels + ",no_result": {1}}, f.missReasons.get())
+	require.Equal(t, map[string][]float64{labels + ",cache_off": {2}, labels + ",other": {1}}, f.notLookedUp.get())
+	require.Equal(t, map[string][]float64{
+		labels + ",cache":         {6},
+		labels + ",executed":      {2},
+		labels + ",not_looked_up": {5},
+	}, f.runSecs.get())
+	// Steps that were not looked up leave the time ratio to the looked up steps.
+	require.Equal(t, map[string][]float64{labels: {0.75}}, f.timeHitRatio.get())
+	require.Equal(t, map[string][]float64{labels: {0.75}}, f.hitRatio.get())
+}
+
+func TestPushBuildMetrics_NoLookup(t *testing.T) {
+	c, f := newBuildMetricsCacheMan()
+	pushBuildMetrics(t, c, `{"BuildGoal": "droid", "Status": "success", "AndroidTarget": "t", "HasNinjaRun": true,
+		"BuildDurationSecs": 30, "Steps": {"RunTypes": {"local": 4}, "NotLookedUp": {"cache_off": 4}, "NotLookedUpRunSecs": 8}}`)
+
+	labels := "droid,success,t"
+	require.Empty(t, f.hitRatio.get())
+	require.Equal(t, map[string][]float64{labels: {30}}, f.duration.get())
+	require.Equal(t, map[string][]float64{labels: {0}}, f.hits.get())
+	require.Equal(t, map[string][]float64{labels: {0}}, f.misses.get())
+	require.Equal(t, map[string][]float64{labels + ",cache_off": {4}}, f.notLookedUp.get())
 }
 
 func TestPushBuildMetrics_StepsWithoutNinjaRun(t *testing.T) {
@@ -267,7 +304,9 @@ func TestBoundedLabel(t *testing.T) {
 		{name: "run type", value: "local-no-tap", known: buildRunTypes, want: "local-no-tap"},
 		{name: "unknown run type", value: "fast", known: buildRunTypes, want: "other"},
 		{name: "empty run type", value: "", known: buildRunTypes, want: "other"},
-		{name: "miss reason", value: "cache_off", known: buildMissReasons, want: "cache_off"},
+		{name: "miss reason", value: "no_result", known: buildMissReasons, want: "no_result"},
+		{name: "cache_off is not a miss reason", value: "cache_off", known: buildMissReasons, want: "other"},
+		{name: "not looked up reason", value: "cache_off", known: buildNotLookedUpReasons, want: "cache_off"},
 		{name: "miss reason is case sensitive", value: "Mismatch", known: buildMissReasons, want: "other"},
 		{name: "reject reason", value: "apply_failed", known: buildRejectReasons, want: "apply_failed"},
 		{name: "no_result is not a reject reason", value: "no_result", known: buildRejectReasons, want: "other"},
@@ -291,8 +330,8 @@ func TestBuildLabelsMatchProducers(t *testing.T) {
 	} {
 		require.Contains(t, buildRunTypes, string(rt))
 	}
+	require.Contains(t, buildNotLookedUpReasons, binding.CacheReasonOff)
 	for _, r := range []string{
-		binding.CacheReasonOff,
 		binding.CacheReasonNoResult,
 		binding.CacheReasonSkipped,
 		binding.CacheReasonMismatch,

@@ -246,6 +246,7 @@ type CacheMan struct {
 
 	buildStepsTotal                metrics.Counter
 	buildMissReasonsTotal          metrics.Counter
+	buildNotLookedUpTotal          metrics.Counter
 	buildRejectedResponsesTotal    metrics.Counter
 	buildStepRunSecondsTotal       metrics.Counter
 	buildCacheSavedCPUSecondsTotal metrics.Counter
@@ -350,6 +351,11 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 			"Total number of build steps executed because the cache had no usable response, by reason.",
 			[]string{"build_goal", "status", "android_target", "reason"},
 		),
+		buildNotLookedUpTotal: provider.NewCounter(
+			"abfs_build_steps_not_looked_up_total",
+			"Total number of build steps executed without a cache lookup, by reason.",
+			[]string{"build_goal", "status", "android_target", "reason"},
+		),
 		buildRejectedResponsesTotal: provider.NewCounter(
 			"abfs_build_cache_rejected_responses_total",
 			"Total number of cached responses that builds did not use, by reason.",
@@ -357,7 +363,7 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 		),
 		buildStepRunSecondsTotal: provider.NewCounter(
 			"abfs_build_step_run_seconds_total",
-			"Total run time of build steps: source=cache is the time measured by the builds that produced the cached steps, source=executed is the time of the steps executed.",
+			"Total run time of build steps: source=cache is the time measured by the builds that produced the cached steps, source=executed is the time of the steps executed after a cache miss, source=not_looked_up is the time of the steps executed without a cache lookup.",
 			[]string{"build_goal", "status", "android_target", "source"},
 		),
 		buildCacheSavedCPUSecondsTotal: provider.NewCounter(
