@@ -25,6 +25,9 @@ import (
 )
 
 func TestMissReason(t *testing.T) {
+	g := loadTestGraph(t, testNinjaFile(phonyOutputBuild("qssi_violators", "src/rules.txt")), "qssi_violators")
+	phonyOutputStep := loadedStep(g, "qssi_violators")
+
 	tests := []struct {
 		name        string
 		cacheOff    bool
@@ -34,6 +37,7 @@ func TestMissReason(t *testing.T) {
 	}{
 		{name: "no response", want: binding.CacheReasonNoResult},
 		{name: "cache off", cacheOff: true, eval: Eval{mismatched: 1}, want: binding.CacheReasonOff, notLookedUp: true},
+		{name: "phony_output with cache off", cacheOff: true, eval: Eval{step: phonyOutputStep}, want: binding.CacheReasonPhonyOutput, notLookedUp: true},
 		{name: "skipped", eval: Eval{skipped: 2}, want: binding.CacheReasonSkipped},
 		{name: "mismatch", eval: Eval{mismatched: 1}, want: binding.CacheReasonMismatch},
 		{name: "apply failed", eval: Eval{applyFailed: 1}, want: binding.CacheReasonApplyFailed},

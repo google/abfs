@@ -144,9 +144,9 @@ func (countClient) ApplyPatch(entities.Patch, entities.Patch, entities.DeletePat
 
 // countBackend runs the real ABFSBackend under the real engine with a fake cache store:
 // out/a, out/b and out/result hit at the first check, out/d goes through the real cache
-// check, finds no response there and hits at the delayed recheck in eval, and out/e finds
-// no response. With the cache off no step is looked up. A dry run uses the real
-// ApplyIfCached and ExecLocal.
+// check, finds no response there and hits at the delayed recheck in eval, out/e finds no
+// response, and out/p goes through the real cache check. With the cache off no step is
+// looked up. A dry run uses the real ApplyIfCached and ExecLocal.
 type countBackend struct {
 	*ABFSBackend
 	t     *testing.T
@@ -163,7 +163,7 @@ func (b countBackend) ApplyIfCached(step *build.Step) (bool, error) {
 		return b.ABFSBackend.ApplyIfCached(step)
 	}
 	switch target := step.Node.Targets[0]; {
-	case target == "out/d":
+	case target == "out/d", target == "out/p":
 		return b.ABFSBackend.ApplyIfCached(step)
 	case b.config.EvalNoCache, target == "out/e":
 		b.evals.Put(step.Node, &Eval{step: step, req: &binding.EvalRequest{}, triedResps: map[entities.Hash]struct{}{}})
@@ -231,47 +231,94 @@ func TestFinalizeBuild_CacheCounts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			g := loadCountGraph(t)
-			t.Chdir(t.TempDir())
-
-			store := &countStore{results: map[entities.Hash][]entities.Hash{}, objects: map[entities.Hash][]byte{}}
-			c := NewABFSBackend()
-			c.abfs = countClient{store: store}
-			c.config = &Configuration{EvalNoCache: tt.cacheOff}
-			c.dryRun = tt.dryRun
-			c.graph = g
-			c.matchFiles = newMatchFiles("out")
-			c.startHashFetchers()
-			require.NoError(t, c.collectInitialHashes())
-			c.logFile = ninjalog.New(".ninja_log")
-			require.NoError(t, c.logFile.OpenForWrite())
-			log := &warnLog{}
-			c.log = log
-			c.startTime = time.Now()
-
-			params := ninjaruntime.NewRunParams()
-			params.CliFlags = &ninjaruntime.CliFlags{ConcurrencyLevel: 2, DryRun: tt.dryRun}
-			params.Log = log
-			params.CleanInspectorsCount, params.CacheCheckersCount, params.RemoteExecutorsCount = 2, 2, 1
-			ctx := context.WithValue(context.Background(), ninjaruntime.RunParamsKey, params)
-			ctx = context.WithValue(ctx, ninjaruntime.BackendKey, build.BuildBackend(countBackend{ABFSBackend: c, t: t, store: store}))
-			require.NoError(t, build.NewEngine(ctx, g).Build(ctx))
-
-			var line string
-			for _, w := range log.warns {
-				if strings.HasPrefix(w, "Evaluation took ") {
-					line = w
-				}
-			}
+			line, s := runCountBuild(t, loadCountGraph(t), tt.cacheOff, tt.dryRun)
 			require.True(t, strings.HasSuffix(line, ", fail: 0, "+tt.wantLine), line)
-
-			b, err := os.ReadFile(".ninja_stats.0")
-			require.NoError(t, err)
-			var s binding.NinjaStats
-			require.NoError(t, json.Unmarshal(b, &s))
 			require.Equal(t, tt.wantHits, s.CacheHitCount)
 			require.Equal(t, tt.wantMisses, s.CacheMissCount)
 			require.InDelta(t, tt.wantPercent, s.CacheHitPercent, 1e-9)
+			require.Equal(t, tt.wantSteps, s.Steps)
+		})
+	}
+}
+
+// runCountBuild builds g with countBackend and returns the "Evaluation took" line and the
+// ninja stats file.
+func runCountBuild(t *testing.T, g *graph.Graph, cacheOff, dryRun bool) (string, *binding.NinjaStats) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+
+	store := &countStore{results: map[entities.Hash][]entities.Hash{}, objects: map[entities.Hash][]byte{}}
+	c := NewABFSBackend()
+	c.abfs = countClient{store: store}
+	c.config = &Configuration{EvalNoCache: cacheOff}
+	c.dryRun = dryRun
+	c.graph = g
+	c.matchFiles = newMatchFiles("out")
+	c.startHashFetchers()
+	require.NoError(t, c.collectInitialHashes())
+	c.logFile = ninjalog.New(".ninja_log")
+	require.NoError(t, c.logFile.OpenForWrite())
+	log := &warnLog{}
+	c.log = log
+	c.startTime = time.Now()
+
+	params := ninjaruntime.NewRunParams()
+	params.CliFlags = &ninjaruntime.CliFlags{ConcurrencyLevel: 2, DryRun: dryRun}
+	params.Log = log
+	params.CleanInspectorsCount, params.CacheCheckersCount, params.RemoteExecutorsCount = 2, 2, 1
+	ctx := context.WithValue(context.Background(), ninjaruntime.RunParamsKey, params)
+	ctx = context.WithValue(ctx, ninjaruntime.BackendKey, build.BuildBackend(countBackend{ABFSBackend: c, t: t, store: store}))
+	require.NoError(t, build.NewEngine(ctx, g).Build(ctx))
+
+	var line string
+	for _, w := range log.warns {
+		if strings.HasPrefix(w, "Evaluation took ") {
+			line = w
+		}
+	}
+
+	b, err := os.ReadFile(".ninja_stats.0")
+	require.NoError(t, err)
+	var s binding.NinjaStats
+	require.NoError(t, json.Unmarshal(b, &s))
+	return line, &s
+}
+
+func TestFinalizeBuild_PhonyOutputCounts(t *testing.T) {
+	tests := []struct {
+		name      string
+		cacheOff  bool
+		wantLine  string
+		wantSteps *binding.StepStats
+	}{
+		{
+			name:     "cache on",
+			wantLine: "cache: hits: 2, misses: 0, ratio: 100.000, not looked up: 1",
+			wantSteps: &binding.StepStats{
+				RunTypes:    map[string]uint32{"cached": 2, "local": 1},
+				NotLookedUp: map[string]uint32{binding.CacheReasonPhonyOutput: 1},
+			},
+		},
+		{
+			name:     "cache off",
+			cacheOff: true,
+			wantLine: "cache: hits: 0, misses: 0, ratio: 0.000, not looked up: 3",
+			wantSteps: &binding.StepStats{
+				RunTypes:    map[string]uint32{"local": 3},
+				NotLookedUp: map[string]uint32{binding.CacheReasonOff: 2, binding.CacheReasonPhonyOutput: 1},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// out/p declares phony_output, as kati writes a .PHONY target with a recipe, and
+			// out/a and out/result hit.
+			g := loadTestGraph(t, testNinjaFile(
+				&ninja.Build{Outputs: []string{"out/a"}, RuleName: "touch"},
+				&ninja.Build{Outputs: []string{"out/p"}, RuleName: "touch", KeyValues: []*ninja.KeyValue{{Key: "phony_output", Value: "true"}}},
+				resultBuild([]string{"out/a", "out/p"}, nil)), "out/result")
+			line, s := runCountBuild(t, g, tt.cacheOff, false)
+			require.True(t, strings.HasSuffix(line, ", fail: 0, "+tt.wantLine), line)
 			require.Equal(t, tt.wantSteps, s.Steps)
 		})
 	}

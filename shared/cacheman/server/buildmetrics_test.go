@@ -331,6 +331,7 @@ func TestBuildLabelsMatchProducers(t *testing.T) {
 		require.Contains(t, buildRunTypes, string(rt))
 	}
 	require.Contains(t, buildNotLookedUpReasons, binding.CacheReasonOff)
+	require.Contains(t, buildNotLookedUpReasons, binding.CacheReasonPhonyOutput)
 	for _, r := range []string{
 		binding.CacheReasonNoResult,
 		binding.CacheReasonSkipped,

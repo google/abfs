@@ -91,10 +91,12 @@ func (s *stepCounter) snapshot() *binding.StepStats {
 }
 
 // missReason tells why a step is executed instead of taken from the cache, and whether
-// the step was looked up. A mismatch outranks an apply failure, which outranks a skipped
-// response.
+// the step was looked up. A phony_output step is never looked up, even with the cache on, so
+// it ranks first. A mismatch outranks an apply failure, which outranks a skipped response.
 func missReason(cacheOff bool, eval *Eval) (reason string, lookedUp bool) {
 	switch {
+	case eval.step != nil && eval.step.IsPhonyOutput():
+		return binding.CacheReasonPhonyOutput, false
 	case cacheOff:
 		return binding.CacheReasonOff, false
 	case eval.mismatched > 0:

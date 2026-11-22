@@ -46,6 +46,7 @@ var buildMissReasons = []string{
 // are reported by name in the reason label.
 var buildNotLookedUpReasons = []string{
 	"cache_off",
+	"phony_output",
 }
 
 // buildRejectReasons are the reasons a cached response was not used that are reported by

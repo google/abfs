@@ -19,6 +19,9 @@ package binding
 const (
 	// CacheReasonOff means the cache lookup is turned off, so the step was not looked up.
 	CacheReasonOff = "cache_off"
+	// CacheReasonPhonyOutput means the step declares phony_output, so it runs on every
+	// build and is never looked up.
+	CacheReasonPhonyOutput = "phony_output"
 	// CacheReasonNoResult means the cache held no response for the step's request.
 	CacheReasonNoResult = "no_result"
 	// CacheReasonSkipped means a cached response does not write the step's targets.
