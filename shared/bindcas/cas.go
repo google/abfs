@@ -16,12 +16,19 @@ package bindcas
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path"
+	"syscall"
 
 	"github.com/google/abfs/shared/entities"
 )
 
-const GitDirName = ".git"
+const (
+	GitDirName = ".git"
+	// NodeTypeCommit is the casfs type of a submodule entry (gitlink).
+	NodeTypeCommit = "commit"
+)
 
 type Node interface {
 	Path() string
@@ -75,7 +82,55 @@ func (d *casfsDir) MkdirAll(ctx context.Context, name string) (Dir, error) {
 	return CreateDir(d.casfs, d, name), nil
 }
 func (d *casfsDir) DeepUpdate(ctx context.Context, deepTreeHash entities.Hash) error {
-	return d.casfs.SetDeepTree(d.Path(), deepTreeHash)
+	return SetWorkTreeDeepTree(d.casfs, d.Path(), deepTreeHash)
+}
+
+// SetWorkTreeDeepTree sets the deeptree of the work tree dir. casfs refuses a deeptree on a
+// submodule entry of the tree around dir; that entry is replaced first (see
+// ReplaceSubmoduleEntry).
+func SetWorkTreeDeepTree(casfs CASFS, dir string, deepTreeHash entities.Hash) error {
+	err := casfs.SetDeepTree(dir, deepTreeHash)
+	if !errors.Is(err, syscall.EOPNOTSUPP) {
+		return err
+	}
+	replaced, replaceErr := ReplaceSubmoduleEntry(casfs, dir)
+	if replaceErr != nil {
+		return fmt.Errorf("failed to replace %s, which takes no deeptree: %w", dir, replaceErr)
+	}
+	if !replaced {
+		return err
+	}
+	return casfs.SetDeepTree(dir, deepTreeHash)
+}
+
+// ReplaceSubmoduleEntry replaces dir with a plain directory that keeps its exclusion when casfs
+// shows it as a submodule entry, an empty directory of type commit that takes no deeptree. git
+// checks a repository out into a submodule entry the same way. Any other node is left alone. It
+// reports whether dir was replaced.
+func ReplaceSubmoduleEntry(casfs CASFS, dir string) (bool, error) {
+	nodeType, err := casfs.NodeType(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to read the node type of %s: %w", dir, err)
+	}
+	if nodeType != NodeTypeCommit {
+		return false, nil
+	}
+	excluded, err := casfs.Excluded(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to read the exclusion of %s: %w", dir, err)
+	}
+	if err := casfs.Remove(dir); err != nil {
+		return false, fmt.Errorf("failed to remove the submodule entry %s: %w", dir, err)
+	}
+	if err := casfs.Mkdir(dir, 0755); err != nil {
+		return false, fmt.Errorf("failed to create directory %s, the submodule entry there is removed: %w", dir, err)
+	}
+	if excluded {
+		if err := casfs.SetExcluded(dir, true); err != nil {
+			return false, fmt.Errorf("failed to exclude %s, the directory is created without its exclusion: %w", dir, err)
+		}
+	}
+	return true, nil
 }
 func (d *casfsDir) Symlink(ctx context.Context, name, target string) (Node, error) {
 	err := d.casfs.Symlink(target, path.Join(d.Path(), name))

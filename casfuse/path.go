@@ -370,6 +370,11 @@ func (f *fsapi) SetExcluded(path string, val bool) error {
 	return f.api.SetExcluded(inode, val)
 }
 
+// NodeType returns no type, as the casfuse type xattr does.
+func (f *fsapi) NodeType(path string) (string, error) {
+	return "", nil
+}
+
 // Hash calculate (if dirty) and return the hash of the path.
 func (f *fsapi) Hash(path string) (hash.Hash, error) {
 	inode, err := f.resolve(path)

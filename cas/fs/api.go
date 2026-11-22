@@ -61,6 +61,8 @@ type FS interface {
 	Excluded(path string) (bool, error)
 	// SetExcluded change the excluded attribute of the path, marking the parent as dirty.
 	SetExcluded(path string, val bool) error
+	// NodeType returns the casfs type of the node at path, as "dir" or "commit".
+	NodeType(path string) (string, error)
 	// Hash calculate (if dirty) and return the hash of the path.
 	Hash(path string) (Hash, error)
 	// SetHash set the hash of the path, only valid if the path is not yet loaded.

@@ -431,13 +431,7 @@ func (c *GitCheckout) applyTreeToWorkdir(ctx context.Context, treeHash entities.
 		if err != nil {
 			return err
 		}
-		var overwrites []string
-		for _, d := range workDiff {
-			if _, found := newMap[d.Path]; found {
-				overwrites = append(overwrites, d.Path)
-			}
-		}
-		if len(overwrites) > 0 {
+		if overwrites := overwrittenPaths(c.workDir, workDiff, newMap); len(overwrites) > 0 {
 			msg := "error: Your local changes to the following files would be overwritten by checkout:\n\t"
 			msg += strings.Join(overwrites, "\n\t")
 			msg += "\nPlease move or remove them before you switch branches.\nAborting"
@@ -762,4 +756,31 @@ func pathPatternMatches(p string, pat pathPattern) bool {
 		return true
 	}
 	return false
+}
+
+// overwrittenPaths returns the paths with local changes in workDiff that the checkout of
+// newMap would overwrite. git keeps what is checked out at a submodule entry that the new tree
+// moves or drops. When the new tree puts a file or a directory there, a checkout in the way
+// stops the switch, where git would delete it or merge into it.
+func overwrittenPaths(workDir string, workDiff []dirsync.DiffAction, newMap map[string]*dirsync.DiffAction) []string {
+	var overwrites []string
+	for _, d := range workDiff {
+		nd, found := newMap[d.Path]
+		if !found {
+			continue
+		}
+		if d.ModeA == entities.FileModeSubmodule && (d.HashB.IsZero() || d.ModeB.IsDir()) {
+			if nd.HashB.IsZero() || nd.ModeB == entities.FileModeSubmodule || !hasEntries(filepath.Join(workDir, d.Path)) {
+				continue
+			}
+		}
+		overwrites = append(overwrites, d.Path)
+	}
+	return overwrites
+}
+
+// hasEntries reports whether dir is a directory that holds at least one entry.
+func hasEntries(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
 }

@@ -47,6 +47,7 @@ const (
 	loadedAttrName      = "casfs.loaded"
 	excludeAttrName     = "casfs.exclude"
 	fsStatusAttrName    = "casfs.fs_status"
+	typeAttrName        = "casfs.type"
 
 	// The standard Git config we extracted from the kernel
 	gitConfigString = `[core]
@@ -302,6 +303,9 @@ func (xfs *xattrFs) SetExcluded(path string, val bool) error {
 	return xfs.writeBool(path, excludeAttrName, val)
 }
 
+func (xfs *xattrFs) NodeType(path string) (string, error) {
+	return xfs.readString(path, typeAttrName)
+}
 func (xfs *xattrFs) Hash(path string) (fs.Hash, error) {
 	return xfs.readHash(path, hashAttrName)
 }
