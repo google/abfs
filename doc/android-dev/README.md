@@ -84,6 +84,10 @@ mkdir $MOUNT
 abfs mount --ws dev --branch android-latest-release $MOUNT
 ```
 
+If your tree comes from a layered manifest (includes, include groups, `remove-project`,
+`extend-project`) or you add local manifests, see
+[Layered manifests](../sysadmin/MANIFESTS.md).
+
 ### Build
 
 Replace the below commands with your desired `lunch` target and build goal.

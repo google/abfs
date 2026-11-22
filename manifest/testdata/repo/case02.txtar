@@ -1,0 +1,44 @@
+Expected projects from git-repo v2.72 (3656290): repo init -u <manifest repository of
+these files> -b main -m default.xml -g all, then repo manifest -o -, with the omitted values
+filled back in (path: the name; revision: the remote's, else the default's; remote, upstream
+and dest-branch: the default's). Groups leave out all, name: and path:. Columns: path, name,
+revision, remote, groups, upstream, dest-branch. want-error holds the start of repo's error.
+-- default.xml --
+<manifest>
+  <remote name="aosp" fetch=".." />
+  <remote name="partner" fetch="https://partner.example.com" revision="partner-rev" />
+  <remote name="other" fetch="https://other.example.com" revision="other-rev" />
+  <default remote="aosp" revision="main" upstream="main-up" />
+  <project name="platform/example/p3" path="ex/p3" revision="rev-b" remote="other" />
+  <include name="inc1.xml" groups="x y" />
+  <project name="platform/example/p5" path="ex/p5" revision="rev-a" />
+  <project name="platform/example/multi" path="ex/multi0" revision="rev-a" remote="partner" />
+</manifest>
+-- inc1.xml --
+<manifest>
+  <project name="platform/example/p2" path="ex/p2" groups="pdk" />
+  <project name="platform/example/multi" path="ex/multi2" revision="rev-a" remote="other" />
+  <include name="inc2.xml" />
+</manifest>
+-- inc2.xml --
+<manifest>
+  <project name="platform/example/p0" path="ex/p0" remote="partner" />
+  <project name="platform/example/p1" path="ex/p1" revision="rev-a" />
+  <include name="inc3.xml" />
+  <project name="platform/example/p4" path="ex/p4" remote="other" groups="notdefault" />
+  <project name="platform/example/multi" path="ex/multi1" groups="a,b" />
+  <remove-project path="ex/p0" />
+</manifest>
+-- inc3.xml --
+<manifest>
+
+</manifest>
+-- want --
+ex/multi0	platform/example/multi	rev-a	partner		main-up	
+ex/multi1	platform/example/multi	main	aosp	a,b,x,y	main-up	
+ex/multi2	platform/example/multi	rev-a	other	x,y	main-up	
+ex/p1	platform/example/p1	rev-a	aosp	x,y	main-up	
+ex/p2	platform/example/p2	main	aosp	pdk,x,y	main-up	
+ex/p3	platform/example/p3	rev-b	other		main-up	
+ex/p4	platform/example/p4	other-rev	other	notdefault,x,y	main-up	
+ex/p5	platform/example/p5	rev-a	aosp		main-up	
