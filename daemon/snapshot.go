@@ -313,7 +313,7 @@ func (c *SnapshotService) syncWorkDir(ctx context.Context, dir string, deepTree 
 		return err
 	}
 	if hash == entities.EmptyDirHash {
-		return c.casfs.SetDeepTree(dir, deepTree.Hash)
+		return bindcas.SetWorkTreeDeepTree(c.casfs, dir, deepTree.Hash)
 	}
 	return c.syncDir(ctx, dir, deepTree.Entries[0].Hash)
 }

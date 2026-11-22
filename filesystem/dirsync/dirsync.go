@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"syscall"
 
 	"golang.org/x/sync/errgroup"
 
@@ -119,6 +120,13 @@ func syncItem(ctx context.Context, store entities.CASStore, dir string, action D
 }
 
 func removeLocal(path string, mode entities.FileMode) error {
+	if mode == entities.FileModeSubmodule {
+		// git keeps a repository checked out at a submodule entry.
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+		return nil
+	}
 	if mode.IsDir() {
 		if err := os.RemoveAll(path); err != nil {
 			return err
@@ -148,6 +156,9 @@ func addEntry(ctx context.Context, casStore entities.CASStore, path string, hash
 
 	case entities.FileModeSubmodule:
 		if err := os.Mkdir(path, 0755); err != nil {
+			if info, statErr := os.Lstat(path); statErr == nil && info.IsDir() {
+				return nil
+			}
 			return err
 		}
 		return nil

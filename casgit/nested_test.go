@@ -22,11 +22,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/cas/fs/gitindex"
+	"github.com/google/abfs/filesystem/dirsync"
 	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/entities"
 )
@@ -120,7 +122,9 @@ type fakeTree struct {
 	name  string
 	sha   entities.Hash
 	files []string
-	dirs  []*fakeTree
+	// submodules are the names of submodule entries (gitlinks).
+	submodules []string
+	dirs       []*fakeTree
 }
 
 func (f *fakeTree) Name() string  { return f.name }
@@ -130,6 +134,9 @@ func (f *fakeTree) Files(ctx context.Context) ([]gitindex.FileEntry, error) {
 	var files []gitindex.FileEntry
 	for _, name := range f.files {
 		files = append(files, gitindex.FileEntry{Name: name})
+	}
+	for _, name := range f.submodules {
+		files = append(files, gitindex.FileEntry{Name: name, Mode: uint32(entities.FileModeSubmodule)})
 	}
 	return files, nil
 }
@@ -213,6 +220,17 @@ func TestClearTreePaths_KeepsRepositories(t *testing.T) {
 			files: []string{"apps/a/b/file.txt", "other/file.txt"},
 			tree:  &fakeTree{files: []string{"apps"}},
 			want:  []string{".", "other", "other/file.txt"},
+		},
+		{
+			name:  "repository at a submodule entry",
+			files: []string{"inner/.git/HEAD", "inner/inner.txt", "inner/work.txt"},
+			tree:  &fakeTree{submodules: []string{"inner"}},
+		},
+		{
+			name:  "repository at a submodule entry below a subtree",
+			files: []string{"sub/inner/.git/HEAD", "sub/inner/work.txt", "sub/old.txt"},
+			tree:  &fakeTree{dirs: []*fakeTree{{name: "sub", files: []string{"old.txt"}, submodules: []string{"inner"}}}},
+			want:  []string{".", "sub", "sub/inner", "sub/inner/.git", "sub/inner/.git/HEAD", "sub/inner/work.txt"},
 		},
 	}
 	for _, tt := range tests {
@@ -318,6 +336,72 @@ func TestGitClone_SetWorkTree(t *testing.T) {
 			require.NoError(t, c.setWorkTree(context.Background(), &fakeTree{files: []string{"version.txt"}}, entities.Hash{}))
 			require.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// submoduleEntryFS shows the paths in commits as submodule entries, which take no deeptree. A
+// removed node loses its exclusion.
+type submoduleEntryFS struct {
+	deepTreeFS
+	commits  map[string]bool
+	excluded map[string]bool
+}
+
+func (f *submoduleEntryFS) NodeType(path string) (string, error) {
+	if f.commits[path] {
+		return bindcas.NodeTypeCommit, nil
+	}
+	return "dir", nil
+}
+
+func (f *submoduleEntryFS) Excluded(path string) (bool, error) {
+	return f.excluded[path], nil
+}
+
+func (f *submoduleEntryFS) SetExcluded(path string, val bool) error {
+	f.excluded[path] = val
+	return nil
+}
+
+func (f *submoduleEntryFS) Remove(path string) error {
+	delete(f.commits, path)
+	delete(f.excluded, path)
+	return os.Remove(path)
+}
+
+func (f *submoduleEntryFS) Mkdir(name string, m entities.FileMode) error {
+	return os.Mkdir(name, os.FileMode(m))
+}
+
+func (f *submoduleEntryFS) SetDeepTree(path string, h entities.Hash) error {
+	if f.commits[path] {
+		return syscall.EOPNOTSUPP
+	}
+	return f.deepTreeFS.SetDeepTree(path, h)
+}
+
+// A clone into a submodule entry of the work tree around it replaces the entry, keeps its
+// exclusion and sets the deeptree, nested or not.
+func TestGitClone_SetWorkTreeAtSubmoduleEntry(t *testing.T) {
+	for _, nested := range []bool{true, false} {
+		for _, excluded := range []bool{true, false} {
+			t.Run(fmt.Sprintf("nested=%v/excluded=%v", nested, excluded), func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "inner")
+				require.NoError(t, os.Mkdir(dir, 0755))
+				var deepTrees []string
+				casfs := &submoduleEntryFS{
+					deepTreeFS: deepTreeFS{setDeepTree: func(path string) { deepTrees = append(deepTrees, path) }},
+					commits:    map[string]bool{dir: true},
+					excluded:   map[string]bool{dir: excluded},
+				}
+				c := &GitClone{GitRepo: &GitRepo{casgit: NewWithCASFS(&emptyRefsStore{}, casfs)}, CloneOptions: CloneOptions{Directory: dir, Nested: nested}}
+
+				require.NoError(t, c.setWorkTree(context.Background(), &fakeTree{files: []string{"inner.txt"}}, entities.Hash{}))
+				require.Equal(t, []string{dir}, deepTrees)
+				require.Empty(t, casfs.commits)
+				require.Equal(t, excluded, casfs.excluded[dir])
+			})
+		}
 	}
 }
 
@@ -452,4 +536,123 @@ func TestGitClone_SetWorkTreeAroundRepository(t *testing.T) {
 		gotSizes[rel] = size
 	}
 	require.Equal(t, wantSizes, gotSizes)
+}
+
+// checkoutStore serves trees and commits by hash.
+type checkoutStore struct {
+	treeStore
+	commits map[entities.Hash]entities.Hash
+}
+
+func (s *checkoutStore) GetObject(ctx context.Context, key entities.Hash) ([]byte, error) {
+	tree, ok := s.commits[key]
+	if !ok {
+		return nil, entities.NotExistErrf("no commit %s", key)
+	}
+	body := fmt.Sprintf("tree %s\nauthor A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\n\ncommit\n", tree)
+	return fmt.Appendf(nil, "commit %d\x00%s", len(body), body), nil
+}
+
+// workHashFS reports a fixed hash for the work tree.
+type workHashFS struct {
+	dirFS
+	hash entities.Hash
+}
+
+func (f *workHashFS) Hash(path string) (entities.Hash, error) {
+	return f.hash, nil
+}
+
+// A checkout that moves a submodule entry keeps the project checked out there, whose directory
+// is not in the hash of the work tree, as git does. A local change to a file the checkout moves
+// still stops it.
+func TestGitCheckout_SubmoduleEntry(t *testing.T) {
+	h := func(b byte) entities.Hash { return entities.Hash{b} }
+	gitlink := func(c byte) entities.FileEntry {
+		return entities.FileEntry{Name: "inner", Mode: entities.FileModeSubmodule, Hash: h(c)}
+	}
+	file := func(c byte) entities.FileEntry {
+		return entities.FileEntry{Name: "a.txt", Mode: entities.FileModeRegular, Hash: h(c)}
+	}
+	tests := []struct {
+		name    string
+		work    []entities.FileEntry
+		target  []entities.FileEntry
+		wantErr string
+	}{
+		{name: "submodule entry moved", work: []entities.FileEntry{file(1)}, target: []entities.FileEntry{file(1), gitlink(3)}},
+		{name: "local change overwritten", work: []entities.FileEntry{file(2)}, target: []entities.FileEntry{file(4), gitlink(3)}, wantErr: "a.txt"},
+		{name: "submodule entry replaced by a file", work: []entities.FileEntry{file(1)}, target: []entities.FileEntry{file(1), {Name: "inner", Mode: entities.FileModeRegular, Hash: h(3)}}, wantErr: "\tinner"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			inner := filepath.Join(dir, "inner")
+			require.NoError(t, os.Mkdir(inner, 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(inner, "inner.txt"), nil, 0644))
+			store := &checkoutStore{
+				treeStore: treeStore{trees: map[entities.Hash][]entities.FileEntry{
+					h(10): {file(1), gitlink(2)},
+					h(11): tt.work,
+					h(12): tt.target,
+				}},
+				commits: map[entities.Hash]entities.Hash{h(20): h(10)},
+			}
+			repo := &GitRepo{casgit: NewWithCASFS(store, &workHashFS{hash: h(11)}), workDir: dir, headHash: h(20)}
+			c := &GitCheckout{GitRepo: repo}
+
+			err := c.applyTreeToWorkdir(context.Background(), h(12))
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				if tt.wantErr != "\tinner" {
+					require.NotContains(t, err.Error(), "inner")
+				}
+				require.FileExists(t, filepath.Join(inner, "inner.txt"))
+				return
+			}
+			require.NoError(t, err)
+			require.FileExists(t, filepath.Join(inner, "inner.txt"))
+		})
+	}
+}
+
+// A checkout keeps the overwrite check for a submodule entry only when a checkout sits there and
+// the new tree puts a file or a directory in its place.
+func TestOverwrittenPaths_SubmoduleEntry(t *testing.T) {
+	h := func(b byte) entities.Hash { return entities.Hash{b} }
+	// The checked-out directory is excluded, so the work tree diff shows the entry as gone.
+	work := []dirsync.DiffAction{{Path: "inner", HashA: h(1), ModeA: entities.FileModeSubmodule}}
+	tests := []struct {
+		name      string
+		onDisk    string
+		target    *dirsync.DiffAction
+		wantPaths []string
+	}{
+		{name: "moved", onDisk: "checkout", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeSubmodule}},
+		{name: "dropped", onDisk: "checkout", target: &dirsync.DiffAction{ModeA: entities.FileModeSubmodule}},
+		{name: "unchanged", onDisk: "checkout"},
+		{name: "file over a checkout", onDisk: "checkout", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeRegular}, wantPaths: []string{"inner"}},
+		{name: "directory over a checkout", onDisk: "checkout", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeDir}, wantPaths: []string{"inner"}},
+		{name: "symlink over a checkout", onDisk: "checkout", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeSymlink}, wantPaths: []string{"inner"}},
+		{name: "file over an empty entry", onDisk: "empty", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeRegular}},
+		{name: "file over an absent entry", onDisk: "absent", target: &dirsync.DiffAction{HashB: h(2), ModeB: entities.FileModeRegular}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			switch tt.onDisk {
+			case "checkout":
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "inner"), 0755))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "inner", "inner.txt"), nil, 0644))
+			case "empty":
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "inner"), 0755))
+			}
+			newMap := map[string]*dirsync.DiffAction{}
+			if tt.target != nil {
+				tt.target.Path = "inner"
+				newMap["inner"] = tt.target
+			}
+			require.Equal(t, tt.wantPaths, overwrittenPaths(dir, work, newMap))
+		})
+	}
 }

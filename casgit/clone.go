@@ -31,6 +31,7 @@ import (
 	"github.com/google/abfs/cas/fs/gitindex"
 	"github.com/google/abfs/filesystem/dirsync"
 	"github.com/google/abfs/maps"
+	"github.com/google/abfs/shared/bindcas"
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/objects/gitobjects"
@@ -317,7 +318,7 @@ func (c *GitClone) setWorkTree(ctx context.Context, tree gitindex.TreeDirectory,
 			return dirsync.DirSyncDiff(ctx, c.casgit.store, c.Directory, missing)
 		}
 	}
-	return c.casgit.casfs.SetDeepTree(c.Directory, deepTree)
+	return bindcas.SetWorkTreeDeepTree(c.casgit.casfs, c.Directory, deepTree)
 }
 
 // missingTreeEntries returns, as actions that add them, the entries of the tree that are missing
@@ -386,6 +387,10 @@ func clearTreePaths(ctx context.Context, dir string, tree gitindex.TreeDirectory
 	}
 	inTree := make(map[string]gitindex.TreeDirectory, len(files)+len(subtrees))
 	for _, f := range files {
+		if f.Mode == uint32(entities.FileModeSubmodule) {
+			// git keeps what is checked out at a submodule entry.
+			continue
+		}
 		inTree[f.Name] = nil
 	}
 	for _, s := range subtrees {

@@ -485,6 +485,11 @@ func SetupEmptyGitRepos(casfs bindcas.CASFS, root, workDir, gitDir, objectsDir s
 	if err := os.MkdirAll(workDirAbs, 0755); err != nil {
 		return err
 	}
+	// A restored outer work tree can hold a submodule entry at workDir. It is replaced before the
+	// .git link goes into it, since only an empty one can be replaced when the deeptree is set.
+	if _, err := bindcas.ReplaceSubmoduleEntry(casfs, workDirAbs); err != nil {
+		return err
+	}
 	if err := casfs.SetExcluded(workDirAbs, true); err != nil {
 		return err
 	}

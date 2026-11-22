@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/shared/bindcas"
+	"github.com/google/abfs/shared/entities"
 )
 
 // objectsFS creates git objects dirs as casfs does: an existing name fails with EEXIST. With
@@ -57,6 +58,10 @@ func (f *objectsFS) CreateGitObjects(path, directory string) error {
 
 func (f *objectsFS) SetExcluded(path string, val bool) error {
 	return nil
+}
+
+func (f *objectsFS) NodeType(path string) (string, error) {
+	return "dir", nil
 }
 
 func TestSetupEmptyGitRepos_SharedObjectsDir(t *testing.T) {
@@ -112,4 +117,75 @@ func TestSetupEmptyGitRepos_SharedObjectsDir(t *testing.T) {
 			require.Equal(t, tt.wantCalls, casfs.calls)
 		})
 	}
+}
+
+// submoduleFS keeps nodes on the local disk and answers for them as casfs does: the paths in
+// commits are submodule entries, which take entries but no deeptree.
+type submoduleFS struct {
+	objectsFS
+	commits   map[string]bool
+	excluded  map[string]bool
+	deepTrees []string
+}
+
+func (f *submoduleFS) NodeType(path string) (string, error) {
+	if _, err := os.Lstat(path); err != nil {
+		return "", err
+	}
+	if f.commits[path] {
+		return bindcas.NodeTypeCommit, nil
+	}
+	return "dir", nil
+}
+
+func (f *submoduleFS) Excluded(path string) (bool, error) {
+	return f.excluded[path], nil
+}
+
+func (f *submoduleFS) SetExcluded(path string, val bool) error {
+	f.excluded[path] = val
+	return nil
+}
+
+func (f *submoduleFS) Remove(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	delete(f.commits, path)
+	return nil
+}
+
+func (f *submoduleFS) Mkdir(name string, m entities.FileMode) error {
+	return os.Mkdir(name, os.FileMode(m))
+}
+
+func (f *submoduleFS) SetDeepTree(path string, h entities.Hash) error {
+	if f.commits[path] {
+		return &xattr.Error{Op: "xattr.LSet", Path: path, Name: "casfs.deeptree", Err: syscall.EOPNOTSUPP}
+	}
+	f.deepTrees = append(f.deepTrees, path)
+	return nil
+}
+
+// A restore of an outer work tree saved with a submodule entry at the path of an inner project
+// leaves that entry there. Setting up the inner git dirs replaces it before the .git link goes
+// into it, so the deeptree of the inner work tree can be set afterwards.
+func TestSetupEmptyGitRepos_SubmoduleEntry(t *testing.T) {
+	const workDir = "sub/inner"
+	const gitDir = ".repo/projects/sub/inner.git"
+	const objects = ".repo/project-objects/test/inner.git/objects"
+	root := t.TempDir()
+	t.Chdir(root)
+	workDirAbs := filepath.Join(root, workDir)
+	require.NoError(t, os.MkdirAll(workDirAbs, 0755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(objects)), 0755))
+	casfs := &submoduleFS{commits: map[string]bool{workDirAbs: true}, excluded: map[string]bool{}}
+
+	require.NoError(t, SetupEmptyGitRepos(casfs, root, workDir, gitDir, objects))
+	require.NoError(t, bindcas.SetWorkTreeDeepTree(casfs, workDirAbs, entities.Hash{}))
+	require.Equal(t, []string{workDirAbs}, casfs.deepTrees)
+	require.True(t, casfs.excluded[workDirAbs])
+	target, err := os.Readlink(filepath.Join(workDirAbs, ".git"))
+	require.NoError(t, err)
+	require.Equal(t, "../../.repo/projects/sub/inner.git", target)
 }

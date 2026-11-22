@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/prometheus/procfs"
+
 	"github.com/google/abfs/cas/cas"
 	"github.com/google/abfs/cas/fs"
 	"github.com/google/abfs/cas/fs/gitindex"
@@ -30,7 +32,6 @@ import (
 	"github.com/google/abfs/cas/hash"
 	"github.com/google/abfs/cas/hash/hashers"
 	"github.com/google/abfs/cas/hash/hashers/sha1"
-	"github.com/prometheus/procfs"
 
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/entities"
@@ -61,6 +62,7 @@ type CASFS interface {
 	Loaded(path string) (bool, error)
 	Excluded(path string) (bool, error)
 	SetExcluded(path string, val bool) error
+	NodeType(path string) (string, error)
 	Hash(path string) (entities.Hash, error)
 	SetHash(path string, h entities.Hash) error
 	HashStat(path string) (*entities.HashStat, error)
@@ -166,6 +168,11 @@ func (c *casfs) Excluded(path string) (bool, error) {
 // SetExcluded change the excluded attribute of the path, marking the parent as dirty.
 func (c *casfs) SetExcluded(path string, val bool) error {
 	return c.casapi.SetExcluded(path, val)
+}
+
+// NodeType returns the casfs type of the node at path.
+func (c *casfs) NodeType(path string) (string, error) {
+	return c.casapi.NodeType(path)
 }
 
 // Hash calculate (if dirty) and return the hash of the path.

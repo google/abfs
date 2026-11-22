@@ -17,7 +17,9 @@ package dirsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -254,5 +256,81 @@ func TestDirSyncDiff_NestedDeletedDirsAndPreservedEmptyDirs(t *testing.T) {
 	// Verify intentionally empty directory a/empty_dir still exists on disk
 	if info, err := os.Stat(filepath.Join(workDir, "a", "empty_dir")); err != nil || !info.IsDir() {
 		t.Fatalf("expected intentionally empty directory a/empty_dir to be preserved, got err=%v", err)
+	}
+}
+
+// A sync that moves, adds or drops a submodule entry leaves a repository checked out there alone,
+// as git does, and creates or removes the empty directory of an entry with no checkout.
+func TestDirSyncDiff_SubmoduleEntry(t *testing.T) {
+	oldCommit := entities.NewHash("1111111111111111111111111111111111111111")
+	newCommit := entities.NewHash("2222222222222222222222222222222222222222")
+	moved := DiffAction{Path: "inner", HashA: oldCommit, ModeA: entities.FileModeSubmodule, HashB: newCommit, ModeB: entities.FileModeSubmodule}
+	added := DiffAction{Path: "inner", HashB: newCommit, ModeB: entities.FileModeSubmodule}
+	dropped := DiffAction{Path: "inner", HashA: oldCommit, ModeA: entities.FileModeSubmodule}
+	checkout := func(dir string) error {
+		if err := os.MkdirAll(filepath.Join(dir, "inner", ".git"), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, "inner", "inner.txt"), []byte("inner"), 0644)
+	}
+	emptyDir := func(dir string) error {
+		return os.Mkdir(filepath.Join(dir, "inner"), 0755)
+	}
+	symlinkToDir := func(dir string) error {
+		if err := os.Mkdir(filepath.Join(dir, "other"), 0755); err != nil {
+			return err
+		}
+		return os.Symlink("other", filepath.Join(dir, "inner"))
+	}
+	tests := []struct {
+		name   string
+		action DiffAction
+		setup  func(dir string) error
+		// want is what is at inner after the sync: "checkout", "empty", "symlink" or "".
+		want    string
+		wantErr error
+	}{
+		{name: "moved over a checkout", action: moved, setup: checkout, want: "checkout"},
+		{name: "added over a checkout", action: added, setup: checkout, want: "checkout"},
+		{name: "dropped over a checkout", action: dropped, setup: checkout, want: "checkout"},
+		{name: "moved with no directory", action: moved, want: "empty"},
+		{name: "added with no directory", action: added, want: "empty"},
+		{name: "dropped with an empty directory", action: dropped, setup: emptyDir},
+		{name: "dropped with no directory", action: dropped},
+		{name: "added over a symlink to a directory", action: added, setup: symlinkToDir, want: "symlink", wantErr: fs.ErrExist},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.setup != nil {
+				if err := tt.setup(dir); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := DirSyncDiff(context.Background(), nil, dir, []DiffAction{tt.action})
+			if tt.wantErr == nil && err != nil {
+				t.Fatalf("DirSyncDiff failed: %v", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("DirSyncDiff returned %v, want %v", err, tt.wantErr)
+			}
+
+			inner := filepath.Join(dir, "inner")
+			got := ""
+			if info, err := os.Lstat(inner); err == nil {
+				switch {
+				case info.Mode()&fs.ModeSymlink != 0:
+					got = "symlink"
+				case info.IsDir():
+					got = "empty"
+					if _, err := os.Stat(filepath.Join(inner, "inner.txt")); err == nil {
+						got = "checkout"
+					}
+				}
+			}
+			if got != tt.want {
+				t.Fatalf("inner is %q after the sync, want %q", got, tt.want)
+			}
+		})
 	}
 }

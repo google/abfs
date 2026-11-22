@@ -20,12 +20,16 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/binding"
+	"github.com/google/abfs/shared/bindcas"
+	"github.com/google/abfs/shared/entities"
+	"github.com/google/abfs/shared/objects/gitobjects"
 )
 
 // A saved workspace is restored in the order repo sync checks it out: a git repo whose work dir
@@ -144,4 +148,60 @@ func TestRestoreInLevels_SharedObjectsDir(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, restored, len(repos))
+}
+
+// submoduleEntryFS holds one empty node, a submodule entry until it is removed, which takes no
+// deeptree.
+type submoduleEntryFS struct {
+	bindcas.CASFS
+	commit    bool
+	removed   bool
+	deepTrees []string
+}
+
+func (f *submoduleEntryFS) Hash(path string) (entities.Hash, error) {
+	return entities.EmptyDirHash, nil
+}
+
+func (f *submoduleEntryFS) NodeType(path string) (string, error) {
+	if f.commit {
+		return bindcas.NodeTypeCommit, nil
+	}
+	return "dir", nil
+}
+
+func (f *submoduleEntryFS) Excluded(path string) (bool, error) {
+	return true, nil
+}
+
+func (f *submoduleEntryFS) SetExcluded(path string, val bool) error {
+	return nil
+}
+
+func (f *submoduleEntryFS) Remove(path string) error {
+	f.commit = false
+	f.removed = true
+	return nil
+}
+
+func (f *submoduleEntryFS) Mkdir(name string, m entities.FileMode) error {
+	return nil
+}
+
+func (f *submoduleEntryFS) SetDeepTree(path string, h entities.Hash) error {
+	if f.commit {
+		return syscall.EOPNOTSUPP
+	}
+	f.deepTrees = append(f.deepTrees, path)
+	return nil
+}
+
+// The restore of a work dir that is a submodule entry of the work tree around it replaces the
+// entry and sets the deeptree.
+func TestSyncWorkDir_SubmoduleEntry(t *testing.T) {
+	casfs := &submoduleEntryFS{commit: true}
+	c := &SnapshotService{casfs: casfs}
+	require.NoError(t, c.syncWorkDir(context.Background(), "sub/inner", &gitobjects.DeepTreeObject{}))
+	require.True(t, casfs.removed)
+	require.Equal(t, []string{"sub/inner"}, casfs.deepTrees)
 }
