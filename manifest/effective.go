@@ -81,7 +81,26 @@ func (m *Manifest) Effective() error {
 		ordered = append(ordered, ele)
 	}
 	m.Ordered = ordered
+	m.warnSyncSubmodules()
 	return nil
+}
+
+// warnSyncSubmodules reports the projects that ask repo to sync their submodules. ABFS does
+// not check submodules out, so each submodule entry stays an empty directory.
+func (m *Manifest) warnSyncSubmodules() {
+	syncDefault := m.Default != nil && xmlBool(m.Default.SyncS)
+	var names []string
+	for _, p := range m.Project {
+		if xmlBool(p.SyncS) || (p.SyncS == "" && syncDefault) {
+			names = append(names, p.Name)
+		}
+	}
+	switch {
+	case len(names) == 1:
+		m.warnings = append(m.warnings, fmt.Sprintf(`<project name=%q>: sync-s="true" is not applied: submodules are not checked out`, names[0]))
+	case len(names) > 1:
+		m.warnings = append(m.warnings, fmt.Sprintf(`<project>: sync-s="true" on %d elements is not applied: submodules are not checked out`, len(names)))
+	}
 }
 
 func (m *Manifest) applyExtend(e *ExtendProject, byName map[string][]*Project, byPath map[string]*Project) ([]string, error) {

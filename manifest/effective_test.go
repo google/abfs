@@ -576,3 +576,43 @@ func TestWarnings_StandardManifestHasNone(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, m.Warnings())
 }
+
+func TestWarnings_SyncSubmodules(t *testing.T) {
+	in := `<manifest>
+ <remote name="aosp" fetch=".." />
+ <default revision="main" remote="aosp" sync-s="true" />
+ <project path="external/lib" name="platform/external/lib" sync-s="TRUE" />
+ <project path="external/inherits" name="platform/external/inherits" />
+ <project path="external/off" name="platform/external/off" sync-s="false" />
+ <project path="external/gone" name="platform/external/gone" sync-s="true" />
+ <remove-project name="platform/external/gone" />
+</manifest>`
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	require.Empty(t, m.Warnings())
+	require.NoError(t, m.Effective())
+	require.Equal(t, []string{
+		`<project>: sync-s="true" on 2 elements is not applied: submodules are not checked out`,
+	}, m.Warnings())
+
+	off, err := Parse([]byte(`<manifest>
+ <remote name="aosp" fetch=".." />
+ <default revision="main" remote="aosp" sync-s="false" />
+ <project path="a" name="platform/a" />
+</manifest>`))
+	require.NoError(t, err)
+	require.NoError(t, off.Effective())
+	require.Empty(t, off.Warnings())
+
+	one, err := Parse([]byte(`<manifest>
+ <remote name="aosp" fetch=".." />
+ <default revision="main" remote="aosp" />
+ <project path="a" name="platform/a" sync-s="true" />
+ <project path="b" name="platform/b" />
+</manifest>`))
+	require.NoError(t, err)
+	require.NoError(t, one.Effective())
+	require.Equal(t, []string{
+		`<project name="platform/a">: sync-s="true" is not applied: submodules are not checked out`,
+	}, one.Warnings())
+}

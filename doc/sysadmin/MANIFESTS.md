@@ -60,7 +60,9 @@ without them:
 - a `<project>` nested in another `<project>`;
 - a `<submanifest>`;
 - an attribute ABFS does not read on `remote`, `default`, `project`, `extend-project`,
-  `remove-project` or `include` (for example `rebase` or `sync-strategy`).
+  `remove-project` or `include` (for example `rebase` or `sync-strategy`);
+- `sync-s="true"`: submodules are not checked out, so each submodule entry stays an empty
+  directory.
 
 A group filter such as `-g local:my-file` prints a warning too: projects from local manifests
 do not get the `local:` groups that `repo` gives them.
