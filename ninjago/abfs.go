@@ -60,6 +60,15 @@ type HashFetchReq struct {
 	callback func(*HashStat, error)
 }
 
+// abfsClient is the part of binding.Client that the backend uses.
+type abfsClient interface {
+	Store() entities.CASStore
+	ApplyPatch(match, patch entities.Patch, deletes entities.DeletePatch, chroot string) error
+	ExecuteSupport() (bool, error)
+	Execute(evalReq entities.Hash, patches []entities.Hash, storeMapResult, prefetchInputs bool) (entities.Hash, error)
+	WaitFor(timeout time.Duration, priority float64, objects []entities.Hash) error
+}
+
 type ABFSBackend struct {
 	startTime       time.Time
 	params          *ninjaruntime.RunParameters
@@ -69,7 +78,7 @@ type ABFSBackend struct {
 	remotePatches   sync.Map
 	useRemote       bool
 	remotableRules  map[string]struct{}
-	abfs            *binding.Client
+	abfs            abfsClient
 	cacheman        *client.Client
 	graph           *graph.Graph
 	log             ninjaruntime.Logger
@@ -85,6 +94,7 @@ type ABFSBackend struct {
 	evals           xxmap.ObjectsMap[graph.Node, *Eval]
 	failedsLock     sync.Mutex
 	faileds         []*FailedStep
+	steps           stepCounter
 	ninjaEntryFile  string
 	ninjaFiles      []string
 	hashFetchC      chan HashFetchReq
@@ -119,6 +129,9 @@ type Eval struct {
 	step          *build.Step
 	req           *binding.EvalRequest
 	triedResps    map[entities.Hash]struct{}
+	skipped       int
+	mismatched    int
+	applyFailed   int
 	triedRemote   bool
 	lastRefresh   time.Time
 	cacheStart    time.Time
@@ -514,7 +527,8 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 		eval.cacheEnd = time.Now()
 	}()
 
-	if c.config.EvalNoCache {
+	// A phony_output step runs on every build, so it is never looked up or recorded.
+	if c.config.EvalNoCache || eval.step.IsPhonyOutput() {
 		return false, nil
 	}
 
@@ -562,6 +576,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 			if len(targetsMap) > 0 {
 				c.log.Tracef("Skipping response %s for %s because WritePatch does not contain %v (chroot is %q)", hash, eval.req.Hash, targetsMap, c.chroot)
 				eval.triedResps[resp.Hash] = struct{}{}
+				c.steps.rejectResponse(eval, binding.CacheReasonSkipped)
 				continue
 			}
 			err = c.cacheMatch(resp, eval)
@@ -571,6 +586,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 					return false, err
 				}
+				c.steps.addStep(runType, "", true, resp)
 				return true, nil
 			}
 			if !binding.IsMatchError(err) {
@@ -582,6 +598,11 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
 				}
 			}
 			eval.triedResps[resp.Hash] = struct{}{}
+			if binding.IsMatchError(err) {
+				c.steps.rejectResponse(eval, binding.CacheReasonMismatch)
+			} else {
+				c.steps.rejectResponse(eval, binding.CacheReasonApplyFailed)
+			}
 		}
 	}
 	return false, nil
@@ -844,6 +865,8 @@ func (c *ABFSBackend) postExec(eval *Eval, resp *binding.EvalResponse, runType n
 		if err := c.addToNinjaLog(eval, resp, runType); err != nil {
 			return err
 		}
+		reason, lookedUp := missReason(c.config.EvalNoCache, eval)
+		c.steps.addStep(runType, reason, lookedUp, resp)
 	}
 
 	return err
@@ -930,12 +953,21 @@ func (c *ABFSBackend) execTapLocal(ctx context.Context, eval *Eval) (*binding.Ev
 	}
 
 	if tapResult.ExitCode == 0 {
-		if err := c.abfs.Store().AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
-		}
+		c.addMapResult(ctx, eval, resp)
 	}
 
 	return resp, nil
+}
+
+// addMapResult records resp as a result of eval's request. A phony_output step runs on every
+// build, so its result is not recorded.
+func (c *ABFSBackend) addMapResult(ctx context.Context, eval *Eval, resp *binding.EvalResponse) {
+	if eval.step.IsPhonyOutput() {
+		return
+	}
+	if err := c.abfs.Store().AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
+	}
 }
 
 func (c *ABFSBackend) lookup(fname string) (*HashStat, error) {
@@ -978,13 +1010,19 @@ func shouldIgnoreInput(fname string) bool {
 	return false
 }
 
-// addInput uses the inputSet to efficiently look recursively through phony rules to see if the input needs to be added.
+// isPhonyNode reports whether the outputs of n are not files: a phony build, or a build with
+// phony_output set on it or on its rule. Kati writes a .PHONY target with a recipe that way.
+func isPhonyNode(n *graph.Node) bool {
+	return n.Build.Rule.IsPhony() || n.Build.Scope.ExpandField("phony_output") != ""
+}
+
+// addInput uses the inputSet to efficiently look recursively through phony and phony_output builds to see if the input needs to be added.
 func (c *ABFSBackend) addInput(fname string, isOrderOnly bool, inputs *[]entities.PatchEntry, inputSet map[string]struct{}) error {
 	if shouldIgnoreInput(fname) {
 		return nil
 	}
-	if n := c.graph.Targets.Get(fname); n != nil && n.Build.Rule.IsPhony() {
-		// Traverse phony targets recursively to add to the input list
+	if n := c.graph.Targets.Get(fname); n != nil && isPhonyNode(n) {
+		// Traverse phony and phony_output targets recursively to add to the input list
 		for i, ins := range n.Build.AllInputs() {
 			for _, in := range ins {
 				if _, exists := inputSet[in]; !exists {
@@ -1176,18 +1214,15 @@ func (c *ABFSBackend) FinalizeBuild(err error) error {
 	close(c.hashFetchC)
 	c.pendingJobs.Wait()
 
-	states := c.engine.StateCounts()
-
-	failed := states[build.StateFailed]
-	cached := states[build.StateCached]
-	done := states[build.StateDone]
+	failed := c.engine.StateCounts()[build.StateFailed]
+	hits, misses, notLookedUp := c.cacheCounts(c.steps.snapshot())
 	hitRate := 0.0
-	if cached+done != 0 {
-		hitRate = float64(cached) / float64(cached+done) * 100
+	if hits+misses != 0 {
+		hitRate = float64(hits) / float64(hits+misses) * 100
 	}
 	msg := fmt.Sprintf(
-		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f",
-		time.Since(c.startTime), failed, cached, done, hitRate,
+		"Evaluation took %s, fail: %d, cache: hits: %d, misses: %d, ratio: %.3f, not looked up: %d",
+		time.Since(c.startTime), failed, hits, misses, hitRate, notLookedUp,
 	)
 	c.log.Warnf("%s", msg)
 
