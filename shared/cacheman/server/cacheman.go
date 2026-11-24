@@ -172,6 +172,7 @@ type CacheMan struct {
 	incomingConfig       atomic.Pointer[instance.Config]
 	newConfigC           chan struct{}
 	newARES              NewARESFunc
+	newARI               func(ctx context.Context, rbeInstance, rbeRemote string) (ari.BlobClient, error)
 	checkCredsFn         CheckCredsFunc
 	healthStatusCode     atomic.Int32
 	healthCheckGroup     singleflight.Group
@@ -798,19 +799,19 @@ func (c *CacheMan) setupRemote(ctx context.Context, config *instance.Config, for
 	// Re-read config after remote config is applied
 	config = c.instance.Config
 
-	if err := c.setupARESClient(config, c.newARES, force); err != nil {
-		c.printer.Printf("Warning: failed to setup ARES client: %v\n", err)
-	}
-
 	if err := c.setupRBE(config, force); err != nil {
 		c.printer.Printf("Warning: failed to setup RBE: %v\n", err)
+	}
+
+	c.setupDAGSync(ctx, config, force)
+
+	if err := c.setupARESClient(config, c.newARES, force); err != nil {
+		c.printer.Printf("Warning: failed to setup ARES client: %v\n", err)
 	}
 
 	if err := c.setupARI(config, force); err != nil {
 		c.printer.Printf("Warning: failed to setup ARI: %v\n", err)
 	}
-
-	c.setupDAGSync(ctx, config, force)
 
 	c.appliedRemoteConfig = config
 	return nil
@@ -888,18 +889,29 @@ func (c *CacheMan) setupARI(config *instance.Config, force bool) error {
 	}
 
 	ctx := context.Background()
-	rbeClient, err := rc.NewClient(ctx, config.RBEInstance, rc.DialParams{
-		Service:               config.RBERemote,
-		NoSecurity:            false,
-		UseApplicationDefault: true,
-	})
+	newARI := c.newARI
+	if newARI == nil {
+		newARI = func(ctx context.Context, rbeInstance, rbeRemote string) (ari.BlobClient, error) {
+			rbeClient, err := rc.NewClient(ctx, rbeInstance, rc.DialParams{
+				Service:               rbeRemote,
+				NoSecurity:            false,
+				UseApplicationDefault: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return ari.NewClient(&rexec.Client{GrpcClient: rbeClient}), nil
+		}
+	}
+
+	ariClient, err := newARI(ctx, config.RBEInstance, config.RBERemote)
 	if err != nil {
 		c.printer.Printf("Warning: failed to initialize RBE client for ARI: %v\n", err)
 		c.ariClient = nil
 		return nil
 	}
 
-	c.ariClient = ari.NewClient(&rexec.Client{GrpcClient: rbeClient})
+	c.ariClient = ariClient
 	return nil
 }
 
