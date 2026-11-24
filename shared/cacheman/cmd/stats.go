@@ -159,6 +159,9 @@ func (c *statsCmd) number(n int64, width int, human func(int64) string) string {
 
 func (c *statsCmd) vol(size int64, width int) string {
 	return c.number(size, width, func(i int64) string {
+		if i < 0 {
+			return "-" + humanize.Bytes(-uint64(i))
+		}
 		return humanize.Bytes(uint64(i))
 	})
 }

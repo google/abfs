@@ -576,6 +576,13 @@ func (i *badgerIndex) LockEviction() func() {
 	}
 }
 
+func formatSignedBytes(v int64) string {
+	if v < 0 {
+		return "-" + humanize.Bytes(-uint64(v))
+	}
+	return humanize.Bytes(uint64(v))
+}
+
 // evictIndexAndCache removes index entries and localcache objects
 // until sufficient space is available. The metadata is purged prior
 // to disk contents.
@@ -583,13 +590,13 @@ func (i *badgerIndex) evictIndexAndCache() error {
 	i.evictStart = time.Now()
 	startLRUSz := i.indexStore.LRUSize()
 	currLRUSz := startLRUSz
-	i.printer.Printf("Starting eviction process with starting LRU size %s...\n", humanize.Bytes(uint64(currLRUSz)))
+	i.printer.Printf("Starting eviction process with starting LRU size %s...\n", formatSignedBytes(currLRUSz))
 
 	var allVictims []*IndexKeyEntry
 
 	defer func() {
 		i.evictEnd = time.Now()
-		i.printer.Printf("Eviction process completed in %v with ending LRU size %s\n", i.evictEnd.Sub(i.evictStart), humanize.Bytes(uint64(currLRUSz)))
+		i.printer.Printf("Eviction process completed in %v with ending LRU size %s\n", i.evictEnd.Sub(i.evictStart), formatSignedBytes(currLRUSz))
 		i.updateOldestObjectStats()
 		i.writeEvictionLog(startLRUSz, currLRUSz, allVictims)
 	}()
@@ -657,10 +664,10 @@ func (i *badgerIndex) writeEvictionLog(startLRUSz, endLRUSz int64, victims []*In
 	fmt.Fprintf(w, "Start: %s\n", i.evictStart.UTC().Format(time.RFC3339Nano))
 	fmt.Fprintf(w, "End: %s\n", i.evictEnd.UTC().Format(time.RFC3339Nano))
 	fmt.Fprintf(w, "Duration: %s\n", i.evictEnd.Sub(i.evictStart))
-	fmt.Fprintf(w, "StartingLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(startLRUSz)), startLRUSz)
-	fmt.Fprintf(w, "EndingLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(endLRUSz)), endLRUSz)
+	fmt.Fprintf(w, "StartingLRUSize: %s (%d bytes)\n", formatSignedBytes(startLRUSz), startLRUSz)
+	fmt.Fprintf(w, "EndingLRUSize: %s (%d bytes)\n", formatSignedBytes(endLRUSz), endLRUSz)
 	targetSize := int64(float64(i.evictThreshold) * (1.0 - evictHeadroom))
-	fmt.Fprintf(w, "TargetLRUSize: %s (%d bytes)\n", humanize.Bytes(uint64(targetSize)), targetSize)
+	fmt.Fprintf(w, "TargetLRUSize: %s (%d bytes)\n", formatSignedBytes(targetSize), targetSize)
 	fmt.Fprintf(w, "TotalEvicted: %d\n\n", len(victims))
 	fmt.Fprintf(w, "# Format: <hash> <type> <size_bytes>\n")
 

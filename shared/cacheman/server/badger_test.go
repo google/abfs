@@ -15,6 +15,7 @@
 package server
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -903,4 +904,237 @@ func TestBadgerIndexPutManyEvictionThreshold(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return idx.EvictCount() >= 1
 	}, 3*time.Second, 50*time.Millisecond)
+}
+
+func TestBadgerIndexStoreUseIgnoresTombstone(t *testing.T) {
+	store := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	key := entities.NewHash("deadbeef10")
+	_, _, _, _, err := store.Put(key, &IndexEntry{
+		EntryType: EntryTypeBlob,
+		Local:     true,
+		Remote:    true,
+		Size:      1000,
+	})
+	require.NoError(t, err)
+
+	victims, totalSz, lruSz, err := store.Evict()
+	require.NoError(t, err)
+	require.Len(t, victims, 1)
+	require.Equal(t, int64(0), totalSz)
+	require.Equal(t, int64(0), lruSz)
+
+	// Touching the evicted tombstone (Local=false, Remote=true) must not re-add it to LRU.
+	require.NoError(t, store.Use(key))
+	require.Equal(t, int64(0), store.LRUSize())
+
+	lru, err := store.ReadLRU()
+	require.NoError(t, err)
+	require.Empty(t, lru)
+
+	victims, _, _, err = store.Evict()
+	require.Error(t, err)
+	require.Empty(t, victims)
+	require.Equal(t, int64(0), store.TotalSize())
+	require.Equal(t, int64(0), store.LRUSize())
+	require.Equal(t, int64(0), store.LocalCount())
+	require.Equal(t, int64(0), store.IndexCount())
+}
+
+func TestBadgerIndexStoreUseIgnoresLocalOnlyAndMissing(t *testing.T) {
+	store := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	missingKey := entities.NewHash("deadbeef20")
+	require.NoError(t, store.Use(missingKey))
+	require.Equal(t, int64(0), store.LRUSize())
+
+	remoteKey := entities.NewHash("deadbeef21")
+	localKey1 := entities.NewHash("deadbeef22")
+	localKey2 := entities.NewHash("deadbeef23")
+
+	_, _, err := store.PutMany([]*IndexKeyEntry{
+		{Key: remoteKey, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: true, Size: 500}},
+		{Key: localKey1, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: false, Size: 1000}},
+		{Key: localKey2, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: false, Size: 2000}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(500), store.LRUSize())
+
+	// Using local-only entries must not record an LRU timestamp that Delete/DeleteMany later subtracts.
+	require.NoError(t, store.Use(localKey1))
+	require.NoError(t, store.Use(localKey2))
+	require.Equal(t, int64(500), store.LRUSize())
+
+	_, _, lruSz, err := store.Delete(localKey1)
+	require.NoError(t, err)
+	require.Equal(t, int64(500), lruSz)
+
+	_, lruSz, err = store.DeleteMany([]entities.Hash{localKey2})
+	require.NoError(t, err)
+	require.Equal(t, int64(500), lruSz)
+	require.Equal(t, int64(500), store.TotalSize())
+
+	lru, err := store.ReadLRU()
+	require.NoError(t, err)
+	require.Len(t, lru, 1)
+	require.Equal(t, remoteKey, lru[0].Key)
+}
+
+func TestBadgerIndexStoreUseRepeatTracked(t *testing.T) {
+	store := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	key := entities.NewHash("deadbeef30")
+	_, lruSz, _, _, err := store.Put(key, &IndexEntry{
+		EntryType: EntryTypeBlob,
+		Local:     true,
+		Remote:    true,
+		Size:      1000,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1000), lruSz)
+
+	lru, err := store.ReadLRU()
+	require.NoError(t, err)
+	require.Len(t, lru, 1)
+	now := lru[0].Timestamp
+
+	require.NoError(t, store.useWithTimestamp(key, now+10))
+	require.NoError(t, store.useWithTimestamp(key, now+20))
+
+	require.Equal(t, int64(1000), store.LRUSize())
+	lru, err = store.ReadLRU()
+	require.NoError(t, err)
+	require.Len(t, lru, 1)
+	require.Equal(t, key, lru[0].Key)
+	require.Equal(t, now+20, lru[0].Timestamp)
+}
+
+func TestBadgerIndexStoreUseLocalOnlyThenPutRemote(t *testing.T) {
+	store := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	key := entities.NewHash("deadbeef31")
+	_, lruSz, _, _, err := store.Put(key, &IndexEntry{
+		EntryType: EntryTypeBlob,
+		Local:     true,
+		Remote:    false,
+		Size:      1000,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), lruSz)
+
+	require.NoError(t, store.Use(key))
+	require.Equal(t, int64(0), store.LRUSize())
+
+	_, lruSz, _, _, err = store.Put(key, &IndexEntry{
+		EntryType: EntryTypeBlob,
+		Local:     true,
+		Remote:    true,
+		Size:      1000,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1000), lruSz)
+	require.Equal(t, int64(1000), store.LRUSize())
+	_, inUntracked := store.untrackedUses[shardForHash(key)][key]
+	require.False(t, inUntracked)
+
+	victims, totalSz, lruSz, err := store.Evict()
+	require.NoError(t, err)
+	require.Len(t, victims, 1)
+	require.Equal(t, int64(0), totalSz)
+	require.Equal(t, int64(0), lruSz)
+	require.Equal(t, int64(0), store.LRUSize())
+}
+
+func TestBadgerIndexStoreUseUntrackedCooldown(t *testing.T) {
+	store := NewBadgerIndexStore(t.TempDir(), nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	const t0 int64 = 1000
+
+	key1 := entities.NewHash("deadbeef40")
+	key2 := entities.NewHash("deadbeef41")
+	key3 := entities.NewHash("deadbeef42")
+	missingKey := entities.NewHash("deadbeef43")
+
+	_, _, err := store.PutMany([]*IndexKeyEntry{
+		{Key: key1, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: false, Size: 400}},
+		{Key: key2, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: false, Size: 500}},
+		{Key: key3, IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: false, Size: 600}},
+	})
+	require.NoError(t, err)
+
+	// First Use on a local-only entry records the untracked cooldown without touching timestamps.
+	require.NoError(t, store.useWithTimestamp(key1, t0))
+	shard1 := shardForHash(key1)
+	require.Equal(t, t0, store.untrackedUses[shard1][key1])
+	require.Zero(t, store.timestamps[shard1][key1])
+
+	// Flip Remote=true directly in Badger to confirm repeat Use within cooldown skips the DB read.
+	err = store.db.Update(func(txn *badger.Txn) error {
+		data, err := json.Marshal(&IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: true, Size: 400})
+		if err != nil {
+			return err
+		}
+		return txn.Set(entryKey(key1), data)
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.useWithTimestamp(key1, t0+useCooldownSec-1))
+	require.Equal(t, int64(0), store.LRUSize())
+	require.Equal(t, t0, store.untrackedUses[shard1][key1])
+	lru, err := store.ReadLRU()
+	require.NoError(t, err)
+	require.Empty(t, lru)
+
+	// Once the cooldown elapses, Use reads Badger, starts tracking key1, and clears untrackedUses.
+	require.NoError(t, store.useWithTimestamp(key1, t0+useCooldownSec))
+	require.Equal(t, int64(400), store.LRUSize())
+	require.Equal(t, t0+useCooldownSec, store.timestamps[shard1][key1])
+	_, ok := store.untrackedUses[shard1][key1]
+	require.False(t, ok)
+	lru, err = store.ReadLRU()
+	require.NoError(t, err)
+	require.Len(t, lru, 1)
+	require.Equal(t, key1, lru[0].Key)
+
+	// MarkObjectRemote clears untrackedUses when the entry becomes tracked.
+	require.NoError(t, store.useWithTimestamp(key2, t0))
+	shard2 := shardForHash(key2)
+	require.Equal(t, t0, store.untrackedUses[shard2][key2])
+	require.NoError(t, store.MarkObjectRemote(key2))
+	_, ok = store.untrackedUses[shard2][key2]
+	require.False(t, ok)
+	require.NotZero(t, store.timestamps[shard2][key2])
+	require.Equal(t, int64(900), store.LRUSize())
+
+	// Delete clears untrackedUses for a local-only entry.
+	require.NoError(t, store.useWithTimestamp(key3, t0))
+	shard3 := shardForHash(key3)
+	require.Equal(t, t0, store.untrackedUses[shard3][key3])
+	_, _, _, err = store.Delete(key3)
+	require.NoError(t, err)
+	_, ok = store.untrackedUses[shard3][key3]
+	require.False(t, ok)
+
+	// Missing keys also obey the cooldown and clear on DeleteMany.
+	shardMissing := shardForHash(missingKey)
+	require.NoError(t, store.useWithTimestamp(missingKey, t0))
+	require.Equal(t, t0, store.untrackedUses[shardMissing][missingKey])
+	require.NoError(t, store.useWithTimestamp(missingKey, t0+useCooldownSec-1))
+	require.Equal(t, t0, store.untrackedUses[shardMissing][missingKey])
+	require.NoError(t, store.useWithTimestamp(missingKey, t0+useCooldownSec))
+	require.Equal(t, t0+useCooldownSec, store.untrackedUses[shardMissing][missingKey])
+	_, _, err = store.DeleteMany([]entities.Hash{missingKey})
+	require.NoError(t, err)
+	_, ok = store.untrackedUses[shardMissing][missingKey]
+	require.False(t, ok)
 }
