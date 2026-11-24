@@ -15,6 +15,7 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -903,4 +904,54 @@ func TestBadgerIndexPutManyEvictionThreshold(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return idx.EvictCount() >= 1
 	}, 3*time.Second, 50*time.Millisecond)
+}
+
+func TestBadgerIndexStoreRestoreDeletesStaleLRUKeys(t *testing.T) {
+	storeDir := t.TempDir()
+	store := NewBadgerIndexStore(storeDir, nil, 1, true)
+	require.NoError(t, store.Open())
+
+	// Evicting one of the entries leaves a tombstone (Local=false, Remote=true).
+	var puts []*IndexKeyEntry
+	for i := range 401 {
+		puts = append(puts, &IndexKeyEntry{
+			Key:        entities.NewHash(fmt.Sprintf("%040x", i)),
+			IndexEntry: &IndexEntry{EntryType: EntryTypeBlob, Local: true, Remote: true, Size: 10},
+		})
+	}
+	_, _, err := store.PutMany(puts)
+	require.NoError(t, err)
+	victims, _, _, err := store.Evict()
+	require.NoError(t, err)
+	require.Len(t, victims, 1)
+
+	// Stale keys sort ahead of the valid ones. There are more than fit in one transaction.
+	const orphans = 120000
+	wb := store.db.NewWriteBatch()
+	defer wb.Cancel()
+	require.NoError(t, wb.Set(lruKey(1, victims[0].Key), nil))
+	for i := range orphans {
+		require.NoError(t, wb.Set(lruKey(1, entities.NewHash(fmt.Sprintf("%08x%032x", i+1, 0))), nil))
+	}
+	require.NoError(t, wb.Flush())
+	lruKeys := func() int {
+		lru, err := store.ReadLRU()
+		require.NoError(t, err)
+		return len(lru)
+	}
+	require.Equal(t, 400+1+orphans, lruKeys())
+	require.NoError(t, store.Close())
+
+	store = NewBadgerIndexStore(storeDir, nil, MaxEvictBatchSize, true)
+	require.NoError(t, store.Open())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	require.Equal(t, 400, lruKeys())
+	require.Equal(t, int64(4000), store.LRUSize())
+	require.Equal(t, int64(4000), store.TotalSize())
+
+	_, totalSz, lruSz, err := store.Evict()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), totalSz)
+	require.Equal(t, int64(0), lruSz)
 }

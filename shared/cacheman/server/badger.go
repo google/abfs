@@ -1115,7 +1115,12 @@ func (b *BadgerIndexStore) restoreIndexStats() error {
 // by iterating over the lru:: keyspace.
 func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 	var lruSz int64
-	err := b.db.Update(func(txn *badger.Txn) error {
+	// A write batch has no size limit, unlike a transaction. It keeps the keys until it
+	// commits, so they must be copies.
+	wb := b.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	err := b.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(keyOnlyIterationOpts())
 		defer it.Close()
 		prefix := []byte(lruPrefix)
@@ -1125,7 +1130,7 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			parts := bytes.Split(key, []byte("::"))
 			if len(parts) != 3 {
 				b.printer.Printf("WARNING: deleting malformed LRU key: %v\n", string(key))
-				if err := txn.Delete(key); err != nil {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1133,7 +1138,7 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			timestamp, err := strconv.ParseInt(string(parts[1]), 10, 64)
 			if err != nil {
 				b.printer.Printf("WARNING: deleting LRU key with invalid timestamp: %v\n", string(key))
-				if err := txn.Delete(key); err != nil {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1141,9 +1146,9 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 			hash := entities.NewHash(string(parts[2]))
 
 			entry, _ := b.get(txn, hash)
-			// Migration/Cleanup: If entry doesn't exist, is not Remote, or is not an LRU candidate, it shouldn't be in LRU.
-			if entry == nil || !entry.Remote || !b.isLRUCandidate(hash) {
-				if err := txn.Delete(key); err != nil {
+			// Migration/Cleanup: If entry doesn't exist, is not Local (evicted), is not Remote, or is not an LRU candidate, it shouldn't be in LRU.
+			if entry == nil || !entry.Local || !entry.Remote || !b.isLRUCandidate(hash) {
+				if err := wb.Delete(item.KeyCopy(nil)); err != nil {
 					return err
 				}
 				continue
@@ -1158,7 +1163,10 @@ func (b *BadgerIndexStore) restoreLRUFromLRUKeys() (int64, error) {
 		}
 		return nil
 	})
-	return lruSz, err
+	if err != nil {
+		return 0, err
+	}
+	return lruSz, wb.Flush()
 }
 
 // ensureLRUConsistency ensures that all entries that should be in the LRU are present
