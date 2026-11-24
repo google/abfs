@@ -2388,6 +2388,40 @@ func (c *CacheMan) RunLocalGC() error {
 	return err
 }
 
+// Drain waits up to timeout for pending remote uploads to finish before stopping. It returns
+// early when only failed uploads remain.
+func (c *CacheMan) Drain(timeout time.Duration) error {
+	if timeout <= 0 {
+		return nil
+	}
+	sync := c.getSync()
+	if sync == nil {
+		return nil
+	}
+	if pending := pendingUploads(sync); pending > 0 {
+		c.printer.Printf("Waiting up to %s for %d pending uploads\n", timeout, pending)
+	}
+	if err := sync.Wait(timeout); err != nil {
+		c.printer.Printf("Stopping with %d uploads not finished: %v\n", pendingUploads(sync), err)
+		return err
+	}
+	return nil
+}
+
+// pendingUploads returns the number of dagsync requests that are not done.
+func pendingUploads(sync *dagsync.DAGSync) int64 {
+	var sum int64
+	for state, counts := range sync.Stats().States {
+		if state == dagsync.HolderState.String() {
+			continue
+		}
+		for _, n := range counts {
+			sum += n
+		}
+	}
+	return sum
+}
+
 func (c *CacheMan) Stop() error {
 	if c.cancelOverridesWatch != nil {
 		c.cancelOverridesWatch()

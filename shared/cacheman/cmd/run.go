@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
@@ -26,13 +27,19 @@ import (
 	"github.com/google/abfs/shared/cacheman/server"
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
+	"github.com/google/abfs/shared/cmd/clierr"
+	"github.com/google/abfs/shared/instance"
 )
+
+const defaultDrainTimeout = 8 * time.Second
 
 type runCmd struct {
 	*cachemanCmd
-	debug   bool
-	port    int
-	printer server.Printer
+	debug        bool
+	port         int
+	drainTimeout time.Duration
+	printer      server.Printer
+	newServer    func(*instance.Instance, server.NewARESFunc) (cachemanServer, error)
 }
 
 func NewRunCmd(c *cachemanCmd) *runCmd {
@@ -51,11 +58,15 @@ func (c *runCmd) Spec() cmd.CmdSpec {
 func (c *runCmd) RegisterFlags(fl *pflag.FlagSet) {
 	fl.BoolVarP(&c.debug, "debug", "d", false, "Show debug log messages")
 	fl.IntVarP(&c.port, "port", "p", 0, "HTTP port to listen")
+	fl.DurationVar(&c.drainTimeout, "drain-timeout", defaultDrainTimeout, "How long a stop waits for pending uploads, 0 to not wait. Keep it below the time until the process is killed (30s for 'cacheman stop', and leave headroom for any exit metrics flush).")
 	fl.StringP("logfile", "l", "", "Deprecated. Only serves to not completely break backwards compatibility")
 }
 
 func (c *runCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
+	if c.drainTimeout < 0 {
+		return clierr.CLIErr("--drain-timeout must not be negative")
+	}
 
 	c.printer = &server.DefaultPrinter{}
 
@@ -65,7 +76,13 @@ func (c *runCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 func (c *runCmd) run(ctx context.Context) error {
 	server.SetDebug(c.debug)
 
-	s, err := server.New(c.Instance, c.newARES)
+	newServer := c.newServer
+	if newServer == nil {
+		newServer = func(inst *instance.Instance, newARES server.NewARESFunc) (cachemanServer, error) {
+			return server.New(inst, newARES)
+		}
+	}
+	s, err := newServer(c.Instance, c.newARES)
 	if err != nil {
 		return err
 	}
@@ -83,20 +100,32 @@ func (c *runCmd) run(ctx context.Context) error {
 		}
 	}()
 
-	return serveUntilStopped(ctx, s)
+	return serveUntilStopped(ctx, s, c.drainTimeout)
 }
 
 // cachemanServer is the part of *server.CacheMan that run drives.
 type cachemanServer interface {
+	Printer() server.Printer
 	Serve(ctx context.Context) error
+	Drain(timeout time.Duration) error
 	Stop() error
 }
 
-func serveUntilStopped(ctx context.Context, s cachemanServer) error {
+func serveUntilStopped(ctx context.Context, s cachemanServer, drainTimeout time.Duration) error {
+	// Keep Serve and dagsync running while pending uploads drain on a requested stop.
+	serveCtx, stopServe := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopServe()
+
 	// A failed Serve also stops cacheman, so the command exits instead of waiting forever.
 	grp, grpCtx := errgroup.WithContext(ctx)
 	grp.Go(func() error {
 		<-grpCtx.Done()
+		if drainTimeout > 0 && ctx.Err() != nil {
+			// Drain logs unfinished uploads. A stop with uploads left is still a clean stop
+			// (exit 0) so Restart=on-failure does not restart cacheman.
+			_ = s.Drain(drainTimeout)
+		}
+		stopServe()
 		if err := s.Stop(); err != nil {
 			return fmt.Errorf("failed to stop cacheman: %w", err)
 		}
@@ -104,7 +133,7 @@ func serveUntilStopped(ctx context.Context, s cachemanServer) error {
 	})
 
 	grp.Go(func() error {
-		err := s.Serve(ctx)
+		err := s.Serve(serveCtx)
 		if ctx.Err() != nil {
 			// Stop closes the socket, which ends Serve with an accept error.
 			return nil
