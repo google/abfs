@@ -16,7 +16,6 @@ package cacheman
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/google/abfs/shared/cmd"
+	"github.com/google/abfs/shared/cmd/clierr"
 )
 
 type remoteOkCmd struct {
@@ -53,23 +53,38 @@ func (c *remoteOkCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *remoteOkCmd) remoteOk(ctx context.Context) error {
+	if c.timeout <= 0 {
+		return clierr.CLIErr("timeout must be positive")
+	}
 	timeoutTime := time.Now().Add(c.timeout)
+	deadlineTimer := time.NewTimer(c.timeout)
+	defer deadlineTimer.Stop()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		if err := c.Cacheman.RemoteOK(); err == nil {
+		reqCtx, cancel := context.WithDeadline(ctx, timeoutTime)
+		err := c.Cacheman.RemoteOKContext(reqCtx)
+		cancel()
+		if err == nil {
 			return nil
-		} else {
-			fmt.Fprintf(os.Stderr, "Remote check failed: %v, retrying...\n", err)
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !time.Now().Before(timeoutTime) {
+			return fmt.Errorf("timeout waiting for a successful remote check: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Remote check failed: %v, retrying...\n", err)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-deadlineTimer.C:
+			return fmt.Errorf("timeout waiting for a successful remote check: %w", err)
 		case t := <-ticker.C:
-			if t.Compare(timeoutTime) == 1 {
-				return errors.New("timeout waiting for a successful remote check")
+			if !t.Before(timeoutTime) {
+				return fmt.Errorf("timeout waiting for a successful remote check: %w", err)
 			}
 		}
 	}

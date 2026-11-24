@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
+	"github.com/google/abfs/shared/cmd/clierr"
 )
 
 type restartCmd struct {
@@ -55,6 +56,9 @@ func (c *restartCmd) RegisterFlags(fl *pflag.FlagSet) {
 
 func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
+	if c.timeout <= 0 {
+		return clierr.CLIErr("timeout must be positive")
+	}
 
 	if c.sysRestart != nil {
 		if err := c.sysRestart.Exec(ctx, fl); err != nil {
@@ -83,17 +87,17 @@ func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	}
 
 	checkName := "remote-ok"
-	checkFunc := func() error { return c.Cacheman.RemoteOK() }
+	checkFunc := func(ctx context.Context) error { return c.Cacheman.RemoteOKContext(ctx) }
 	if c.Config != nil && c.Config.LocalOnly {
 		checkName = "ping"
-		checkFunc = func() error { return c.Cacheman.Ping() }
+		checkFunc = func(ctx context.Context) error { return c.Cacheman.PingContext(ctx) }
 	}
 
 	fmt.Printf("Waiting for cacheman to respond to %s...\n", checkName)
 	return c.waitFor(ctx, checkName, checkFunc)
 }
 
-func (c *restartCmd) waitFor(ctx context.Context, name string, check func() error) error {
+func (c *restartCmd) waitFor(ctx context.Context, name string, check func(context.Context) error) error {
 	if c.CachemanProvider == nil || c.Cacheman == nil {
 		return errors.New("cacheman client not initialized")
 	}
@@ -101,15 +105,23 @@ func (c *restartCmd) waitFor(ctx context.Context, name string, check func() erro
 }
 
 // waitForCacheman polls check until it succeeds or timeout expires.
-func waitForCacheman(ctx context.Context, timeout time.Duration, name string, check func() error) error {
+func waitForCacheman(ctx context.Context, timeout time.Duration, name string, check func(context.Context) error) error {
 	timeoutTime := time.Now().Add(timeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		err := check()
+		reqCtx, cancel := context.WithDeadline(ctx, timeoutTime)
+		err := check(reqCtx)
+		cancel()
 		if err == nil {
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !time.Now().Before(timeoutTime) {
+			return fmt.Errorf("timeout waiting for cacheman to respond to %s: %w", name, err)
 		}
 
 		select {

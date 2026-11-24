@@ -25,13 +25,23 @@ import (
 	"github.com/google/abfs/shared/cmd/clierr"
 )
 
+const defaultWaitHTTPMargin = 5 * time.Second
+
 var errNotTried = errors.New("not tried yet")
 
 type waitCmd struct {
 	*cachemanCmd
 	*cmd.CachemanProvider
-	timeout int64
-	noRetry bool
+	timeout    int64
+	noRetry    bool
+	httpMargin time.Duration
+}
+
+func (c *waitCmd) margin() time.Duration {
+	if c.httpMargin > 0 {
+		return c.httpMargin
+	}
+	return defaultWaitHTTPMargin
 }
 
 func NewWaitCmd(c *cachemanCmd) *waitCmd {
@@ -61,7 +71,6 @@ func (c *waitCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 }
 
 func (c *waitCmd) run(ctx context.Context) error {
-
 	endTime := time.Now().Add(time.Duration(c.timeout) * time.Second)
 
 	for err := errNotTried; err != nil; {
@@ -69,8 +78,18 @@ func (c *waitCmd) run(ctx context.Context) error {
 		if timeout < 0 || (c.noRetry && err != errNotTried) {
 			return err
 		}
-		err = c.Cacheman.WaitIdle(timeout)
+		// Leave margin beyond the server wait timeout so a responsive cacheman returns
+		// its own 408 error, while a hung socket still fails instead of blocking forever.
+		reqCtx, cancel := context.WithDeadline(ctx, endTime.Add(c.margin()))
+		err = c.Cacheman.WaitIdleContext(reqCtx, timeout)
+		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if c.noRetry || time.Until(endTime) <= 0 {
+				return err
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
