@@ -15,6 +15,7 @@
 package remote
 
 import (
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -59,6 +60,8 @@ func ExtractLinksOpt(value bool) ValidatorOpts {
 	return extractLinksOpt{value: value}
 }
 
+var errValidatorStopped = errors.New("validator stopped reading the object")
+
 func NewValidator(hash Hash, encoding string, opts ...ValidatorOpts) (*Validator, error) {
 
 	pr, pw := io.Pipe()
@@ -93,6 +96,15 @@ func NewValidator(hash Hash, encoding string, opts ...ValidatorOpts) (*Validator
 
 	v.wg.Add(1)
 	go func() {
+		// Once this goroutine stops reading, for example because the content
+		// cannot be decoded, writes would block forever; make them fail.
+		defer func() {
+			err := v.err
+			if err == nil {
+				err = errValidatorStopped
+			}
+			_ = pr.CloseWithError(err)
+		}()
 		defer func() { _ = v.reader.Close() }()
 		defer v.wg.Done()
 		defer func() {
