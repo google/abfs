@@ -18,13 +18,18 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/google/abfs/daemon"
 	"github.com/google/abfs/shared/instance"
+	abfsversion "github.com/google/abfs/shared/version"
 )
 
 func startMockCachemanServer(t *testing.T, cacheDir string, handler http.Handler) {
@@ -37,6 +42,185 @@ func startMockCachemanServer(t *testing.T, cacheDir string, handler http.Handler
 		_ = srv.Close()
 		_ = l.Close()
 	})
+}
+
+// newCachemanMux serves what the preflight asks a healthy cacheman.
+func newCachemanMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(true)
+	})
+	mux.HandleFunc("/interface-version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"implemented": abfsversion.CachemanABFSImplementedVersion,
+			"required":    abfsversion.CachemanABFSRequiredVersion,
+		})
+	})
+	return mux
+}
+
+// shortenCachemanWait makes the ping and startup waits short for the test.
+func shortenCachemanWait(t *testing.T, ping, startup time.Duration) {
+	oldPing, oldStartup := cachemanPingTimeout, cachemanStartupWait
+	cachemanPingTimeout, cachemanStartupWait = ping, startup
+	t.Cleanup(func() { cachemanPingTimeout, cachemanStartupWait = oldPing, oldStartup })
+}
+
+// captureStderr redirects os.Stderr to a file and returns a function that reads it.
+func captureStderr(t *testing.T) func() string {
+	f, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	require.NoError(t, err)
+	old := os.Stderr
+	os.Stderr = f
+	t.Cleanup(func() {
+		os.Stderr = old
+		_ = f.Close()
+	})
+	return func() string {
+		b, err := os.ReadFile(f.Name())
+		require.NoError(t, err)
+		return string(b)
+	}
+}
+
+// listenWithoutServing listens on the cacheman socket and serves only after delay, as
+// cacheman does while it restores its index. A negative delay never serves.
+func listenWithoutServing(t *testing.T, cacheDir string, delay time.Duration) {
+	l, err := net.Listen("unix", filepath.Join(cacheDir, "http.socket"))
+	require.NoError(t, err)
+	srv := &http.Server{Handler: newCachemanMux()}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = l.Close()
+	})
+	if delay >= 0 {
+		time.AfterFunc(delay, func() { _ = srv.Serve(l) })
+	}
+}
+
+func TestCheckCachemanStatus_Running(t *testing.T) {
+	cacheDir := t.TempDir()
+	startMockCachemanServer(t, cacheDir, newCachemanMux())
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	require.NoError(t, doc.checkCachemanStatus())
+}
+
+func TestCheckCachemanStatus_NoSocket(t *testing.T) {
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: t.TempDir()}})
+	err := doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "could not detect a running cacheman")
+	require.Contains(t, err.Error(), "does not exist, so cacheman is not running")
+	require.Contains(t, err.Error(), "`abfs --instance test cacheman status`")
+}
+
+func TestCheckCachemanStatus_NoSocketDefaultInstance(t *testing.T) {
+	doc := NewDoctor(&instance.Instance{Name: instance.DefaultInstanceName, Config: &instance.Config{CacheDir: t.TempDir()}})
+	err := doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "`abfs cacheman status`")
+	require.NotContains(t, err.Error(), "--instance")
+}
+
+func TestCheckCachemanStatus_Refused(t *testing.T) {
+	cacheDir := t.TempDir()
+	l, err := net.Listen("unix", filepath.Join(cacheDir, "http.socket"))
+	require.NoError(t, err)
+	// Leave the socket file behind, as a cacheman killed with SIGKILL does.
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, l.Close())
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	err = doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "nothing listens on")
+}
+
+func TestCheckCachemanStatus_PermissionDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can connect to any socket")
+	}
+	cacheDir := t.TempDir()
+	startMockCachemanServer(t, cacheDir, newCachemanMux())
+	require.NoError(t, os.Chmod(filepath.Join(cacheDir, "http.socket"), 0o000))
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	err := doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "permission denied on")
+}
+
+func TestCheckCachemanStatus_NotADirectory(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	require.NoError(t, os.WriteFile(cacheDir, nil, 0o644))
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	err := doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a directory")
+}
+
+func TestCheckCachemanStatus_AnswersAfterStart(t *testing.T) {
+	shortenCachemanWait(t, 50*time.Millisecond, 5*time.Second)
+	stderr := captureStderr(t)
+	cacheDir := t.TempDir()
+	listenWithoutServing(t, cacheDir, 200*time.Millisecond)
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	require.NoError(t, doc.checkCachemanStatus())
+	require.Equal(t, 1, strings.Count(stderr(), "Waiting for cacheman to answer on"))
+}
+
+func TestCheckCachemanStatus_NoAnswer(t *testing.T) {
+	shortenCachemanWait(t, 50*time.Millisecond, 250*time.Millisecond)
+	stderr := captureStderr(t)
+	cacheDir := t.TempDir()
+	listenWithoutServing(t, cacheDir, -1)
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	start := time.Now()
+	err := doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "did not answer on")
+	require.Contains(t, err.Error(), "within 250ms")
+	require.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond)
+	require.Less(t, time.Since(start), 2*time.Second)
+	require.Equal(t, 1, strings.Count(stderr(), "Waiting for cacheman to answer on"))
+}
+
+func TestCheckCachemanStatus_ListenQueueFull(t *testing.T) {
+	shortenCachemanWait(t, 50*time.Millisecond, 250*time.Millisecond)
+	stderr := captureStderr(t)
+	cacheDir := t.TempDir()
+	socket := filepath.Join(cacheDir, "http.socket")
+	// A backlog of 0 holds one connection, so the next connect fails with EAGAIN.
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	require.NoError(t, syscall.Bind(fd, &syscall.SockaddrUnix{Name: socket}))
+	require.NoError(t, syscall.Listen(fd, 0))
+	held, err := net.Dial("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = held.Close() })
+	_, err = net.Dial("unix", socket)
+	require.ErrorIs(t, err, syscall.EAGAIN)
+
+	doc := NewDoctor(&instance.Instance{Name: "test", Config: &instance.Config{CacheDir: cacheDir}})
+	start := time.Now()
+	err = doc.checkCachemanStatus()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "could not detect a running cacheman")
+	require.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond)
+	require.Equal(t, 1, strings.Count(stderr(), "Waiting for cacheman to answer on"))
+}
+
+func TestPreflightCheck_CachemanRunning(t *testing.T) {
+	cacheDir := t.TempDir()
+	startMockCachemanServer(t, cacheDir, newCachemanMux())
+
+	inst := &instance.Instance{Name: "test", Config: &instance.Config{LocalOnly: true, CacheDir: cacheDir}}
+	require.NoError(t, PreflightCheck(inst, CheckCASFS, CheckServer))
 }
 
 func TestCheckCachemanRemoteOK_LocalOnly(t *testing.T) {
