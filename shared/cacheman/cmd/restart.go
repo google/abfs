@@ -18,15 +18,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
 
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/args"
+	"github.com/google/abfs/shared/instance"
 )
 
 type restartCmd struct {
@@ -56,6 +58,13 @@ func (c *restartCmd) RegisterFlags(fl *pflag.FlagSet) {
 func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 	args.EnsureNoArgs(fl)
 
+	checkName := "remote-ok"
+	checkFunc := func() error { return c.Cacheman.RemoteOK() }
+	if c.Config != nil && c.Config.LocalOnly {
+		checkName = "ping"
+		checkFunc = func() error { return c.Cacheman.Ping() }
+	}
+
 	if c.sysRestart != nil {
 		if err := c.sysRestart.Exec(ctx, fl); err != nil {
 			return err
@@ -66,27 +75,25 @@ func (c *restartCmd) Exec(ctx context.Context, fl *pflag.FlagSet) error {
 			return err
 		}
 
-		executablePath, err := os.Executable()
+		pid, err := runDetached(c.Instance)
 		if err != nil {
-			log.Fatalf("Error getting executable path: %v", err)
-		}
-
-		cmd := exec.CommandContext(ctx, executablePath, "--instance", c.Instance.Name, "--"+c.Instance.Flavor.InstancesDirOpt, c.Instance.BaseDir, "cacheman", "run")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
 			return err
 		}
-	}
-	if c.sysRestart == nil {
 		fmt.Println("Restart cacheman done.")
-	}
-
-	checkName := "remote-ok"
-	checkFunc := func() error { return c.Cacheman.RemoteOK() }
-	if c.Config != nil && c.Config.LocalOnly {
-		checkName = "ping"
-		checkFunc = func() error { return c.Cacheman.Ping() }
+		started, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		outPath := cachemanOutPath(c.Instance)
+		answers := checkFunc
+		checkFunc = func() error {
+			// The new cacheman is our child until we exit, so it stays a zombie when it
+			// fails and the check can tell at once.
+			if processExited(started) {
+				return fmt.Errorf("%w before it answered %s; see %s", errCachemanExited, checkName, outPath)
+			}
+			return answers()
+		}
 	}
 
 	fmt.Printf("Waiting for cacheman to respond to %s...\n", checkName)
@@ -111,6 +118,9 @@ func waitForCacheman(ctx context.Context, timeout time.Duration, name string, ch
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errCachemanExited) {
+			return err
+		}
 
 		select {
 		case <-ctx.Done():
@@ -121,4 +131,56 @@ func waitForCacheman(ctx context.Context, timeout time.Duration, name string, ch
 			}
 		}
 	}
+}
+
+var errCachemanExited = errors.New("cacheman exited")
+
+// newRunCmd returns the command that runs cacheman for inst. Tests replace it.
+var newRunCmd = func(inst *instance.Instance) (*exec.Cmd, error) {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to find the abfs executable: %w", err)
+	}
+	return exec.Command(executablePath, "--instance", inst.Name, inst.Flavor.DashedInstancesDir(), inst.BaseDir, "cacheman", "run"), nil
+}
+
+// cachemanOutPath returns the file that gets the stdout and stderr of cacheman, the
+// one the systemd unit uses.
+func cachemanOutPath(inst *instance.Instance) string {
+	return filepath.Join(inst.Config.LogDir, "cachemand")
+}
+
+// runDetached starts 'cacheman run' for inst so that it outlives this command, and
+// returns its pid.
+func runDetached(inst *instance.Instance) (int, error) {
+	if err := os.MkdirAll(inst.Config.LogDir, 0700); err != nil {
+		return 0, err
+	}
+	cmd, err := newRunCmd(inst)
+	if err != nil {
+		return 0, err
+	}
+	return startDetached(cmd, cachemanOutPath(inst))
+}
+
+// startDetached starts cmd in a session of its own with stdin from /dev/null and its
+// output appended to outPath, and returns its pid. No context is attached, so the end
+// of this command does not kill it, and the terminal sends it no SIGINT or SIGHUP.
+// It does not hold the output of the caller, so 'out=$(abfs cacheman restart)'
+// returns.
+func startDetached(cmd *exec.Cmd, outPath string) (int, error) {
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = out.Close() }()
+	cmd.Stdin = nil
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	pid := cmd.Process.Pid
+	return pid, cmd.Process.Release()
 }

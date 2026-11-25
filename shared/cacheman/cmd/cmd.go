@@ -15,17 +15,12 @@
 package cacheman
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"github.com/spf13/pflag"
 
@@ -33,9 +28,7 @@ import (
 	"github.com/google/abfs/shared/cmd"
 	"github.com/google/abfs/shared/cmd/clierr"
 	"github.com/google/abfs/shared/cmd/root"
-	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/systemd"
-	"github.com/google/abfs/shared/user"
 )
 
 type cachemanCmd struct {
@@ -175,99 +168,4 @@ func checkSystemctlUser() error {
 		return fmt.Errorf("%w: %s", err, out)
 	}
 	return err
-}
-
-func instanceSocketLockPath(inst *instance.Instance) string {
-	return path.Join(inst.Config.CacheDir, "socket.lock")
-}
-
-func socketLockPathForPid(pid int) (string, error) {
-	fdPath := path.Join("/proc", strconv.Itoa(pid), "fd")
-
-	files, err := os.ReadDir(fdPath)
-	if err != nil {
-		return "", fmt.Errorf("error reading %q: %w", fdPath, err)
-	}
-
-	for _, file := range files {
-		symlinkPath := filepath.Join(fdPath, file.Name())
-		targetPath, err := os.Readlink(symlinkPath)
-		if err != nil {
-			return "", fmt.Errorf("error resolving symlink %q: %w", symlinkPath, err)
-		}
-		if strings.Contains(targetPath, "socket.lock") {
-			return targetPath, nil
-		}
-	}
-
-	return "", errors.New("process isn't using a socket.lock file")
-}
-
-type cachemans struct {
-	psHeader string
-	infos    []cachemanInfo
-}
-
-type cachemanInfo struct {
-	pid            int
-	psLine         string
-	socketLockPath string
-}
-
-// loadCachemans returns cachemans for the current user.
-func loadCachemans(inst *instance.Instance, currInstanceOnly bool) (*cachemans, error) {
-	var infos []cachemanInfo
-
-	currLockPath := instanceSocketLockPath(inst)
-	// Providing -U to 'ps' will perform a logical OR with the -C option.
-	// The user filter is done manually.
-	output, err := exec.Command("ps", "-C", "abfs", "-o", "uname:32,pid,etime,cmd").Output()
-	if err != nil {
-		return nil, err
-	}
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	currUser, err := user.CurrentUser()
-	if err != nil {
-		return nil, err
-	}
-	var header string
-	for scanner.Scan() {
-		if header == "" {
-			header = scanner.Text()
-		}
-		if strings.Contains(scanner.Text(), "cacheman run") {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) < 3 {
-				return nil, fmt.Errorf("could not parse %q", scanner.Text())
-			}
-			// The returned username from ps is capped to 32 characters above.
-			// Using HasPrefix accounts for usernames longer than 32 characters.
-			if !strings.HasPrefix(currUser.Username, fields[0]) {
-				continue
-			}
-			pid, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return nil, err
-			}
-			socketLock, err := socketLockPathForPid(pid)
-			if err != nil {
-				return nil, err
-			}
-
-			if currInstanceOnly && currLockPath != socketLock {
-				continue
-			}
-
-			infos = append(infos, cachemanInfo{
-				pid:            pid,
-				psLine:         scanner.Text(),
-				socketLockPath: socketLock,
-			})
-		}
-	}
-	if scanner.Err() != nil {
-		return nil, err
-	}
-
-	return &cachemans{psHeader: header, infos: infos}, nil
 }
