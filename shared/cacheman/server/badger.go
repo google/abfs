@@ -93,6 +93,9 @@ type BadgerIndexStore struct {
 	timestampsLock [timestampShards]sync.Mutex
 	timestamps     [timestampShards]map[entities.Hash]int64
 
+	// The last Use of a hash that the LRU does not track, for the Use cooldown only
+	untrackedUses [timestampShards]map[entities.Hash]int64
+
 	// 'totalSize' is an atomic int, but it is not updated
 	// atomically with respect to the state of the index.
 	// Callers of methods that would change the totalSize will see
@@ -133,14 +136,17 @@ func NewBadgerIndexStore(path string, printer Printer, evictBatchSize uint, trac
 	}
 
 	var timestamps [timestampShards]map[entities.Hash]int64
+	var untrackedUses [timestampShards]map[entities.Hash]int64
 	for i := range timestampShards {
 		timestamps[i] = make(map[entities.Hash]int64)
+		untrackedUses[i] = make(map[entities.Hash]int64)
 	}
 
 	return &BadgerIndexStore{
 		BaseBadgerStore: BaseBadgerStore{path: path, printer: PrinterOrDefault(printer)},
 		trackUse:        trackUse,
 		timestamps:      timestamps,
+		untrackedUses:   untrackedUses,
 		evictBatchSize:  evictBatchSize,
 		done:            make(chan struct{}, 1),
 	}
@@ -1282,6 +1288,7 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	// sizeDelta will be zero if the entry is already in LRU tracking
 	// otherwise, it will be LocalSize of the entry
 	var sizeDelta int64
+	var tracked bool
 	if !b.isLRUCandidate(hash) {
 		return nil
 	}
@@ -1290,8 +1297,9 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	defer b.unlockTimestamps(hash)
 
 	prevTimestamp := b.readTimestampLocked(hash)
+	untracked := b.untrackedUses[shardForHash(hash)]
 	// Limit spammy Use() calls.
-	if (currTimestamp - prevTimestamp) < useCooldownSec {
+	if (currTimestamp - max(prevTimestamp, untracked[hash])) < useCooldownSec {
 		return nil
 	}
 
@@ -1306,16 +1314,13 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 		// Use() and Put() are concurrent with each other, so it's possible
 		// the entry may not exist yet. The LRU will be updated on a future Put()
 		// call. 'maintenance' will also re-establish consistency.
+		// Only local entries backed by the remote store belong in the LRU.
 		entry, _ := b.get(txn, hash)
-		if entry == nil {
+		if entry == nil || !entry.Local || !entry.Remote {
 			return nil
 		}
 
-		// Only add to LRU if it is a Remote object.
-		if !entry.Remote {
-			return nil
-		}
-
+		tracked = true
 		sizeDelta += int64(entry.LocalSize())
 
 		var deleteErr error
@@ -1332,9 +1337,11 @@ func (b *BadgerIndexStore) useWithTimestamp(hash entities.Hash, currTimestamp in
 	if err != nil {
 		return err
 	}
-	if success {
+	if success && tracked {
 		b.writeTimestampLocked(hash, currTimestamp)
 		b.lruSize.Add(sizeDelta)
+	} else if success {
+		untracked[hash] = currTimestamp
 	}
 
 	return nil
@@ -1390,11 +1397,13 @@ func (b *BadgerIndexStore) readTimestampLocked(hash entities.Hash) int64 {
 func (b *BadgerIndexStore) writeTimestampLocked(hash entities.Hash, timestamp int64) {
 	shard := shardForHash(hash)
 	b.timestamps[shard][hash] = timestamp
+	delete(b.untrackedUses[shard], hash)
 }
 
 func (b *BadgerIndexStore) deleteTimestampLocked(hash entities.Hash) {
 	shard := shardForHash(hash)
 	delete(b.timestamps[shard], hash)
+	delete(b.untrackedUses[shard], hash)
 }
 
 // Transaction conflicts can occur when:

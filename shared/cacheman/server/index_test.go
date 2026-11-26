@@ -334,3 +334,52 @@ func TestRecentEvictionLog(t *testing.T) {
 	require.Contains(t, logStr, "# Format: <hash> <type> <size_bytes>")
 	require.Contains(t, logStr, "blob 100")
 }
+
+func TestWriteEvictionLogSignedSizes(t *testing.T) {
+	logDir := t.TempDir()
+	idx := &badgerIndex{
+		printer:        PrinterOrDefault(nil),
+		logDir:         logDir,
+		evictThreshold: 1000,
+		evictStart:     time.Unix(100, 0),
+		evictEnd:       time.Unix(101, 0),
+	}
+	victims := []*IndexKeyEntry{
+		{
+			Key: hashOf("signed-log-victim"),
+			IndexEntry: &IndexEntry{
+				EntryType: EntryTypeBlob,
+				Size:      100,
+			},
+		},
+	}
+
+	idx.writeEvictionLog(-1000, -2000, victims)
+
+	content, err := os.ReadFile(filepath.Join(logDir, "recent_eviction.log"))
+	require.NoError(t, err)
+	logStr := string(content)
+
+	require.Contains(t, logStr, "StartingLRUSize: -1.0 kB (-1000 bytes)")
+	require.Contains(t, logStr, "EndingLRUSize: -2.0 kB (-2000 bytes)")
+	require.NotContains(t, logStr, "EB")
+}
+
+func TestFormatSignedBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int64
+		want string
+	}{
+		{name: "zero", in: 0, want: "0 B"},
+		{name: "positive", in: 1000, want: "1.0 kB"},
+		{name: "negative", in: -1000, want: "-1.0 kB"},
+		{name: "negative megabytes", in: -160071680, want: "-160 MB"},
+		{name: "min int64", in: -1 << 63, want: "-9.2 EB"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, formatSignedBytes(tt.in))
+		})
+	}
+}
