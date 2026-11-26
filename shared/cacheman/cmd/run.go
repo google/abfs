@@ -83,17 +83,33 @@ func (c *runCmd) run(ctx context.Context) error {
 		}
 	}()
 
-	var grp errgroup.Group
+	return serveUntilStopped(ctx, s)
+}
+
+// cachemanServer is the part of *server.CacheMan that run drives.
+type cachemanServer interface {
+	Serve(ctx context.Context) error
+	Stop() error
+}
+
+func serveUntilStopped(ctx context.Context, s cachemanServer) error {
+	// A failed Serve also stops cacheman, so the command exits instead of waiting forever.
+	grp, grpCtx := errgroup.WithContext(ctx)
 	grp.Go(func() error {
-		<-ctx.Done()
+		<-grpCtx.Done()
 		if err := s.Stop(); err != nil {
-			c.printer.Printf("Error while stopping cacheman: %s\n", err)
+			return fmt.Errorf("failed to stop cacheman: %w", err)
 		}
 		return nil
 	})
 
 	grp.Go(func() error {
-		return s.Serve(ctx)
+		err := s.Serve(ctx)
+		if ctx.Err() != nil {
+			// Stop closes the socket, which ends Serve with an accept error.
+			return nil
+		}
+		return err
 	})
 
 	return grp.Wait()

@@ -38,8 +38,8 @@ type HttpClient struct {
 func NewHTTPClient(cacheDir string) *HttpClient {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", path.Join(cacheDir, "http.socket"))
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", path.Join(cacheDir, "http.socket"))
 			},
 		},
 	}
@@ -92,12 +92,16 @@ func (c *HttpClient) postJSON(path string, req any, result any) error {
 }
 
 func (c *HttpClient) doRequest(method, path string, req any, result any) error {
+	return c.doRequestContext(context.Background(), method, path, req, result)
+}
+
+func (c *HttpClient) doRequestContext(ctx context.Context, method, path string, req any, result any) error {
 	buf := new(bytes.Buffer)
 	if err := json.NewEncoder(buf).Encode(req); err != nil {
 		return err
 	}
 
-	httpReq, err := http.NewRequest(method, "http://localhost"+path, buf)
+	httpReq, err := http.NewRequestWithContext(ctx, method, "http://localhost"+path, buf)
 	if err != nil {
 		return err
 	}
@@ -125,7 +129,15 @@ func (c *HttpClient) doRequest(method, path string, req any, result any) error {
 }
 
 func (c *HttpClient) getJSON(path string, result any) error {
-	resp, err := c.http.Get("http://localhost" + path)
+	return c.getJSONContext(context.Background(), path, result)
+}
+
+func (c *HttpClient) getJSONContext(ctx context.Context, path string, result any) error {
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", "http://localhost"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return err
 	}
@@ -220,7 +232,11 @@ func (c *HttpClient) SearchRefs(server string, project string, refPrefix string,
 }
 
 func (c *HttpClient) WaitIdle(timeout time.Duration) error {
-	req, err := http.NewRequest("GET", "http://localhost/sync/wait", nil)
+	return c.WaitIdleContext(context.Background(), timeout)
+}
+
+func (c *HttpClient) WaitIdleContext(ctx context.Context, timeout time.Duration) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/sync/wait", nil)
 	if err != nil {
 		return err
 	}
@@ -276,12 +292,20 @@ func (c *HttpClient) LRUSize() (uint64, error) {
 }
 
 func (c *HttpClient) Ping() error {
-	return c.postJSON("/ping", nil, nil)
+	return c.PingContext(context.Background())
+}
+
+func (c *HttpClient) PingContext(ctx context.Context) error {
+	return c.doRequestContext(ctx, "POST", "/ping", nil, nil)
 }
 
 func (c *HttpClient) RemoteOK() error {
+	return c.RemoteOKContext(context.Background())
+}
+
+func (c *HttpClient) RemoteOKContext(ctx context.Context) error {
 	var resp bool
-	return c.getJSON("/remote-ok", &resp)
+	return c.getJSONContext(ctx, "/remote-ok", &resp)
 }
 
 func (c *HttpClient) InterfaceVersion() (implemented, required string, err error) {

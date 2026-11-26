@@ -141,6 +141,10 @@ func (c *Client) WaitIdle(timeout time.Duration) error {
 	return c.httpClient.WaitIdle(timeout)
 }
 
+func (c *Client) WaitIdleContext(ctx context.Context, timeout time.Duration) error {
+	return c.httpClient.WaitIdleContext(ctx, timeout)
+}
+
 func (c *Client) SetDebug(debug bool) error {
 	return c.httpClient.SetDebug(debug)
 }
@@ -176,11 +180,25 @@ func (c *Client) Ping() error {
 	return c.httpClient.Ping()
 }
 
+func (c *Client) PingContext(ctx context.Context) error {
+	if c.client.IsClosing() {
+		return cacheman.ErrClosedClient
+	}
+	return c.httpClient.PingContext(ctx)
+}
+
 func (c *Client) RemoteOK() error {
 	if c.client.IsClosing() {
 		return cacheman.ErrClosedClient
 	}
 	return c.httpClient.RemoteOK()
+}
+
+func (c *Client) RemoteOKContext(ctx context.Context) error {
+	if c.client.IsClosing() {
+		return cacheman.ErrClosedClient
+	}
+	return c.httpClient.RemoteOKContext(ctx)
 }
 
 func (c *Client) PingBinary() error {

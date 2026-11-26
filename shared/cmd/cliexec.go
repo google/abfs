@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -150,12 +151,12 @@ func (c *CliExec) signalWrap(ctx context.Context, f func(ctx context.Context) er
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	closed := false
+	var received atomic.Int32
 
 	go func() {
 		// On the first Interrupt (Ctrl+C) try a clean exit
 		select {
-		case <-sigChan:
+		case sig := <-sigChan:
 			log.Println("Received a shutdown signal, attempting to cleanly exit...")
 			go func() {
 				// On the second Interrupt (Ctrl+C) try os.Exit()
@@ -163,7 +164,7 @@ func (c *CliExec) signalWrap(ctx context.Context, f func(ctx context.Context) er
 				fmt.Fprintf(os.Stderr, "Process didn't exit, trying to exit forcefully\n")
 				os.Exit(1)
 			}()
-			closed = true
+			received.Store(int32(sig.(syscall.Signal)))
 			cancel()
 		case <-ctx.Done():
 			return
@@ -171,10 +172,20 @@ func (c *CliExec) signalWrap(ctx context.Context, f func(ctx context.Context) er
 	}()
 
 	err := f(ctx)
-	if err != nil && !closed {
-		return err
+	if sig := syscall.Signal(received.Load()); err != nil && sig != 0 {
+		return interruptedErr(sig, err)
 	}
-	return nil
+	return err
+}
+
+// interruptedErr reports a command that failed after a signal with the exit code a shell
+// gives a process killed by that signal, so callers do not read the stop as a success.
+func interruptedErr(sig syscall.Signal, err error) error {
+	exitCode := 128 + int(sig)
+	if msg := err.Error(); msg != "" {
+		return clierr.CLIErrWithExitCode(exitCode, "interrupted by %s: %s", unix.SignalName(sig), msg)
+	}
+	return clierr.CLIErrWithExitCode(exitCode, "interrupted by %s", unix.SignalName(sig))
 }
 
 func SetEmbedded[T Provider](o any, newObj func() (T, error)) error {

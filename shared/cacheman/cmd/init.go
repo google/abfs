@@ -126,9 +126,9 @@ func setupCachemanService(ctx context.Context, svc systemd.Service, inst *instan
 		return err
 	}
 	// Each ping gives up after a few seconds, so a wedged cacheman can't hang init.
-	ping := cachemanclient.NewHTTPClientWithTimeout(inst.Config.CacheDir, 5*time.Second).Ping
+	ping := cachemanclient.NewHTTPClientWithTimeout(inst.Config.CacheDir, 5*time.Second).PingContext
 	unitActive := exec.CommandContext(ctx, "systemctl", "--user", "is-active", "--quiet", svc.Name+".service").Run() == nil
-	if ping() == nil && !unitActive {
+	if ping(ctx) == nil && !unitActive {
 		// Starting the unit now would crash-loop on the cacheman socket lock.
 		fmt.Fprintf(os.Stderr, "WARNING: A cacheman that systemd does not manage is already running for "+
 			"instance '%s', so %s was not set up. To let systemd manage cacheman, stop that "+
