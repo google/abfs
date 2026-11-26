@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,13 +37,16 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
 	"github.com/google/abfs/shared/cacheman/protocol"
+	"github.com/google/abfs/shared/dagsync"
 	"github.com/google/abfs/shared/entities"
 	"github.com/google/abfs/shared/instance"
 	"github.com/google/abfs/shared/objects"
 	"github.com/google/abfs/shared/objects/gitobjects"
 	"github.com/google/abfs/shared/remote"
+	abfsserver "github.com/google/abfs/shared/remote/grpc/server"
 	"github.com/google/abfs/shared/remote/servers/inmemory"
 )
 
@@ -2133,4 +2137,279 @@ func TestMaintenanceAndEvictionRace(t *testing.T) {
 	require.False(t, hasKept, "clean must remove blob file from disk when EnableIndex is true")
 	require.NoError(t, c.maintenanceWork())
 	require.Nil(t, c.index.Get(keptHash), "cleaned hash must not be resurrected by subsequent maintenance")
+}
+
+type blockingUpdater struct {
+	dagsync.ABFSUpdater
+	started chan struct{}
+	release chan struct{}
+}
+
+func (u *blockingUpdater) PutObject(ctx context.Context, key entities.Hash, reader remote.ContentReadCloser) error {
+	select {
+	case <-u.started:
+	default:
+		close(u.started)
+	}
+	select {
+	case <-u.release:
+		return u.ABFSUpdater.PutObject(ctx, key, reader)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type drainTestPrinter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (p *drainTestPrinter) Printf(format string, v ...any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(&p.buf, format, v...)
+}
+
+func (p *drainTestPrinter) Println(v ...any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintln(&p.buf, v...)
+}
+
+func (p *drainTestPrinter) Fatal(v ...any) {
+	panic(fmt.Sprint(v...))
+}
+
+func (p *drainTestPrinter) Fatalf(format string, v ...any) {
+	panic(fmt.Sprintf(format, v...))
+}
+
+func (p *drainTestPrinter) Close() error { return nil }
+
+func (p *drainTestPrinter) String() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.String()
+}
+
+type memBlobReader struct {
+	*bytes.Reader
+	size int64
+}
+
+func (r *memBlobReader) Close() error         { return nil }
+func (r *memBlobReader) Size() (int64, error) { return r.size, nil }
+
+type memBlobAccessor struct {
+	blobs map[entities.Hash][]byte
+}
+
+func (a *memBlobAccessor) GetObject(ctx context.Context, key entities.Hash) ([]byte, error) {
+	return nil, entities.NotExistErrf("object %s", key)
+}
+
+func (a *memBlobAccessor) OpenBlob(ctx context.Context, key entities.Hash) (dagsync.ReadSizeCloser, error) {
+	b, ok := a.blobs[key]
+	if !ok {
+		return nil, entities.NotExistErrf("blob %s", key)
+	}
+	return &memBlobReader{Reader: bytes.NewReader(b), size: int64(len(b))}, nil
+}
+
+func TestCachemanDrain(t *testing.T) {
+	printer := &drainTestPrinter{}
+	c := &CacheMan{printer: printer}
+
+	// Nil sync and zero timeout return immediately.
+	require.NoError(t, c.Drain(time.Second))
+	require.NoError(t, c.Drain(0))
+
+	data1 := []byte("pending blob 1")
+	key1 := objects.HashBlobBytes(data1)
+	data2 := []byte("pending blob 2")
+	key2 := objects.HashBlobBytes(data2)
+	updater := &blockingUpdater{
+		ABFSUpdater: inmemory.New(),
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	ds := dagsync.New(&dagsync.DagSyncOpts{
+		Updater: updater,
+		Accessor: &memBlobAccessor{blobs: map[entities.Hash][]byte{
+			key1: data1,
+			key2: data2,
+		}},
+		WorkersCount: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go ds.Start(ctx)
+	c.sync.Store(ds)
+
+	// Idle drain returns immediately without logging.
+	start := time.Now()
+	require.NoError(t, c.Drain(5*time.Second))
+	require.Less(t, time.Since(start), time.Second)
+	require.Empty(t, printer.String())
+
+	// Busy upload: zero timeout returns immediately without waiting.
+	ds.PutBlob(key1)
+	<-updater.started
+	start = time.Now()
+	require.NoError(t, c.Drain(0))
+	require.Less(t, time.Since(start), time.Second)
+
+	// Busy upload that exceeds drain timeout waits ~timeout and logs start and unfinished counts.
+	start = time.Now()
+	err := c.Drain(100 * time.Millisecond)
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	require.GreaterOrEqual(t, elapsed, 90*time.Millisecond)
+	require.Less(t, elapsed, 2*time.Second)
+	require.Contains(t, printer.String(), "Waiting up to 100ms for 1 pending uploads")
+	require.Contains(t, printer.String(), "Stopping with 1 uploads not finished")
+
+	// Queued upload behind the running upload is included in the pending count.
+	ds.PutBlob(key2)
+	require.Eventually(t, func() bool {
+		return pendingUploads(ds) == 2
+	}, 2*time.Second, 10*time.Millisecond)
+	err = c.Drain(50 * time.Millisecond)
+	require.Error(t, err)
+	require.Contains(t, printer.String(), "Waiting up to 50ms for 2 pending uploads")
+	require.Contains(t, printer.String(), "Stopping with 2 uploads not finished")
+
+	// Busy uploads that finish within drain timeout succeed cleanly.
+	close(updater.release)
+	require.NoError(t, c.Drain(5*time.Second))
+
+	// Failed upload is counted as unfinished and Drain returns early without waiting full timeout.
+	missingKey := objects.HashBlobBytes([]byte("missing blob"))
+	ds.PutBlob(missingKey)
+	require.Eventually(t, func() bool {
+		state, ok := ds.State(missingKey.String())
+		return ok && state == dagsync.FailedState
+	}, 2*time.Second, 10*time.Millisecond)
+	start = time.Now()
+	err = c.Drain(5 * time.Second)
+	require.Error(t, err)
+	require.Less(t, time.Since(start), time.Second)
+	require.Contains(t, printer.String(), "Waiting up to 5s for 1 pending uploads")
+	require.Contains(t, printer.String(), "Stopping with 1 uploads not finished: dagsync is idle but there are 1 failed and 0 blocked nodes")
+}
+
+func TestCachemanDrainRealGRPC(t *testing.T) {
+	const pushCount = 12
+	baseDir := t.TempDir()
+
+	tests := []struct {
+		name  string
+		drain time.Duration
+	}{
+		{name: "drain_5s", drain: 5 * time.Second},
+		{name: "drain_0", drain: 0},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Keep paths short under baseDir so Unix socket binds stay below the sun_path limit.
+			tmp := filepath.Join(baseDir, strconv.Itoa(i))
+			cacheDir := filepath.Join(tmp, "c")
+			logDir := filepath.Join(tmp, "l")
+			require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "tmp"), 0755))
+			require.NoError(t, os.MkdirAll(logDir, 0755))
+
+			var pushed atomic.Int32
+			firstRPC := make(chan struct{})
+			var firstOnce sync.Once
+
+			fs := inmemory.New()
+			fromHashes := make([]entities.Hash, pushCount)
+			for j := range pushCount {
+				data := fmt.Appendf(nil, "blob-%d", j)
+				h := objects.HashBlobBytes(data)
+				require.NoError(t, fs.PutObject(context.Background(), h, remote.NewBlobReader(io.NopCloser(bytes.NewReader(data)), int64(len(data)))))
+				fromHashes[j] = h
+			}
+
+			lis, err := net.Listen("tcp", "localhost:0")
+			require.NoError(t, err)
+			gs, err := abfsserver.NewGRPCServer(&abfsserver.GRPCServerOpts{
+				Server: fs,
+				ExtraServerOpts: []grpc.ServerOption{
+					grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+						if strings.Contains(info.FullMethod, "Map") {
+							firstOnce.Do(func() { close(firstRPC) })
+							select {
+							case <-time.After(100 * time.Millisecond):
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							}
+							resp, err := h(ctx, req)
+							if err == nil {
+								pushed.Add(1)
+							}
+							return resp, err
+						}
+						return h(ctx, req)
+					}),
+				},
+			})
+			require.NoError(t, err)
+			go func() {
+				_ = gs.Serve(lis)
+			}()
+			defer gs.Stop()
+
+			falseVal := false
+			trueVal := true
+			remoteServers := []string{lis.Addr().String()}
+			authType := instance.AuthType("none")
+			concurrentUploads := 2
+			fc := &instance.ConfigOptional{
+				CacheDir:          &cacheDir,
+				LogDir:            &logDir,
+				LocalOnly:         &falseVal,
+				EnableIndex:       &trueVal,
+				DisableTLS:        &trueVal,
+				RemoteServers:     &remoteServers,
+				AuthType:          &authType,
+				ConcurrentUploads: &concurrentUploads,
+			}
+			inst := instance.NewInstance("default", tmp, tmp, "abfs", fc, instance.DefaultFlavor)
+			defer func() {
+				require.NoError(t, inst.Close())
+			}()
+
+			c, err := New(inst, nil)
+			require.NoError(t, err)
+
+			serveCtx, cancelServe := context.WithCancel(context.Background())
+			defer cancelServe()
+			require.NoError(t, c.setupRemote(serveCtx, c.config, true))
+
+			ds := c.getSync()
+			require.NotNil(t, ds)
+			for _, from := range fromHashes {
+				ds.AddMapResult(from, entities.EmptyDirHash)
+			}
+
+			select {
+			case <-firstRPC:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for first map upload RPC")
+			}
+
+			require.NoError(t, c.Drain(tt.drain))
+			cancelServe()
+			require.NoError(t, c.Stop())
+			gs.Stop()
+
+			if tt.drain > 0 {
+				require.Equal(t, int32(pushCount), pushed.Load())
+			} else {
+				require.Less(t, pushed.Load(), int32(pushCount))
+			}
+		})
+	}
 }

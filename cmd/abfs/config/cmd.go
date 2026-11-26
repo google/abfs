@@ -123,7 +123,7 @@ func (c *configCmd) run(ctx context.Context) error {
 			c.printConfig(config, "  ")
 		})
 		<-ctx.Done()
-		return ctx.Err()
+		return nil
 
 	case c.asRead:
 		config := c.localConfig()
