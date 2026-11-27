@@ -58,6 +58,7 @@ type Config struct {
 	ForceWorkspaces     bool          `yaml:"force-workspaces,omitempty" json:",omitempty" desc:"Force workspace mode"`
 	IgnoreSoongEnvAvail bool          `yaml:"ignore-soong-env-avail,omitempty" json:",omitempty" desc:"Ignore Soong environment availability check"`
 	EagerPush           bool          `yaml:"eager-push,omitempty" json:",omitempty" desc:"Eagerly push local objects to remote server"`
+	IdleLocalGC         bool          `yaml:"idle-local-gc,omitempty" json:",omitempty" desc:"Remove unused local-only blobs when no mount is connected"`
 
 	SyncAutoSetup    bool     `yaml:"sync.auto-setup,omitempty" json:",omitempty" desc:"Automatically run setup after sync"`
 	SyncPrefetchDirs []string `yaml:"sync.prefetch-dirs,omitempty" json:",omitempty" desc:"Directories to prefetch during sync"`
@@ -128,6 +129,7 @@ type ConfigOptional struct {
 	ForceWorkspaces     *bool          `yaml:"force-workspaces,omitempty" json:",omitempty"`
 	IgnoreSoongEnvAvail *bool          `yaml:"ignore-soong-env-avail,omitempty" json:",omitempty"`
 	EagerPush           *bool          `yaml:"eager-push,omitempty" json:",omitempty"`
+	IdleLocalGC         *bool          `yaml:"idle-local-gc,omitempty" json:",omitempty"`
 
 	SyncAutoSetup    *bool     `yaml:"sync.auto-setup,omitempty" json:",omitempty"`
 	SyncPrefetchDirs *[]string `yaml:"sync.prefetch-dirs,omitempty" json:",omitempty"`

@@ -1560,6 +1560,25 @@ func (b *BadgerMapsStore) Put(from, to entities.Hash) error {
 	})
 }
 
+// ForEach implements MapsStore.
+func (b *BadgerMapsStore) ForEach(fn func(from, to entities.Hash) error) error {
+	return b.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(keyOnlyIterationOpts())
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			key := it.Item().Key()
+			parts := bytes.Split(key, []byte("::"))
+			if len(parts) != 2 {
+				return fmt.Errorf("could not parse key: %v", string(key))
+			}
+			if err := fn(entities.NewHash(string(parts[0])), entities.NewHash(string(parts[1]))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Close implements MapsStore.
 func (b *BadgerMapsStore) Close() error {
 	return b.db.Close()

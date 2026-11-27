@@ -205,6 +205,8 @@ type CacheMan struct {
 	newObjReqs           *NewObjectReqQueue
 	pendingAdd           *PendingAddTracker
 	notifyUseAgg         *NotifyUseAggregator
+	mounts               *mountTracker
+	lastIdleGC           time.Time
 	activeWorkers        sync.WaitGroup
 
 	relFetchObjectReqs chan RelativeFetchReq
@@ -253,6 +255,7 @@ func New(inst *instance.Instance, newARES NewARESFunc) (*CacheMan, error) {
 		config:             new(instance.Config),
 		newConfigC:         make(chan struct{}, 1),
 		healthCheckTrigger: make(chan struct{}, 1),
+		mounts:             newMountTracker(time.Now),
 		newARES:            newARES,
 		printer:            new(DefaultPrinter),
 		serverCtx:          serverCtx,
@@ -1357,6 +1360,7 @@ func (c *CacheMan) indexObjectsWorker(ctx context.Context) {
 // EnqueueNewObject pushes locally created object notifications to an asynchronous
 // queue for background indexing and eager-push without blocking the socket reader.
 func (c *CacheMan) EnqueueNewObject(hash entities.Hash, objType protocol.RequestObjectType) {
+	c.mounts.noteNewObject()
 	c.newObjReqs.Push(NewObjectReq{Hash: hash, ObjType: objType})
 }
 
@@ -2168,6 +2172,7 @@ func (c *CacheMan) Serve(ctx context.Context) error {
 			c.printer.Printf("Error while running maintenance: %v\n", err)
 		}
 	}()
+	go c.idleGC(ctx)
 
 	workers := runtime.NumCPU()
 	for range workers {
@@ -2325,6 +2330,7 @@ func (c *CacheMan) Stats() protocol.CacheManStats {
 		EvictEnd:      c.index.EvictEnd(),
 		EvictCount:    c.index.EvictCount(),
 		OldestObject:  c.index.OldestUsed(),
+		Mounts:        int64(c.mounts.kernelMounts()),
 		FetchBlobs:    c.fetchBlobsStat,
 		FetchTrees:    c.fetchTreesStat,
 		FetchObjects:  c.fetchObjectsStat,
@@ -2879,11 +2885,12 @@ func (c *CacheMan) reconcileDiskObject(hash entities.Hash, objType protocol.Requ
 		}
 	} else if !entry.Remote {
 		// 3. If object is on disk and in the index, but index says remote=false:
-		// This will add to the index, push to the remote,
-		// and receive the dagsync callbacks to update 'remote' tracking.
-		// The "add" to the index will be a NOP in the common case, but we want
-		// to go through this code path for the callbacks.
-		c.NewObject(hash, resolveObjType())
+		// Push to the remote and receive the dagsync callbacks that mark it remote.
+		// Without a push the re-add would only set its last alive time to now, and
+		// a cacheman that restarts often would never sweep its local-only blobs.
+		if sync := c.getSync(); sync != nil && c.config.EagerPush && !c.noRemotePush() {
+			c.NewObject(hash, resolveObjType())
+		}
 	} else if entry.Local && entry.Remote {
 		// 4. Object is fully synced but might be missing from LRU tracking.
 		if _, tracked := trackedInLRU[hash]; !tracked {

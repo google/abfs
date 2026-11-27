@@ -211,7 +211,7 @@ func (c *statsCmd) printStats(stats protocol.CacheManStats) {
 	} else {
 		connected = c.color(color.Red, "%-20s", "Disconnected")
 	}
-	fmt.Printf("%s %s %s %s\n", c.title("Status       "), connected, c.title("GC      "), gc)
+	fmt.Printf("%s %s %s %s %s %s\n", c.title("Status       "), connected, c.title("GC      "), gc, c.title("Mounts"), c.cell(stats.Mounts))
 	fmt.Printf("%s %-20s %s %s\n", c.title("Oldest Object"), humanTime(stats.OldestObject), c.title("Eviction"), evict)
 	fmt.Printf("%s %s %s %s %s %s %s %s\n", c.title("Total Size   "), c.vol(stats.TotalSize, 20), c.title("LRU Size     "), c.vol(stats.LRUSize, 20), c.title("Local Count"), c.cell(stats.LocalCount), c.title("Index Count"), c.cell(stats.IndexCount))
 	fmt.Printf("%s %s %s %s\n", c.title("Sent         "), c.vol(stats.BytesSent, 20), c.title("Received"), c.vol(stats.BytesReceived, 20))

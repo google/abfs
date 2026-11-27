@@ -44,13 +44,15 @@ type Connection struct {
 
 func newConnection(c *CacheMan, conn net.Conn) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Connection{
+	connection := &Connection{
 		server:  c,
 		conn:    conn,
 		printer: c.printer,
 		ctx:     ctx,
 		cancel:  cancel,
 	}
+	c.mounts.add(connection)
+	return connection
 }
 
 func (c *Connection) Serve() error {
@@ -123,6 +125,9 @@ func (c *Connection) Close() error {
 	c.closed = true
 	if c.cancel != nil {
 		c.cancel()
+	}
+	if c.server != nil {
+		c.server.mounts.remove(c)
 	}
 	return c.conn.Close()
 }
@@ -625,6 +630,8 @@ func (c *Connection) handleCheckStatus() error {
 	if err != nil {
 		return fmt.Errorf("%w: ReadCheckStatusReq failed: %v", ErrProtocol, err)
 	}
+	// casfs polls with check_status on its connection while mounted.
+	c.server.mounts.markKernel(c)
 
 	errCode := c.server.HealthStatus()
 	result := protocol.ResultSuccess
